@@ -192,3 +192,32 @@ AES-NI 的老 x86 CPU 直接非法指令，且对已有硬件探测路径零收�
 | 推迟 | O1-R | 前置（上层显式 flush 语义）改造大，收益仅压缩率；用户需要压缩率时再启 |
 | P1 | O5 | spike 先行，与 Go 互通不过即关；e2e 届时需用户确认 |
 | P2 按序 | O9 → O7 → O11 → O8 → O17 → O3-R → O12 → O13 → O14 → O15 → O16 → O10-R | 每条独立 commit `perf(opt): <编号> …`，先 bench 后动手 |
+
+---
+
+## 七、v2 执行结果总表（2026-10-10 收尾补录）
+
+分支 `perf/opt-v2`，逐条独立 commit（`perf(opt)`/`docs(perf)` 前缀）：
+
+| 条目 | 结果 | commit | 关键数据/证据 |
+|---|---|---|---|
+| A0 | ✅ 完成 | `3dc7e2a8` | 356/0 测试、clippy/fmt 过、O2/O3/O4 bench（idle −65%）、本留档 |
+| O0 | ✅ 关闭（验证型） | 同上（第五节） | AES-NI 硬件区间 1975/659ns/包；不加 rustflags |
+| O9 | ✅ 完成 | `01b2a17e` | CFB 解密 659→483ns/包（−27%），71/0 + 3 个 bit-一致单测 |
+| O7 | ✅ 完成 | `f6339083` | async 发送零 to_vec/零 out 分配（timeout 回退除外），56/0 + stress 8/8 |
+| O11 | ✅ 关闭（证据型） | `004a3077` | seal() 无生产调用方，grep 留档 |
+| O8 | ✅ 完成 | `3fd839d6` | cpu_block 8.03→4.03 allocs/调用（−50%）、1200→168B（−86%） |
+| O17 | ✅ 完成（6/7） | `73d2cc6b` | #6 空扫跳过有据跳过（HOTSPOTS 无记录+CRITICAL 面）；#4 已内置 |
+| O3-R | ✅ 完成 | `f074b8dc` | 空闲 10s 唤醒 ≤20 断言，3 遍稳定 |
+| O12 | ✅ 完成 | `1b17c2b4` | prepare 1024 流 mean −3.0% / median −6.1%（交替 5 轮） |
+| O13 | ✅ 完成 | `291dc387` | 直读 codec；e2e 噪声内无可测提升（如实记录） |
+| O14 | ✅ 完成 | `922e8ec5` | 单条流缓存；bench 噪声内持平（如实记录） |
+| O15 | ✅ 完成 | `3d52282e` | 活流 RSS −41.7%（1024 流），吞吐无退化 |
+| O16 | ✅ 完成 | （见 git log） | --threads CLI + knet configure；1MiB 冒烟 OK；延迟 A/B 见 evidence |
+| O10-R | ✅ 关闭（微测） | `2e353298` | 字节融合 CRC 4032ns vs crc32fast 167ns（24× 负收益） |
+| O5 | ✅ 关闭（spike） | `52b0f9f8` | reed-solomon-simd 为 GF(2^16)——与 klauspost GF(2^8) 不同域 |
+| O1-R | ⏸️ 推迟 | — | 用户确认的推迟项（上层 flush 语义前置） |
+| harness | 附带 | `bdcbbbad`/`76422a76`/`36cf1b73` | CIPHERS 补 aes、cfb_bench、py3.6 兼容 |
+
+环境备注：hk_dev 与另一会话共享，期间其清理过 /opt/rh、/root/kcptun-perf
+（已重建）；benches 均在该机 x86_64 Linux 完成。
