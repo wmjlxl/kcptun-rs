@@ -103,6 +103,11 @@ const REAP_LINGER: Duration = Duration::from_secs(30);
 pub struct SmuxConn {
     session: Arc<Session>,
     flush_notify: Arc<knet::Notify>,
+    /// Flush-task loop wakeups (health timer or producer notify). Relaxed
+    /// counter backing the O3-R idle-wake budget test: an idle conn must
+    /// wake ~1×/s (health timer), not the pre-O3 100 Hz poll. Shared across
+    /// `Clone` handles via `Arc`; test-facing only.
+    flush_wakeups: Arc<std::sync::atomic::AtomicUsize>,
     /// Set to true once a driver task has been started (via run/spawn or
     /// the connect/serve builders / client/server wrappers). Prevents
     /// accidentally starting a second driver on the same connection.
@@ -176,6 +181,7 @@ impl SmuxConn {
         Ok(Self {
             session,
             flush_notify,
+            flush_wakeups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             driven: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -415,6 +421,7 @@ impl SmuxConn {
         // ── Flush + keepalive + reap task ──
         let session = self.session.clone();
         let flush_notify = self.flush_notify.clone();
+        let flush_wakeups = self.flush_wakeups.clone();
         knet::spawn_task(async move {
             let mut buf = BytesMut::with_capacity(65536);
             let mut nop_buf = BytesMut::with_capacity(8);
@@ -443,6 +450,9 @@ impl SmuxConn {
                     next_health.saturating_duration_since(std::time::Instant::now())
                 };
                 let _ = knet::timeout(wait, flush_notify.notified()).await;
+                // O3-R observability: one count per loop wakeup (health
+                // deadline or producer notify) for the idle-wake budget test.
+                flush_wakeups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 buf.clear();
                 let ver = session.version();
@@ -1053,6 +1063,41 @@ mod tests {
             }
 
             assert!(conn.session().streams().lock().get(&sid).is_none());
+        }
+
+        /// O3-R: an idle conn's flush task must wake only on the 1s health
+        /// timer (plus the initial immediate pass) — ≤20 wakeups per 10s.
+        /// The pre-O3 loop polled at 100 Hz, i.e. ~1000 wakeups in this
+        /// window, so the budget is ~5× below the old behaviour and ~2×
+        /// above the expected ~11 (1 initial + 10 health ticks).
+        #[tokio::test]
+        async fn idle_flush_wakeups_stay_within_budget() {
+            let conn = SmuxConn::new(DEFAULT_CONFIG.clone(), true).unwrap();
+            let written = Arc::new(Mutex::new(BytesMut::new()));
+            let fail = Arc::new(AtomicBool::new(false));
+            conn.spawn(
+                BlockingReadHalf,
+                MockWriteHalf {
+                    written,
+                    fail_next_write: fail,
+                },
+            );
+            // Let the immediate first pass land, then measure a quiet window.
+            knet::sleep_ms(50).await;
+            let start = conn
+                .flush_wakeups
+                .load(std::sync::atomic::Ordering::Relaxed);
+            knet::sleep_ms(10_000).await;
+            let end = conn
+                .flush_wakeups
+                .load(std::sync::atomic::Ordering::Relaxed);
+            conn.close();
+            knet::sleep_ms(20).await;
+            let wakes = end - start;
+            assert!(
+                wakes <= 20,
+                "idle flush task woke {wakes} times in 10s (budget 20; pre-O3 was ~1000)"
+            );
         }
     }
 }
