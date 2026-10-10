@@ -29,5 +29,6 @@ impl<T> Future for JoinHandle<T> {
 mod tokio;
 
 pub use self::tokio::{
-    block_on, block_on_local, block_on_multi_thread, cpu_block, spawn_task, yield_now,
+    block_on, block_on_local, block_on_multi_thread, configure_worker_threads, cpu_block,
+    spawn_task, yield_now,
 };

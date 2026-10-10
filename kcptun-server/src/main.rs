@@ -31,5 +31,8 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse_go_compatible();
+    // O16: the runtime is built lazily by the first `block_on`, so the
+    // worker-thread knob must land before it — CLI is parsed in main here.
+    knet::configure_worker_threads(cli.threads);
     knet::block_on(app::async_main(cli))
 }

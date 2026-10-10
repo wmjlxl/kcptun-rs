@@ -374,3 +374,15 @@ async fn test_inflight_wait_drain_times_out() {
         "wait_drain must report timeout while a task is still live"
     );
 }
+
+/// O16: `configure_worker_threads` must be safe to call before `block_on`
+/// (the runtime applies the count at first use; later calls are ignored by
+/// design — OnceLock). Worker-count itself is validated end-to-end by the
+/// binaries' `--threads` smoke, not here: the global runtime is
+/// process-wide and test order is nondeterministic.
+#[test]
+fn configure_worker_threads_before_block_on_is_safe() {
+    crate::configure_worker_threads(0); // 0 = auto (no override)
+    let v: usize = crate::block_on(async { 7 });
+    assert_eq!(v, 7);
+}

@@ -255,6 +255,12 @@ pub(crate) struct Cli {
     /// Use e.g. `0.0.0.0:6060` to restore Go kcptun's all-interfaces bind.
     #[arg(long, default_value = "127.0.0.1:6060")]
     pub pprofaddr: String,
+
+    /// Tokio worker threads for the global async runtime
+    /// (0 = auto, one per CPU core). Values of 2–4 can reduce P99 jitter in
+    /// latency-sensitive deployments — see BOTTLENECK_ANALYSIS_SUMMARY.md.
+    #[arg(long, default_value_t = 0)]
+    pub threads: usize,
 }
 
 impl Cli {
@@ -308,6 +314,8 @@ impl Cli {
             peripsessionrate: cfg.peripsessionrate.unwrap_or(cli.peripsessionrate),
             maxsessionsperip: cfg.maxsessionsperip.unwrap_or(cli.maxsessionsperip),
             pprofaddr: cfg.pprofaddr.unwrap_or(cli.pprofaddr),
+            // CLI-only knob: the JSON config has no runtime-thread setting.
+            threads: cli.threads,
         }
     }
 }

@@ -205,12 +205,29 @@ fn recycle_result_pair<R: Send + 'static>(pair: ResultPair<R>) {
 /// test suites and embedded callers that call `block_on` repeatedly.
 static GLOBAL_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+/// Worker-thread override for the global runtime (O16 / `--threads`).
+/// Unset or `0` = tokio default (CPU core count).
+static WORKER_THREADS: OnceLock<usize> = OnceLock::new();
+
+/// Set the worker-thread count of the global `block_on` runtime.
+///
+/// Must be called **before** the first `block_on` (the runtime is built
+/// lazily on first use); a later call is ignored — the runtime already
+/// exists. `0` restores the tokio default (CPU core count). The binaries'
+/// `--threads` flag wires through here; latency-sensitive deployments can
+/// pin 2–4 workers (see BOTTLENECK_ANALYSIS_SUMMARY.md).
+pub fn configure_worker_threads(n: usize) {
+    let _ = WORKER_THREADS.set(n);
+}
+
 fn global_rt() -> &'static tokio::runtime::Runtime {
     GLOBAL_RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime")
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        if let Some(&n) = WORKER_THREADS.get().filter(|&n| *n > 0) {
+            builder.worker_threads(n);
+        }
+        builder.build().expect("failed to create tokio runtime")
     })
 }
 

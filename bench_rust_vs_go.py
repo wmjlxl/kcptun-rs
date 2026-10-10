@@ -247,6 +247,11 @@ def build_args(binary_path, is_go, role, echo_port, srv_port, cli_port,
         listen_flag = '-l'
         target_flag = '-r' if role == 'client' else '-t'
         args = common if role == 'server' else client_common
+        # O16: optional worker-thread override for the Rust binaries only
+        # (Go kcptun has no --threads flag).
+        threads = os.environ.get('KCPTUN_THREADS')
+        if threads:
+            args = args + ['--threads', threads]
         if role == 'server':
             return [binary_path, listen_flag, f'0.0.0.0:{srv_port}',
                     target_flag, f'127.0.0.1:{echo_port}'] + args
