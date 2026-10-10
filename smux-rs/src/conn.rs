@@ -72,6 +72,14 @@ use crate::stream::Stream;
 const RUN_POLL_MS: u64 = 10;
 /// Keepalive / reap check interval (in poll cycles, ~1s at 10ms each).
 const HEALTH_INTERVAL: u32 = 100;
+/// Wall-clock keepalive / reap cadence for the `spawn()` flush task.
+///
+/// The flush task used to decrement `health` per iteration over a 10 ms
+/// poll — 100 wakeups/s per idle connection, and notify bursts silently
+/// *accelerated* the health cadence. Now that every producer (write,
+/// shutdown, SYN, close, read-side window tokens) notifies the loop, the
+/// timer only has to carry the health check itself.
+const SPAWN_HEALTH_PERIOD: Duration = Duration::from_secs(1);
 /// Stale stream linger before forced reap.
 const REAP_LINGER: Duration = Duration::from_secs(30);
 
@@ -219,6 +227,9 @@ impl SmuxConn {
         let stream = self.session.open_stream()?;
         self.session.queue_syn(stream.id());
         stream.set_flush_notify(self.flush_notify.clone());
+        // The flush task no longer polls at 10ms — wake it so the SYN goes
+        // out now instead of on the next health deadline.
+        self.flush_notify.notify_one();
         Ok(stream)
     }
 
@@ -407,24 +418,41 @@ impl SmuxConn {
         knet::spawn_task(async move {
             let mut buf = BytesMut::with_capacity(65536);
             let mut nop_buf = BytesMut::with_capacity(8);
-            let mut health: u32 = 0;
+            // Due immediately: the old counter started at `health = 0`, so
+            // the first iteration ran reap/keepalive — tests (and fresh
+            // sessions) rely on a reaped stream leaving the map right away.
+            let mut next_health = std::time::Instant::now();
+            // A FIN that was queued but not yet marked sent (transport write
+            // failed, or the batch was truncated) must retry on the old 10ms
+            // tick — waiting a full health period would stall the peer's EOF.
+            let mut fin_retry = false;
 
             loop {
                 if session.is_closed() {
                     break;
                 }
 
-                // Wait for notify (stream wrote data) or 10 ms timeout.
-                let _ = knet::timeout(Duration::from_millis(RUN_POLL_MS), flush_notify.notified())
-                    .await;
+                // Wait for a producer notify (stream write / shutdown / SYN /
+                // close / read-side window update) or until the next health
+                // deadline. Producers carry all data wakes now, so idle
+                // connections park on the 1s health timer instead of spinning
+                // the 4-pass outbound walk at 100 Hz.
+                let wait = if fin_retry {
+                    Duration::from_millis(RUN_POLL_MS)
+                } else {
+                    next_health.saturating_duration_since(std::time::Instant::now())
+                };
+                let _ = knet::timeout(wait, flush_notify.notified()).await;
 
                 buf.clear();
                 let ver = session.version();
                 let mut fin_ids = session.prepare_outbound_into(&mut buf, 65536, ver);
 
-                // Keepalive / timeout / reap (throttled ~1s)
-                if health == 0 {
-                    health = HEALTH_INTERVAL;
+                // Keepalive / timeout / reap — wall-clock cadence, immune to
+                // notify bursts (the old per-iteration counter sped up to well
+                // under 1s whenever writes were flowing).
+                if std::time::Instant::now() >= next_health {
+                    next_health = std::time::Instant::now() + SPAWN_HEALTH_PERIOD;
 
                     if session.is_keepalive_timeout() {
                         session.close();
@@ -447,7 +475,6 @@ impl SmuxConn {
                     }
                     fin_ids.extend(need_fin);
                 }
-                health -= 1;
 
                 if !buf.is_empty() {
                     // Only mark FINs as sent if the transport actually accepted the bytes.
@@ -455,6 +482,35 @@ impl SmuxConn {
                     if write.write_all(&buf).await.is_ok() {
                         session.mark_fins_sent(&fin_ids);
                     }
+                }
+
+                // Decide how the next wait can be parked:
+                // - unmarked FINs (write failed or batch truncated) retry on
+                //   the 10ms tick so the peer's EOF isn't delayed;
+                // - queued stream data preserves a notify permit so the next
+                //   64 KiB chunk goes out immediately — with the idle wait now
+                //   up to 1s, relying on the timer here would stall bulk
+                //   transfers.
+                let streams = session.streams();
+                let guard = streams.lock();
+                fin_retry = false;
+                let mut more_data = false;
+                for stream in guard.values() {
+                    if stream.pending_send() > 0 {
+                        more_data = true;
+                        break;
+                    }
+                    if stream.is_local_closed() && !stream.is_fin_sent() {
+                        fin_retry = true;
+                    }
+                }
+                drop(guard);
+                // Only data preserves a permit. A pending FIN must NOT
+                // notify: if the transport write keeps failing, notify →
+                // immediate re-run → fail → notify would spin the loop.
+                // `fin_retry` instead picks the 10ms timer at the top.
+                if more_data {
+                    flush_notify.notify_one();
                 }
             }
         });

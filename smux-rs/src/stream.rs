@@ -428,18 +428,41 @@ impl Stream {
     /// sent (for V2 flow control).
     pub fn read(&self, buf: &mut [u8]) -> Result<(usize, bool), StreamError> {
         let mut offset = 0;
-        {
-            let mut inner = self.recv.lock();
-            while offset < buf.len() && !inner.recv.is_empty() {
-                let front = inner.recv.front_mut().unwrap();
-                let to_copy = front.len().min(buf.len() - offset);
-                buf[offset..offset + to_copy].copy_from_slice(&front[..to_copy]);
-                offset += to_copy;
-                if to_copy == front.len() {
-                    inner.recv.pop_front();
-                } else {
-                    *front = front.slice(to_copy..);
+        // Pop whole/partial chunks out of the queue under the lock (metadata
+        // only) and copy into the caller's buffer after releasing it: a
+        // 16–64 KiB memcpy inside the critical section blocks the session
+        // read task's `push_data_bytes` for its full duration. Batches keep
+        // the lock cycles bounded (≤16 chunks per acquisition); a partial
+        // front chunk is consumed with `split_to` — head out, tail stays at
+        // the queue front — so no back-fill is needed.
+        while offset < buf.len() {
+            let mut batch: [Option<Bytes>; 16] = std::array::from_fn(|_| None);
+            let mut nbatch = 0usize;
+            let mut batch_bytes = 0usize;
+            {
+                let mut inner = self.recv.lock();
+                while nbatch < batch.len() && offset + batch_bytes < buf.len() {
+                    let Some(front_len) = inner.recv.front().map(|f| f.len()) else {
+                        break;
+                    };
+                    let room = buf.len() - offset - batch_bytes;
+                    if front_len <= room {
+                        batch[nbatch] = inner.recv.pop_front();
+                        batch_bytes += front_len;
+                    } else {
+                        batch[nbatch] = Some(inner.recv.front_mut().unwrap().split_to(room));
+                        batch_bytes += room;
+                    }
+                    nbatch += 1;
                 }
+            }
+            if nbatch == 0 {
+                break;
+            }
+            for chunk in &batch[..nbatch] {
+                let chunk = chunk.as_ref().unwrap();
+                buf[offset..offset + chunk.len()].copy_from_slice(chunk);
+                offset += chunk.len();
             }
         }
 
@@ -501,6 +524,16 @@ impl Stream {
         } else {
             false
         };
+        // The flush loop reclaims `tokens_to_return` and emits UPD frames
+        // (Pass 1/2 of prepare_outbound), but reads never notified it —
+        // a read-heavy flow relied purely on the loop's idle tick. Wake it
+        // when there is something outbound to do: a pending UPD, or enough
+        // accumulated window tokens to matter. Throttled by construction:
+        // `need_upd` fires at most once per max_recv_buf/2 bytes, tokens at
+        // most once per threshold.
+        if need_upd || self.tokens_to_return.load(Ordering::Relaxed) >= self.max_recv_buf / 4 {
+            self.notify_flush();
+        }
         Ok((offset, need_upd))
     }
 
@@ -585,16 +618,24 @@ impl Stream {
         if data.is_empty() {
             return Ok(0);
         }
-        let bytes = {
+        // Take a pooled buffer under the lock, fill it after releasing: the
+        // memcpy must not block the flush task's `drain_send_max` — the lock
+        // is only needed for pool / queue bookkeeping.
+        let mut buf = self.send.lock().pool.acquire();
+        buf.extend_from_slice(data);
+        let n = buf.len();
+        let bytes = buf.split_to(n).freeze();
+        {
             let mut inner = self.send.lock();
-            let mut buf = inner.pool.acquire();
-            buf.extend_from_slice(data);
-            let n = buf.len();
-            let bytes = buf.split_to(n).freeze();
             inner.pool.release(buf);
-            bytes
-        };
-        self.write_bytes(bytes)
+            if self.local_closed.load(Ordering::Acquire) {
+                return Err(StreamError::Closed);
+            }
+            inner.send.push_back(bytes);
+        }
+        self.send_buf_bytes.fetch_add(n, Ordering::Relaxed);
+        // Note: bytes_written tracks *on-wire* bytes (incremented in drain_send_max).
+        Ok(n)
     }
 
     /// Write a `Bytes` chunk into the send buffer (zero-copy enqueue).
@@ -626,19 +667,37 @@ impl Stream {
         }
         let limit = max_bytes.min(peer_win);
         let mut drained = 0;
-        {
-            let mut inner = self.send.lock();
-            while drained < limit && !inner.send.is_empty() {
-                let front = inner.send.front_mut().unwrap();
-                let take = front.len().min(limit - drained);
-                buf.extend_from_slice(&front[..take]);
-                drained += take;
-                if take == front.len() {
-                    inner.send.pop_front();
-                } else {
-                    *front = front.slice(take..);
+        // Pop chunks under the lock (metadata only), append to the frame
+        // buffer after releasing it — mirrors `read()`: the memcpy must not
+        // block writers calling `write()` concurrently.
+        while drained < limit {
+            let mut batch: [Option<Bytes>; 16] = std::array::from_fn(|_| None);
+            let mut nbatch = 0usize;
+            let mut batch_bytes = 0usize;
+            {
+                let mut inner = self.send.lock();
+                while nbatch < batch.len() && drained + batch_bytes < limit {
+                    let Some(front_len) = inner.send.front().map(|f| f.len()) else {
+                        break;
+                    };
+                    let room = limit - drained - batch_bytes;
+                    if front_len <= room {
+                        batch[nbatch] = inner.send.pop_front();
+                        batch_bytes += front_len;
+                    } else {
+                        batch[nbatch] = Some(inner.send.front_mut().unwrap().split_to(room));
+                        batch_bytes += room;
+                    }
+                    nbatch += 1;
                 }
             }
+            if nbatch == 0 {
+                break;
+            }
+            for chunk in &batch[..nbatch] {
+                buf.extend_from_slice(chunk.as_ref().unwrap());
+            }
+            drained += batch_bytes;
         }
         if drained > 0 {
             self.send_buf_bytes.fetch_sub(drained, Ordering::Relaxed);
@@ -898,6 +957,11 @@ impl Stream {
         self.send_buf_bytes.store(0, Ordering::Relaxed);
         self.ch_reader_wakeup.notify_one();
         self.ch_write_wakeup.notify_one();
+        // `close()` makes this stream a FIN candidate (local_closed, send
+        // buffer empty); without a notify the FIN waits for the flush loop's
+        // idle tick. Session-close paths reaping the loop are unaffected —
+        // they break out on `is_closed()` before flushing.
+        self.notify_flush();
         if let Some(w) = read_waker {
             w.wake();
         }

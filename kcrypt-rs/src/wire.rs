@@ -636,8 +636,9 @@ pub fn encrypt_batch_ref_into(
                         break;
                     }
                     // CryptEngine enum dispatch (no dyn vtable).
-                    // For AES CFB the encrypt call goes through
-                    // aes::BlockEncrypt::encrypt_blocks for ILP on AES-NI/ARMv8.
+                    // AES CFB itself is serial per packet (cfb16_encrypt
+                    // chains blocks via encrypt_block); the ILP here comes
+                    // from running whole packets on separate threads.
                     handles.push(s.spawn(move || {
                         let mut r = Vec::with_capacity(chunk.len());
                         for mut buf in chunk {

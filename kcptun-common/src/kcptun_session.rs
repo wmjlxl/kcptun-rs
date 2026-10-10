@@ -793,12 +793,23 @@ async fn write_loop(
     limiter: Arc<RateLimiter>,
     out_state: Arc<OutState>,
 ) {
-    // KCP owns its own event-driven flush loop. Stream writes notify this task
-    // directly, so this is only an idle health-check cadence. A 2ms timer per
-    // session dominates short concurrent transfers.
+    // KCP owns its own event-driven flush loop. Stream writes, shutdowns,
+    // opens, closes and read-side window updates all notify this task
+    // directly, so the timer only carries the health check (~500ms) plus a
+    // 10ms retry for FINs that could not go out yet (KCP window / failed
+    // write). An idle session used to wake 100×/s here polling for work
+    // that producers now announce themselves.
     const IDLE_WAKE_MS: u64 = 10;
+    const HEALTH_PERIOD: Duration = Duration::from_millis(500);
     let mut out = BytesMut::with_capacity(64 * 1024);
-    let mut health = 0u32;
+    // Due immediately, matching the old `health = 0` start (first iteration
+    // ran the keepalive / dead check).
+    let mut next_health = std::time::Instant::now();
+    // FIN emission can be deferred: `allow_fin` is false while KCP still has
+    // unacknowledged data, and a failed transport write leaves the FIN
+    // unmarked. KCP draining produces no SMUX notify, so poll those cases on
+    // the old 10ms tick — everything else parks until the health deadline.
+    let mut fin_wait = false;
     while !dead.load(Ordering::Acquire) && !smux.is_closed() && !kcp.is_closed() {
         // Fast path: a wake is already pending (a stream write or the previous
         // iteration's `notify_one` preserved a permit) — await it directly so
@@ -806,10 +817,17 @@ async fn write_loop(
         if flush.has_pending() {
             flush.notified().await;
         } else {
-            let _ = knet::timeout(Duration::from_millis(IDLE_WAKE_MS), flush.notified()).await;
+            let wait = if fin_wait {
+                Duration::from_millis(IDLE_WAKE_MS)
+            } else {
+                next_health.saturating_duration_since(std::time::Instant::now())
+            };
+            let _ = knet::timeout(wait, flush.notified()).await;
         }
-        if health == 0 {
-            health = 50;
+        // Wall-clock health cadence: notify bursts used to accelerate the
+        // old per-iteration counter to far better than 500ms.
+        if std::time::Instant::now() >= next_health {
+            next_health = std::time::Instant::now() + HEALTH_PERIOD;
             if kcp.is_dead() || smux.is_keepalive_timeout() {
                 break;
             }
@@ -817,8 +835,6 @@ async fn write_loop(
                 smux.keepalive_frame().encode(&mut out);
                 smux.mark_keepalive_sent();
             }
-        } else {
-            health -= 1;
         }
         let has_pending_stream_data = smux
             .streams()
@@ -914,15 +930,33 @@ async fn write_loop(
             // `prepare_outbound_into_controlled` deliberately caps each KCP
             // write to 64 KiB. If a stream still has queued data, preserve a
             // notify permit for the next iteration instead of imposing the
-            // idle 2ms poll delay between chunks (a 128 KiB TCP write commonly
+            // idle poll delay between chunks (a 128 KiB TCP write commonly
             // needs two iterations). Backpressure remains bounded by
             // `write_all`, which waits when the KCP window is full.
-            if smux
-                .streams()
-                .lock()
-                .values()
-                .any(|stream| stream.pending_send() > 0)
+            //
+            // `fin_wait` covers the complementary case: a FIN that could not
+            // go out this round (KCP still draining / write failed) has no
+            // producer to notify us — poll it on the 10ms tick.
+            let mut more_data = false;
+            fin_wait = false;
             {
+                let streams = smux.streams();
+                let guard = streams.lock();
+                for stream in guard.values() {
+                    if stream.pending_send() > 0 {
+                        more_data = true;
+                        break;
+                    }
+                    if stream.is_local_closed() && !stream.is_fin_sent() {
+                        fin_wait = true;
+                    }
+                }
+            }
+            // Only data preserves a permit. A pending FIN must NOT notify:
+            // if KCP still can't take it, notify → immediate re-run → still
+            // can't → notify would spin the loop. `fin_wait` instead picks
+            // the 10ms timer at the top of the loop.
+            if more_data {
                 flush.notify_one();
             }
         }

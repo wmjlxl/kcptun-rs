@@ -691,7 +691,10 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
         } else {
             SESSION_INBOX_CAP
         };
-        let mut slot = vec![0u8; MAX_DATAGRAM];
+        // First-packet scratch for each wakeup. Refilled from the shared
+        // BufPool after `take` hands the buffer to `burst` — a fresh
+        // `vec![0; MAX_DATAGRAM]` would malloc 2KB on every quiet wakeup.
+        let mut slot = acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
         let mut watched: Vec<(SocketAddr, u64)> = Vec::new();
         // Reused across bursts: the datagram buffers themselves move into
         // queues / KCP, so only the index vectors are cleared.
@@ -716,7 +719,18 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
             // already up to date when that returns. Eviction then runs once
             // per burst on the peers just watched.
 
-            slot.resize(MAX_DATAGRAM, 0);
+            // Refill `slot` after a previous `take` emptied it: keep the
+            // `vec![0; ...]`-equivalent len, but source capacity from the
+            // pool so a taken (cap-0) vec doesn't malloc 2KB every wakeup.
+            if slot.len() < MAX_DATAGRAM {
+                if slot.capacity() < MAX_DATAGRAM {
+                    slot = acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
+                    if slot.capacity() < MAX_DATAGRAM {
+                        slot.reserve(MAX_DATAGRAM - slot.capacity());
+                    }
+                }
+                slot.resize(MAX_DATAGRAM, 0);
+            }
             // The timeout bounds a live listener so the idle sweep runs on a
             // quiet socket. `stop` ends the task when the listener is dropped.
             let first = knet::timeout(

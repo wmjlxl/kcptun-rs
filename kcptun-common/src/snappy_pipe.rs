@@ -20,6 +20,28 @@ use bytes::{Buf, BytesMut};
 
 use crate::SnappyStreamDecoder;
 
+/// `io::Write` adapter over a [`BytesMut`] — `bytes` does not implement
+/// `io::Write`, so this lets `snap::FrameEncoder` compress straight into the
+/// staged buffer instead of an intermediate `Vec` that had to be taken and
+/// reallocated on every write.
+///
+/// NOTE: the write side deliberately keeps one flush per `poll_write` (small
+/// writes each become their own frame) rather than accumulating to a block
+/// threshold: upper layers (`SmuxConn` write task, session keepalive NOPs)
+/// call `write_all` without `poll_flush`, so deferring the flush would park
+/// small frames — including keepalives — until 32 KiB accumulates.
+struct BytesMutWriter(BytesMut);
+
+impl std::io::Write for BytesMutWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Snappy session codec adapter (`AsyncRead + AsyncWrite`).
 ///
 /// - **Write side** buffers compressed bytes until the inner transport accepts
@@ -31,7 +53,14 @@ pub struct SnappyPipe<T> {
     inner: T,
     compress: bool,
     // ── write side ──
-    encoder: Option<snap::write::FrameEncoder<Vec<u8>>>,
+    /// Compressed output goes straight into the encoder's writer (a
+    /// `BytesMut`), never through an intermediate `Vec` that had to be
+    /// `mem::take`-en and reallocated on every write. In passthrough mode
+    /// this is `None` and `pending` carries the bytes instead.
+    encoder: Option<snap::write::FrameEncoder<BytesMutWriter>>,
+    /// Bytes staged for the inner transport in passthrough mode. When
+    /// compressing, the staged bytes live in the encoder's writer
+    /// (`BytesMutWriter`) instead.
     pending: BytesMut,
     // ── read side ──
     decoder: SnappyStreamDecoder,
@@ -52,7 +81,9 @@ where
         SnappyPipe {
             inner,
             compress,
-            encoder: compress.then(|| snap::write::FrameEncoder::new(Vec::new())),
+            encoder: compress.then(|| {
+                snap::write::FrameEncoder::new(BytesMutWriter(BytesMut::with_capacity(64 * 1024)))
+            }),
             pending: BytesMut::new(),
             decoder: SnappyStreamDecoder::new(),
             dec_out: VecDeque::new(),
@@ -160,9 +191,9 @@ where
     // ── write side ──────────────────────────────────────────────────────────
 
     fn poll_write_impl(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        // 1. Drain any pending bytes to the inner transport first; propagate
+        // 1. Drain any staged bytes to the inner transport first; propagate
         //    backpressure (Pending) so we don't buffer unboundedly.
-        if !self.pending.is_empty() {
+        if !self.is_staged_empty() {
             match self.drain_pending(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -170,18 +201,20 @@ where
             }
         }
 
-        // 2. Accept new input into `pending` (compress or passthrough).
+        // 2. Accept new input into `buf` (compress or passthrough).
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
         if self.compress {
             use std::io::Write;
             let enc = self.encoder.as_mut().expect("encoder set when compress");
+            // One flush per poll_write (see `BytesMutWriter`): the compressed
+            // frame lands directly in the writer's `BytesMut`, staged for the
+            // drain below — no intermediate `Vec`, no take/realloc, one copy
+            // fewer than the old pending-extend path.
             if enc.write_all(buf).is_err() || enc.flush().is_err() {
                 return Poll::Ready(Err(io::Error::other("snappy encode failed")));
             }
-            self.pending
-                .extend_from_slice(&std::mem::take::<Vec<u8>>(enc.get_mut()));
         } else {
             self.pending.extend_from_slice(buf);
         }
@@ -201,15 +234,11 @@ where
             use std::io::Write;
             let enc = self.encoder.as_mut().expect("encoder set when compress");
             let _ = enc.flush();
-            if !enc.get_mut().is_empty() {
-                self.pending
-                    .extend_from_slice(&std::mem::take::<Vec<u8>>(enc.get_mut()));
-            }
         }
         match self.drain_pending(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
         }
     }
 
@@ -231,14 +260,46 @@ where
         inner_poll_shutdown(&mut self.inner, cx)
     }
 
+    /// True when nothing is staged for the inner transport.
+    fn is_staged_empty(&self) -> bool {
+        match self.encoder {
+            Some(ref enc) => enc.get_ref().0.is_empty(),
+            None => self.pending.is_empty(),
+        }
+    }
+
+    /// Drain staged bytes to the inner transport.
+    ///
+    /// Compressing: the staged buffer is the encoder's own writer — the
+    /// compressed frames land there directly (no intermediate `Vec` hop).
+    /// Passthrough: `pending`. After a partial write the remainder stays
+    /// staged; the next call resumes from the front.
     fn drain_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
-            if self.pending.is_empty() {
+            // Destructure so the staged buffer (`encoder`/`pending`) and the
+            // transport (`inner`) are disjoint field borrows in one call.
+            let Self {
+                inner,
+                encoder,
+                pending,
+                ..
+            } = self;
+            let staged: &mut BytesMut = match encoder {
+                Some(enc) => &mut enc.get_mut().0,
+                None => pending,
+            };
+            if staged.is_empty() {
                 return Poll::Ready(Ok(()));
             }
-            match inner_poll_write(&mut self.inner, cx, &self.pending) {
+            match inner_poll_write(inner, cx, staged) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Ok(())),
-                Poll::Ready(Ok(n)) => self.pending.advance(n),
+                Poll::Ready(Ok(n)) => {
+                    let staged: &mut BytesMut = match encoder {
+                        Some(enc) => &mut enc.get_mut().0,
+                        None => pending,
+                    };
+                    staged.advance(n);
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
