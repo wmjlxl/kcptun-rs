@@ -322,7 +322,10 @@ fn snmp_send_recv_counts_upper_bytes() {
     b.set_nodelay(1, 10, 2, 1);
     a.send(b"abcdef").unwrap();
     a.update(10);
-    a.flush();
+    // Simulated clock: flush() would compare wall time against
+    // resendts≈10+RTO, RTO-retransmit the just-sent segment and pollute
+    // the global lost_segs counter other tests assert on.
+    a.flush_with_current(10, true);
     let pkts = store.lock().unwrap().clone();
     assert!(!pkts.is_empty());
     for p in &pkts {
@@ -507,9 +510,14 @@ fn test_fast_retransmit_fires_on_duplicate_acks() {
     sender.send(b"BBB").unwrap();
     sender.send(b"CCC").unwrap();
 
-    // Flush at t=100 → moves segments to snd_buf, sends them
+    // Flush at t=100 → moves segments to snd_buf, sends them.
+    // MUST use the simulated clock: `flush()` reads wall_ms(), and its real
+    // epoch timestamp compared via signed itimediff() against
+    // resendts≈100+RTO retransmits all 3 segments (or not) purely depending
+    // on where epoch_ms mod 2^32 lands — this test passed or failed on a
+    // ~25-day cycle. Keep every flush on the update() timeline.
     sender.update(100);
-    sender.flush();
+    sender.flush_with_current(100, true);
 
     // Extract individual KCP segments from wire packets (a wire packet
     // may contain multiple KCP segments packed up to MTU).
@@ -551,9 +559,10 @@ fn test_fast_retransmit_fires_on_duplicate_acks() {
         receiver.input_no_flush(seg, false).unwrap();
     }
 
-    // Step 3: Receiver flushes → sends ACKs for received segments
+    // Step 3: Receiver flushes → sends ACKs for received segments.
+    // Simulated clock — see the note at Step 1 (flush() would use wall time).
     receiver.update(110);
-    receiver.flush();
+    receiver.flush_with_current(110, true);
 
     let receiver_segs = extract_segments(&receiver_out.lock().unwrap().clone());
     let ack_segs: Vec<_> = receiver_segs
@@ -573,10 +582,13 @@ fn test_fast_retransmit_fires_on_duplicate_acks() {
         sender.input_no_flush(seg, false).unwrap();
     }
 
-    // Step 5: Sender flushes → should fast retransmit segment 0
+    // Step 5: Sender flushes → should fast retransmit segment 0.
+    // Simulated clock — a wall-clock flush() here would ALSO RTO-retransmit
+    // on resendts (epoch vs 120+RTO), making lost_segs nonzero and failing
+    // the `lost == 0` assertion at the mercy of the epoch sawtooth.
     sender_out.lock().unwrap().clear();
     sender.update(120);
-    sender.flush();
+    sender.flush_with_current(120, true);
 
     let fast_retrans = crate::snmp::DEFAULT_SNMP
         .fast_retrans
