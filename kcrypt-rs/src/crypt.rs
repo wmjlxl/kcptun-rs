@@ -331,6 +331,13 @@ pub fn cfb16_encrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
 
 /// CFB-128 decrypt using a `BlockCipher16`.
 ///
+/// Decryption keystream block `j` is `E(ciphertext[j-1])`: every input is
+/// known before a single byte of the packet is touched, so the block
+/// encryptions are independent and are issued through
+/// [`BlockCipher16::encrypt_blocks`] (AES-NI pipelines them; the old serial
+/// `encrypt_block` chain could not). Output is bit-identical to the serial
+/// chain — same keystream, same XOR.
+///
 /// Uses direct byte indexing (matching `cfb8_decrypt`) instead of
 /// `try_into().unwrap()` to avoid runtime bounds checks in the hot path.
 #[inline]
@@ -338,8 +345,9 @@ pub fn cfb16_decrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
     if data.is_empty() {
         return;
     }
-    // Mirror cfb16_encrypt: reuse the cached E(GO_CFB_IV) when provided.
-    let mut tbl = match c.cached_first_keystream() {
+    // First keystream block is E(GO_CFB_IV); reuse the cached copy when the
+    // implementation provides it (mirrors cfb16_encrypt).
+    let first = match c.cached_first_keystream() {
         Some(k) => k,
         None => {
             let mut t = GO_CFB_IV;
@@ -349,39 +357,83 @@ pub fn cfb16_decrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
             t
         }
     };
-    let mut i = 0;
-    while i + 16 <= data.len() {
-        let chunk = &mut data[i..i + 16];
-        let src = [
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
-        ];
-        let mut b = [0u8; 16];
-        c.encrypt_block(&mut b, &tbl);
-        let b0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-        let b1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
-        let s0 = u64::from_le_bytes([
-            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
-        ]);
-        let s1 = u64::from_le_bytes([
-            src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
-        ]);
-        let out0 = (s0 ^ b0).to_le_bytes();
-        let out1 = (s1 ^ b1).to_le_bytes();
-        chunk[0..8].copy_from_slice(&out0);
-        chunk[8..16].copy_from_slice(&out1);
-        tbl = src;
-        i += 16;
-    }
-    if i < data.len() {
-        let chunk = &mut data[i..];
-        let len = chunk.len();
-        let mut b = [0u8; 16];
-        c.encrypt_block(&mut b, &tbl);
+    let nblocks = data.len() / 16;
+    // Block-0 keystream: the existing chain feeds `E(GO_CFB_IV)` (the cached
+    // `first`) back through E once — E(E(IV)), not bare E(IV). Keep that
+    // bit-for-bit: this item only reorders the *independent* E() calls, it
+    // must not change a single output byte.
+    let mut ks0 = [0u8; 16];
+    c.encrypt_block(&mut ks0, &first);
+    if nblocks == 0 {
+        // Sub-block packet: keystream is E(first).
+        let len = data.len();
         for j in 0..len {
-            chunk[j] ^= b[j];
+            data[j] ^= ks0[j];
+        }
+        return;
+    }
+    // Block 0 xors with `ks0`; its ciphertext feeds keystream[1], so save
+    // it before touching the buffer.
+    let mut prev_ct = [0u8; 16];
+    prev_ct.copy_from_slice(&data[..16]);
+    xor16(&mut data[..16], &ks0);
+
+    // Blocks 1..nblocks in chunks of CHUNK: input[k] = ciphertext[j-1+k].
+    // All inputs are still intact — blocks >= j are xored only after the
+    // batch encrypt, and ct[j-1] is carried in `prev_ct`.
+    const CHUNK: usize = 16;
+    let mut ks = [0u8; CHUNK * 16];
+    let mut j = 1usize;
+    while j < nblocks {
+        let m = CHUNK.min(nblocks - j);
+        ks[..16].copy_from_slice(&prev_ct);
+        for k in 1..m {
+            let off = (j - 1 + k) * 16;
+            ks[k * 16..k * 16 + 16].copy_from_slice(&data[off..off + 16]);
+        }
+        let last_off = (j + m - 1) * 16;
+        let mut last_ct = [0u8; 16];
+        last_ct.copy_from_slice(&data[last_off..last_off + 16]);
+        c.encrypt_blocks(&mut ks[..m * 16]);
+        for k in 0..m {
+            let off = (j + k) * 16;
+            xor16(&mut data[off..off + 16], &ks[k * 16..k * 16 + 16]);
+        }
+        prev_ct = last_ct;
+        j += m;
+    }
+
+    // Trailing bytes after the last full block: E(last full ciphertext).
+    let tail = nblocks * 16;
+    if tail < data.len() {
+        let mut b = [0u8; 16];
+        c.encrypt_block(&mut b, &prev_ct);
+        for (t, byte) in data[tail..].iter_mut().enumerate() {
+            *byte ^= b[t];
         }
     }
+}
+
+/// XOR exactly 16 bytes, split into two u64 halves (hot-path idiom shared by
+/// the CFB loops; keeps bounds checks out of the per-block work).
+#[inline]
+fn xor16(dst: &mut [u8], src: &[u8]) {
+    let a0 = u64::from_le_bytes([
+        dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7],
+    ]);
+    let a1 = u64::from_le_bytes([
+        dst[8], dst[9], dst[10], dst[11], dst[12], dst[13], dst[14], dst[15],
+    ]);
+    let b0 = u64::from_le_bytes([
+        src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+    ]);
+    let b1 = u64::from_le_bytes([
+        src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
+    ]);
+    let out0 = (a0 ^ b0).to_le_bytes();
+    let out1 = (a1 ^ b1).to_le_bytes();
+    dst[0..8].copy_from_slice(&out0);
+    dst[8..16].copy_from_slice(&out1);
 }
 
 // ─── Cipher Selection ──────────────────────────────────────────────────
@@ -747,6 +799,116 @@ mod tests {
                 !s.contains("abab") && !s.contains("171, 171"),
                 "{m} leaks key material"
             );
+        }
+    }
+
+    /// Pre-O9 serial reference: keystream chain `E(prev_ciphertext)`, one
+    /// `encrypt_block` per block. Kept here to prove the batched
+    /// `cfb16_decrypt` is bit-identical across packet sizes.
+    fn serial_cfb16_decrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
+        if data.is_empty() {
+            return;
+        }
+        let mut tbl = match c.cached_first_keystream() {
+            Some(k) => k,
+            None => {
+                let mut t = GO_CFB_IV;
+                let mut b = [0u8; 16];
+                c.encrypt_block(&mut b, &t);
+                t.copy_from_slice(&b);
+                t
+            }
+        };
+        let mut i = 0;
+        while i + 16 <= data.len() {
+            let chunk = &mut data[i..i + 16];
+            let src = [
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14],
+                chunk[15],
+            ];
+            let mut b = [0u8; 16];
+            c.encrypt_block(&mut b, &tbl);
+            let b0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            let b1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+            let s0 = u64::from_le_bytes([
+                src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+            ]);
+            let s1 = u64::from_le_bytes([
+                src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
+            ]);
+            let out0 = (s0 ^ b0).to_le_bytes();
+            let out1 = (s1 ^ b1).to_le_bytes();
+            chunk[0..8].copy_from_slice(&out0);
+            chunk[8..16].copy_from_slice(&out1);
+            tbl = src;
+            i += 16;
+        }
+        if i < data.len() {
+            let chunk = &mut data[i..];
+            let len = chunk.len();
+            let mut b = [0u8; 16];
+            c.encrypt_block(&mut b, &tbl);
+            for j in 0..len {
+                chunk[j] ^= b[j];
+            }
+        }
+    }
+
+    /// Mock cipher with the *default* `encrypt_blocks` (loop) and the
+    /// *default* `cached_first_keystream` (None) — covers the trait-default
+    /// batch path and the on-the-fly E(IV) branch.
+    struct MockCipher;
+    impl BlockCipher16 for MockCipher {
+        fn encrypt_block(&self, out: &mut [u8; 16], inp: &[u8; 16]) {
+            for i in 0..16 {
+                out[i] = inp[i].rotate_left(1) ^ 0x5A;
+            }
+            out.swap(0, 8);
+            out.swap(3, 12);
+        }
+    }
+
+    fn assert_bit_identical<C: BlockCipher16>(c: &C, sizes: &[usize]) {
+        for &size in sizes {
+            let mut a: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+            let mut b = a.clone();
+            serial_cfb16_decrypt(&mut a, c);
+            cfb16_decrypt(&mut b, c);
+            assert_eq!(a, b, "batched != serial reference at size={size}");
+        }
+    }
+
+    const SIZES: &[usize] = &[
+        0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 256, // exactly CHUNK blocks
+        272, // CHUNK + 1 blocks
+        100, 1326, // typical kcptun datagram payload
+        4096, // 16 chunks exactly, no tail
+        4099, // chunks + odd tail
+    ];
+
+    #[test]
+    fn cfb16_decrypt_batched_matches_serial_aes() {
+        let c = super::aes_cfb::AesCfbCrypt::new(&[0x2Bu8; 16]);
+        assert_bit_identical(&c, SIZES);
+    }
+
+    #[test]
+    fn cfb16_decrypt_batched_matches_serial_default_backend() {
+        assert_bit_identical(&MockCipher, SIZES);
+    }
+
+    #[test]
+    fn cfb16_decrypt_batched_roundtrip_after_encrypt() {
+        // Encrypt-then-batch-decrypt must restore the plaintext for the
+        // real AES backend (Go wire path shape).
+        let c = super::aes_cfb::AesCfbCrypt::new(&[0x91u8; 32]);
+        for &size in SIZES {
+            let original: Vec<u8> = (0..size).map(|i| (i * 13 + 5) as u8).collect();
+            let mut buf = original.clone();
+            cfb16_encrypt(&mut buf, &c);
+            cfb16_decrypt(&mut buf, &c);
+            assert_eq!(buf, original, "roundtrip failed at size={size}");
         }
     }
 }

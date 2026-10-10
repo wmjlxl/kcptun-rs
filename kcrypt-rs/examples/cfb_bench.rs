@@ -14,7 +14,7 @@
 //!   cargo run --release -p kcrypt-rs --example cfb_bench -- <method> <enc|dec> [iters] [size]
 //!   e.g. cfb_bench aes dec 2000000 1326
 
-use kcrypt_rs::{AeadCrypt, BlockCrypt, CryptEngine};
+use kcrypt_rs::{BlockCrypt, CryptEngine};
 use std::time::Instant;
 
 fn main() {
@@ -25,10 +25,7 @@ fn main() {
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(2_000_000);
-    let size: usize = args
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1326);
+    let size: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1326);
     assert!(mode == "enc" || mode == "dec", "mode must be enc|dec");
 
     let (crypt, name) = CryptEngine::select(method, b"kcptun-bench-key");
@@ -80,7 +77,11 @@ fn main() {
 
     let ns_per_pkt = elapsed.as_nanos() as f64 / iters as f64;
     let mbps = (size as f64 * iters as f64) / elapsed.as_secs_f64() / 1e6;
-    let note = if is_aead { " (aead, incl. per-call Vec alloc)" } else { "" };
+    let note = if is_aead {
+        " (aead, incl. per-call Vec alloc)"
+    } else {
+        ""
+    };
     println!(
         "method={name} mode={mode} size={size} iters={iters} total_s={:.3} ns/pkt={ns_per_pkt:.1} MB/s={mbps:.1}{note}",
         elapsed.as_secs_f64()
