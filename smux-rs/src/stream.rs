@@ -34,12 +34,12 @@ const MIN_SEND_BUFFER: usize = 262_144;
 /// Reduces `Bytes::copy_from_slice` allocations on the hot write/push_data path
 /// by reusing `BytesMut` capacity. When the pool is empty, falls back to
 /// `Bytes::copy_from_slice` (same behavior as before).
-struct BytesPool {
+pub(crate) struct BytesPool {
     buffers: Vec<BytesMut>,
 }
 
 impl BytesPool {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BytesPool {
             buffers: Vec::with_capacity(POOL_MAX_BUFFERS),
         }
@@ -117,16 +117,12 @@ struct RecvInner {
     /// than its flush; without the grace, `read` EOFs and the caller's pipe
     /// completes, dropping the tail).
     remote_closed_at: Option<Instant>,
-    /// Buffer pool for inbound data chunks (reduces Bytes::copy_from_slice alloc).
-    pool: BytesPool,
 }
 
 /// Send half + write waker (separate mutex so push/read does not block drain).
 struct SendInner {
     send: VecDeque<Bytes>,
     write_waker: Option<Waker>,
-    /// Buffer pool for outbound data chunks (reduces Bytes::copy_from_slice alloc).
-    pool: BytesPool,
 }
 
 /// A single logical stream within a SMUX session.
@@ -212,6 +208,12 @@ pub struct Stream {
     flush_notify: Mutex<Option<Arc<knet::Notify>>>,
     /// Weak self-reference so a grace-expiry wakeup task can re-wake a reader.
     self_ref: Mutex<Option<std::sync::Weak<Stream>>>,
+    /// Send-side [`BytesPool`], **shared session-wide** (O15): the session
+    /// installs its single pool via `set_send_pool` before publishing the
+    /// stream, so 1024 live streams hold one pool's worth of 16 KiB buffers
+    /// instead of each retaining its own (16 MiB → ~16 KiB). Standalone
+    /// streams (tests, `io.rs`) lazily create a private pool on first write.
+    send_pool: std::sync::OnceLock<Arc<Mutex<BytesPool>>>,
 }
 
 impl Stream {
@@ -225,12 +227,10 @@ impl Stream {
                 read_waker: None,
                 local_closed_at: None,
                 remote_closed_at: None,
-                pool: BytesPool::new(),
             }),
             send: Mutex::new(SendInner {
                 send: VecDeque::new(),
                 write_waker: None,
-                pool: BytesPool::new(),
             }),
             send_buf_bytes: AtomicUsize::new(0),
             recv_buf_bytes_avail: AtomicUsize::new(0),
@@ -255,7 +255,24 @@ impl Stream {
             ch_write_wakeup: knet::Notify::new(),
             flush_notify: Mutex::new(None),
             self_ref: Mutex::new(None),
+            send_pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The send-side pool — the session-wide shared one once `set_send_pool`
+    /// ran, otherwise a lazily-created private pool (standalone streams).
+    #[inline]
+    fn send_pool(&self) -> &Arc<Mutex<BytesPool>> {
+        self.send_pool
+            .get_or_init(|| Arc::new(Mutex::new(BytesPool::new())))
+    }
+
+    /// Install the session-wide shared send pool (O15). Called by `Session`
+    /// right after construction, before the stream is published anywhere;
+    /// a late call (first write already ran) is ignored — that stream keeps
+    /// its private pool.
+    pub(crate) fn set_send_pool(&self, pool: Arc<Mutex<BytesPool>>) {
+        let _ = self.send_pool.set(pool);
     }
 
     /// Attach a weak self-reference (set by the Session after Arc creation) so a
@@ -388,25 +405,15 @@ impl Stream {
 
     /// Push incoming data into the receive buffer.
     ///
-    /// Uses the internal [`BytesPool`] to avoid `Bytes::copy_from_slice`
-    /// allocation when a pooled buffer is available. The buffer is copied
-    /// into a pooled `BytesMut`, then split and frozen; the remaining capacity
-    /// is returned to the pool for reuse.
+    /// The production path is `push_data_bytes` (zero-copy); this copy-in
+    /// helper remains for tests and simple callers. O15 removed the recv-side
+    /// [`BytesPool`]: its only caller was this method, which nothing in the
+    /// session stack uses anymore — the pool sat empty per stream.
     pub fn push_data(&self, data: &[u8]) -> Result<(), StreamError> {
         if data.is_empty() {
             return Ok(());
         }
-        let bytes = {
-            let mut inner = self.recv.lock();
-            let mut buf = inner.pool.acquire();
-            buf.extend_from_slice(data);
-            let n = buf.len();
-            let bytes = buf.split_to(n).freeze();
-            // Return the remaining BytesMut (with preserved capacity) to pool
-            inner.pool.release(buf);
-            bytes
-        };
-        self.push_data_bytes(bytes)
+        self.push_data_bytes(Bytes::copy_from_slice(data))
     }
 
     /// Push incoming data as a `Bytes` (zero-copy append).
@@ -644,13 +651,16 @@ impl Stream {
         // Take a pooled buffer under the lock, fill it after releasing: the
         // memcpy must not block the flush task's `drain_send_max` — the lock
         // is only needed for pool / queue bookkeeping.
-        let mut buf = self.send.lock().pool.acquire();
+        // Session-shared pool (O15): pop under its own mutex, memcpy with no
+        // lock held (the popped buffer is exclusively ours), push back, then
+        // queue — the queue lock is never held across the copy either.
+        let mut buf = self.send_pool().lock().acquire();
         buf.extend_from_slice(data);
         let n = buf.len();
         let bytes = buf.split_to(n).freeze();
+        self.send_pool().lock().release(buf);
         {
             let mut inner = self.send.lock();
-            inner.pool.release(buf);
             if self.local_closed.load(Ordering::Acquire) {
                 return Err(StreamError::Closed);
             }

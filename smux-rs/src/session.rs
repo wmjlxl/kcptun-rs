@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use bytes::{Bytes, BytesMut};
 
 use crate::frame::{Cmd, Frame, FrameCodec};
-use crate::stream::{Stream, StreamState};
+use crate::stream::{BytesPool, Stream, StreamState};
 
 /// Highest stream id an `open_stream` may hand out.
 ///
@@ -209,6 +209,11 @@ pub struct Session {
     stream_ids_exhausted: AtomicBool,
     /// Frame codec for encoding/decoding frames.
     codec: Arc<Mutex<FrameCodec>>,
+    /// Session-wide shared send-side buffer pool (O15): every stream this
+    /// session creates swaps its private pool for this one before publish,
+    /// so N live streams share one pool's worth of 16 KiB buffers instead
+    /// of retaining N of their own.
+    send_pool: Arc<Mutex<BytesPool>>,
     /// Keepalive interval.
     keepalive_interval: Duration,
     /// Time of last keepalive.
@@ -264,6 +269,7 @@ impl Session {
                     .min(config.max_receive_buffer),
                 config.max_codec_buffered,
             ))),
+            send_pool: Arc::new(Mutex::new(BytesPool::new())),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
             last_keepalive_ms: AtomicU64::new(knet::mono_ms()),
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
@@ -452,6 +458,8 @@ impl Session {
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
         stream.set_self_ref(Arc::downgrade(&stream));
+        // O15: share the session-wide send pool before the stream is published.
+        stream.set_send_pool(self.send_pool.clone());
         stream.set_state(StreamState::Ready);
         stream.mark_opened();
         // SMUX v1 has no UPD / per-stream send window.
@@ -484,6 +492,8 @@ impl Session {
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
         stream.set_self_ref(Arc::downgrade(&stream));
+        // O15: share the session-wide send pool before the stream is published.
+        stream.set_send_pool(self.send_pool.clone());
         stream.set_state(StreamState::Ready);
         stream.mark_opened();
         // SMUX v1 has no UPD / per-stream send window.
