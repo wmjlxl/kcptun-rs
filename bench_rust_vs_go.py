@@ -52,7 +52,7 @@ def _pids_on_port(port):
     try:
         out = subprocess.check_output(
             ['lsof', f'-tiTCP:{port}', '-sTCP:LISTEN'],
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=subprocess.DEVNULL, universal_newlines=True)
         pids.update(int(x) for x in out.split() if x.strip().isdigit())
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
@@ -60,7 +60,7 @@ def _pids_on_port(port):
     try:
         out = subprocess.check_output(
             ['lsof', f'-tiUDP:{port}'],
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=subprocess.DEVNULL, universal_newlines=True)
         pids.update(int(x) for x in out.split() if x.strip().isdigit())
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
@@ -68,7 +68,7 @@ def _pids_on_port(port):
     try:
         out = subprocess.check_output(
             ['lsof', f'-ti:{port}'],
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=subprocess.DEVNULL, universal_newlines=True)
         pids.update(int(x) for x in out.split() if x.strip().isdigit())
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
