@@ -521,11 +521,64 @@ impl Session {
             )));
         }
 
+        self.decode_frames(&mut codec, data.len())
+    }
+
+    /// Detach the codec's inbound buffer for a direct transport read (O13).
+    ///
+    /// Returns the buffer (possibly holding an undecoded partial frame) plus
+    /// how many more bytes it may accept before `max_buffered`. The reader
+    /// fills it via `read_buf` (one memcpy less than read-vec → `feed`) and
+    /// hands it back through [`end_inbound_read`]. Only the session's own
+    /// read task does this — `process_data` callers see an empty codec
+    /// window in between, which is fine because that same read task is the
+    /// only producer of inbound bytes.
+    pub(crate) fn begin_inbound_read(&self) -> (bytes::BytesMut, usize) {
+        let mut codec = self.codec.lock();
+        let allowance = codec.max_buffered().saturating_sub(codec.len());
+        (codec.take_buf(), allowance)
+    }
+
+    /// Reattach a buffer from [`begin_inbound_read`] and decode it.
+    ///
+    /// Cap semantics match `feed()`: if the read pushed the buffered bytes
+    /// past `max_buffered`, the session is killed with the same error.
+    pub(crate) fn end_inbound_read(
+        &self,
+        buf: bytes::BytesMut,
+    ) -> Result<Vec<(u32, bytes::Bytes)>, SessionError> {
+        if self.is_closed() {
+            return Err(SessionError::SessionClosed);
+        }
+        let mut codec = self.codec.lock();
+        codec.restore_buf(buf);
+        if codec.len() > codec.max_buffered() {
+            let cap = codec.max_buffered();
+            log::warn!("SMUX: codec buffer exceeded max_buffered ({cap}), closing session");
+            drop(codec);
+            self.close();
+            return Err(SessionError::InvalidFrame(format!(
+                "codec buffer exceeded max_buffered ({cap})"
+            )));
+        }
+        let hint = codec.len();
+        self.decode_frames(&mut codec, hint)
+    }
+
+    /// Decode every frame currently buffered in `codec` and run the frame
+    /// handlers. Shared by [`process_data`] (feed first) and the direct
+    /// transport-read path (`begin_inbound_read`/`end_inbound_read`), which
+    /// reads straight into the codec buffer and skips the feed copy.
+    fn decode_frames(
+        &self,
+        codec: &mut FrameCodec,
+        hint: usize,
+    ) -> Result<Vec<(u32, bytes::Bytes)>, SessionError> {
         // Frame-count hint: a KCP read chunk usually carries either a couple
         // of near-max frames or a burst of small ones. len/256 clamped to
         // [2, 16] lands the allocation on the common cases without the
         // 4→8→16→32 growth ladder `Vec::new()` pays for control bursts.
-        let mut results = Vec::with_capacity((data.len() >> 8).clamp(2, 16));
+        let mut results = Vec::with_capacity((hint >> 8).clamp(2, 16));
 
         while let Some(frame) = codec.decode() {
             // Any received frame confirms peer is alive.
@@ -538,7 +591,6 @@ impl Session {
                     frame.ver,
                     self.config.version
                 );
-                drop(codec);
                 self.close();
                 return Err(SessionError::InvalidFrame(format!(
                     "frame version {} != session version {}",
@@ -675,7 +727,6 @@ impl Session {
         // `codec.buf` without ever touching the bucket. The residual is
         // sticky across calls, so only the delta is applied.
         let residual = codec.len();
-        drop(codec);
         let prev = self
             .codec_residual_charged
             .swap(residual, Ordering::Relaxed);
