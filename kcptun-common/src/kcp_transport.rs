@@ -23,8 +23,8 @@ use parking_lot::Mutex;
 use kcp_rs::{KcpConfig, KcpStream, PacketTransport};
 use kcrypt_rs::crypt::CryptEngine;
 use kcrypt_rs::wire::{
-    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, encrypt_batch_ref_into, inbound_null,
-    should_cpu_block_encrypt, CryptoBuf, OffloadProfile,
+    decrypt_cfb_in_place, encrypt_batch_ref_into, inbound_null, should_cpu_block_encrypt,
+    CryptoBuf, OffloadProfile,
 };
 
 use crate::RateLimiter;
@@ -72,9 +72,11 @@ pub struct CryptoTransport {
     has_encryption: bool,
     data_crypto_buf: Arc<Mutex<CryptoBuf>>,
     ack_crypto_buf: Arc<Mutex<CryptoBuf>>,
-    /// Reusable output buffer for `encrypt_sync` — avoids per-flush `Vec<Bytes>`
-    /// allocation on the sync TX path. Guarded by `is_sending` CAS in
-    /// `drain_and_flush_tx`, so only one sender touches this at a time.
+    /// Reusable output buffer for the TX path — the sync `try_send_batch`
+    /// encrypts under the lock; the async send fns `take` it out for the
+    /// duration of the send and `recycle` it afterwards (no lock across
+    /// `.await`). Sync/flush overlap is ruled out by the `is_sending` CAS in
+    /// `drain_and_flush_tx`, so only one sender owns the contents at a time.
     data_tx_buf: Mutex<Vec<Bytes>>,
     /// Runtime-shaped CPU offload profile (per-session, not global).
     offload_profile: OffloadProfile,
@@ -138,6 +140,20 @@ impl CryptoTransport {
         }
     }
 
+    /// Take the reusable TX output buffer for one async send. Ownership
+    /// leaves the mutex, so no lock is held across `.await`. The KCP flush
+    /// loop is serialized by the `is_sending` CAS (single flush owner); a
+    /// racing urgent send would simply `take` the now-empty slot and allocate
+    /// — last `recycle_tx_buf` writer wins, buffers are never aliased.
+    fn take_tx_buf(&self) -> Vec<Bytes> {
+        std::mem::take(&mut *self.data_tx_buf.lock())
+    }
+
+    /// Hand the (filled, now unused) TX buffer back for the next flush cycle.
+    fn recycle_tx_buf(&self, buf: Vec<Bytes>) {
+        *self.data_tx_buf.lock() = buf;
+    }
+
     /// Whether this transport negotiated encryption (tests/diagnostics).
     #[cfg(test)]
     pub(crate) fn has_encryption(&self) -> bool {
@@ -145,9 +161,10 @@ impl CryptoTransport {
     }
 
     /// Encrypt a batch on the **data** path (flush loop). May offload heavy
-    /// cipher batches to `cpu_block` (M0.2).
-    async fn encrypt_data(&self, packets: Vec<Bytes>) -> Vec<Bytes> {
-        self.encrypt_with(&self.data_crypto_buf, packets, false)
+    /// cipher batches to `cpu_block` (M0.2). `out` is a caller-owned reusable
+    /// buffer; it comes back filled (or is replaced on the rare timeout path).
+    async fn encrypt_data(&self, packets: &[Bytes], out: Vec<Bytes>) -> Vec<Bytes> {
+        self.encrypt_with(&self.data_crypto_buf, packets, out, false)
             .await
     }
 
@@ -156,18 +173,20 @@ impl CryptoTransport {
     /// (with FEC, a single ACK expands to a 13-packet batch that would trip the
     /// offload heuristic and add a blocking-pool hop). Matches the legacy
     /// binary's inline ACK encrypt.
-    async fn encrypt_urgent(&self, packets: Vec<Bytes>) -> Vec<Bytes> {
-        self.encrypt_with(&self.ack_crypto_buf, packets, true).await
+    async fn encrypt_urgent(&self, packets: &[Bytes], out: Vec<Bytes>) -> Vec<Bytes> {
+        self.encrypt_with(&self.ack_crypto_buf, packets, out, true)
+            .await
     }
 
     async fn encrypt_with(
         &self,
         crypto_buf: &Arc<Mutex<CryptoBuf>>,
-        packets: Vec<Bytes>,
+        packets: &[Bytes],
+        out: Vec<Bytes>,
         force_inline: bool,
     ) -> Vec<Bytes> {
         if packets.is_empty() {
-            return packets;
+            return out;
         }
         let has_aead = self.crypt.is_aead();
         let total_bytes: usize = packets.iter().map(|p| p.len()).sum();
@@ -190,50 +209,57 @@ impl CryptoTransport {
             // bugs/BUGREPORT_TCPRAW_ACCEPT_STARVES_CPU_POOL.md). The job gets a
             // refcounted clone of the packets; on timeout the originals are
             // still owned here and the fallback encrypts inline.
-            let job_packets = packets.clone();
+            let job_packets: Arc<[Bytes]> = Arc::from(packets);
             let job_crypt = self.crypt.clone();
             let job_cb = crypto_buf.clone();
             let has_encryption = self.has_encryption;
+            // The reusable `out` rides into the job and comes back filled. On
+            // timeout the still-running/completed job owns it, so the buffer
+            // is lost — rare, and the fallback below simply allocates once.
+            let job_out = out;
             match knet::timeout(
                 ENCRYPT_CPU_BLOCK_WAIT,
                 knet::cpu_block(move || {
-                    encrypt_batch(
-                        job_packets,
+                    let mut filled = job_out;
+                    encrypt_batch_ref_into(
+                        &job_packets,
                         job_crypt.as_ref(),
                         &job_cb,
                         has_encryption,
                         false,
-                    )
+                        &mut filled,
+                    );
+                    filled
                 }),
             )
             .await
             {
-                Ok(out) => out,
+                Ok(filled) => filled,
                 Err(_) => {
                     warn_encrypt_offload_overflow();
-                    let mut out = Vec::with_capacity(packets.len());
-                    encrypt_batch_into(
+                    let mut filled = Vec::with_capacity(packets.len());
+                    encrypt_batch_ref_into(
                         packets,
                         self.crypt.as_ref(),
                         crypto_buf,
                         self.has_encryption,
                         false,
-                        &mut out,
+                        &mut filled,
                     );
-                    out
+                    filled
                 }
             }
         } else {
-            let mut out = Vec::with_capacity(packets.len());
-            encrypt_batch_into(
+            let mut filled = out;
+            encrypt_batch_ref_into(
                 packets,
                 self.crypt.as_ref(),
                 crypto_buf,
                 self.has_encryption,
                 allow_parallel,
-                &mut out,
+                &mut filled,
             );
-            out
+            filled
         }
     }
 
@@ -405,9 +431,10 @@ impl PacketTransport for CryptoTransport {
         if packets.is_empty() {
             return Ok(());
         }
-        let encrypted = self.encrypt_data(packets.to_vec()).await;
+        let encrypted = self.encrypt_data(packets, self.take_tx_buf()).await;
         self.wait_for_rate(&encrypted).await;
         let r = self.inner.send_batch(&encrypted).await;
+        self.recycle_tx_buf(encrypted);
         r
     }
 
@@ -415,27 +442,33 @@ impl PacketTransport for CryptoTransport {
         if packets.is_empty() {
             return Ok(());
         }
-        let encrypted = self.encrypt_data(packets.to_vec()).await;
+        let encrypted = self.encrypt_data(packets, self.take_tx_buf()).await;
         self.wait_for_rate(&encrypted).await;
-        self.inner.send_batch_to(&encrypted, target).await
+        let r = self.inner.send_batch_to(&encrypted, target).await;
+        self.recycle_tx_buf(encrypted);
+        r
     }
 
     async fn send_urgent(&self, packets: &[Bytes]) -> io::Result<()> {
         if packets.is_empty() {
             return Ok(());
         }
-        let encrypted = self.encrypt_urgent(packets.to_vec()).await;
+        let encrypted = self.encrypt_urgent(packets, self.take_tx_buf()).await;
         self.wait_for_rate(&encrypted).await;
-        self.inner.send_urgent(&encrypted).await
+        let r = self.inner.send_urgent(&encrypted).await;
+        self.recycle_tx_buf(encrypted);
+        r
     }
 
     async fn send_urgent_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<()> {
         if packets.is_empty() {
             return Ok(());
         }
-        let encrypted = self.encrypt_urgent(packets.to_vec()).await;
+        let encrypted = self.encrypt_urgent(packets, self.take_tx_buf()).await;
         self.wait_for_rate(&encrypted).await;
-        self.inner.send_urgent_to(&encrypted, target).await
+        let r = self.inner.send_urgent_to(&encrypted, target).await;
+        self.recycle_tx_buf(encrypted);
+        r
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -583,7 +616,7 @@ mod tests {
             Bytes::from_static(b"hello-null"),
             Bytes::from_static(b"world"),
         ];
-        let out = ct.encrypt_data(plain.clone()).await;
+        let out = ct.encrypt_data(&plain, Vec::new()).await;
         assert_eq!(out.len(), 2);
         assert_eq!(&out[0][..], b"hello-null");
         assert_eq!(&out[1][..], b"world");
@@ -600,7 +633,9 @@ mod tests {
         assert!(!ct.crypt.is_aead());
 
         let plain = b"kcp-segment-payload-for-cfb-test!!";
-        let encrypted = ct.encrypt_data(vec![Bytes::copy_from_slice(plain)]).await;
+        let encrypted = ct
+            .encrypt_data(&[Bytes::copy_from_slice(plain)], Vec::new())
+            .await;
         assert_eq!(encrypted.len(), 1);
         assert!(encrypted[0].len() > plain.len()); // 20B header
 
@@ -619,9 +654,11 @@ mod tests {
         let key = b"0123456789abcdef0123456789abcdef";
         let ct = CryptoTransport::new(inner, key, "aes");
 
-        let data = ct.encrypt_data(vec![Bytes::from_static(b"data-pkt")]).await;
+        let data = ct
+            .encrypt_data(&[Bytes::from_static(b"data-pkt")], Vec::new())
+            .await;
         let ack = ct
-            .encrypt_urgent(vec![Bytes::from_static(b"ack-pkt!")])
+            .encrypt_urgent(&[Bytes::from_static(b"ack-pkt!")], Vec::new())
             .await;
         // Different session_id seeds → different nonces in first 8 bytes after
         // counter (bytes 8..16 hold session_id). Counters both start at 0 so
@@ -640,7 +677,9 @@ mod tests {
         assert!(ct.crypt.is_aead());
 
         let plain = b"aead-payload-test";
-        let encrypted = ct.encrypt_data(vec![Bytes::copy_from_slice(plain)]).await;
+        let encrypted = ct
+            .encrypt_data(&[Bytes::copy_from_slice(plain)], Vec::new())
+            .await;
         let mut buf = encrypted[0].to_vec();
         // Need room: open copies plaintext back into buf
         let nlen = buf.len();
@@ -1086,9 +1125,15 @@ mod tests {
         let inner: Arc<dyn PacketTransport> = mock.clone();
         let ct = CryptoTransport::with_transport(inner, key, "aes");
 
-        let g0 = ct.encrypt_data(vec![Bytes::from_static(b"good-0")]).await;
-        let g1 = ct.encrypt_data(vec![Bytes::from_static(b"good-1")]).await;
-        let g2 = ct.encrypt_data(vec![Bytes::from_static(b"good-2")]).await;
+        let g0 = ct
+            .encrypt_data(&[Bytes::from_static(b"good-0")], Vec::new())
+            .await;
+        let g1 = ct
+            .encrypt_data(&[Bytes::from_static(b"good-1")], Vec::new())
+            .await;
+        let g2 = ct
+            .encrypt_data(&[Bytes::from_static(b"good-2")], Vec::new())
+            .await;
 
         // Corrupt the middle packet's ciphertext so its CRC check fails.
         let mut bad = g1[0].to_vec();
