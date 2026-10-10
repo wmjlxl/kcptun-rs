@@ -579,6 +579,9 @@ impl Session {
         // [2, 16] lands the allocation on the common cases without the
         // 4→8→16→32 growth ladder `Vec::new()` pays for control bursts.
         let mut results = Vec::with_capacity((hint >> 8).clamp(2, 16));
+        // O14: single-entry lookup cache for this call — consecutive frames
+        // for the same stream (bulk burst) pay one `streams` lock per burst.
+        let mut stream_cache: Option<(u32, Arc<Stream>)> = None;
 
         while let Some(frame) = codec.decode() {
             // Any received frame confirms peer is alive.
@@ -636,7 +639,7 @@ impl Session {
                 Cmd::Fin => {
                     // Stream closed by remote (Go cmdFIN = 1) — may carry last data
                     debug!("SMUX: received FIN for stream {}", frame.stream_id);
-                    if let Some(stream) = self.streams.lock().get(&frame.stream_id) {
+                    if let Some(stream) = self.stream_cached(&mut stream_cache, frame.stream_id) {
                         if !frame.data.is_empty() {
                             self.consume_tokens(frame.data.len());
                             if let Err(e) = stream.push_data_bytes(frame.data.clone()) {
@@ -656,7 +659,7 @@ impl Session {
                 }
                 Cmd::Psh => {
                     // Data push (Go cmdPSH = 2)
-                    if let Some(stream) = self.streams.lock().get(&frame.stream_id) {
+                    if let Some(stream) = self.stream_cached(&mut stream_cache, frame.stream_id) {
                         // Use zero-copy push_data_bytes: the frame.data is a
                         // reference-counted Bytes slice from the codec buffer.
                         self.consume_tokens(frame.data.len());
@@ -702,11 +705,9 @@ impl Session {
                         let window =
                             u32::from_le_bytes(frame.data[4..8].try_into().unwrap_or([0; 4]));
                         // Apply per-stream peer window (write-side flow control).
+                        if let Some(stream) = self.stream_cached(&mut stream_cache, frame.stream_id)
                         {
-                            let streams = self.streams.lock();
-                            if let Some(stream) = streams.get(&frame.stream_id) {
-                                stream.apply_peer_update(consumed, window);
-                            }
+                            stream.apply_peer_update(consumed, window);
                         }
                         // NOTE: a UPD advertises the *peer's* receive window;
                         // it says nothing about ours. Adding it to the local
@@ -781,6 +782,35 @@ impl Session {
                 );
             }
         }
+    }
+
+    /// O14: single-entry stream lookup cache scoped to one `decode_frames`
+    /// call. Consecutive frames for the same stream (the common bulk burst)
+    /// pay one `streams` lock per burst instead of one per frame.
+    ///
+    /// Only *positive* lookups are cached: a SYN earlier in this same batch
+    /// may have just created the stream, so a miss must re-query. The cache
+    /// is call-local, so removals/rebuilds between calls need no
+    /// invalidation. As a side effect the `streams` mutex is no longer held
+    /// across `push_data_bytes`/`apply_peer_update` (the old `if let Some =
+    /// lock().get()` kept the guard alive for the whole arm body) — those
+    /// actions only touch the stream itself, which the `Arc` pins.
+    #[inline]
+    fn stream_cached(
+        &self,
+        cache: &mut Option<(u32, Arc<Stream>)>,
+        id: u32,
+    ) -> Option<Arc<Stream>> {
+        if let Some((cid, s)) = cache {
+            if *cid == id {
+                return Some(s.clone());
+            }
+        }
+        let found = self.streams.lock().get(&id).cloned();
+        if let Some(s) = &found {
+            *cache = Some((id, s.clone()));
+        }
+        found
     }
 
     /// Close the session and all streams.
