@@ -1,17 +1,16 @@
 <div align="center">
-
-# kcptun-rs ⚡
-
-**Rust 移植 kcptun — 性能最高达到 Go 版本的 5.38 倍，完全线上兼容**
-
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
-[![Tests](https://img.shields.io/badge/tests-334%20passed-brightgreen)](#)
-[![E2E](https://img.shields.io/badge/e2e-68%20passed-brightgreen)](#)
-[![License](https://img.shields.io/badge/license-MIT-blue)](#)
-[![Rust](https://img.shields.io/badge/rust-1.92+-orange)](#)
-[![Go Compatible](https://img.shields.io/badge/Go%20compat-v5-success)](#)
-
-[English](README.md) | 中文
+  <img src="docs/logo.png" alt="kcptun-rs logo" width="180">
+  <h1>kcptun-rs ⚡</h1>
+  <p><strong>Rust 移植 kcptun — 性能最高达到 Go 版本的 5.38 倍，完全线上兼容</strong></p>
+  <p>
+    <a href="#"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status"></a>
+    <a href="#"><img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests"></a>
+    <a href="#"><img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E"></a>
+    <a href="#"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+    <a href="#"><img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust"></a>
+    <a href="#"><img src="https://img.shields.io/badge/Go%20compat-v5-success" alt="Go Compatible"></a>
+  </p>
+  <p><a href="README.md">English</a> | 中文</p>
 
 </div>
 
@@ -26,6 +25,26 @@
 >
 > 完整免责声明请参阅 [DISCLAIMER.zh.md](DISCLAIMER.zh.md)。
 > </details>
+
+---
+
+## 📑 目录
+
+- [🔥 性能概览](#-性能概览)
+- [📖 什么是 kcptun-rs？](#-什么是-kcptun-rs)
+- [✨ 功能特性](#-功能特性)
+- [🔐 加密认证说明](#-加密认证说明)
+- [🚀 快速开始](#-快速开始)
+- [📊 性能深度分析](#-性能深度分析)
+- [📡 客户端 I/O 模式对比](#-客户端io-模式对比)
+- [🔗 Go 兼容性](#-go-兼容性)
+- [🏗️ 架构](#-架构)
+- [🔧 构建与运行](#-构建与运行)
+- [🎛️ 延迟调优指南（Linux）](#-延迟调优指南linux)
+- [🔬 优化历程](#-优化历程)
+- [🧪 测试严谨性](#-测试严谨性)
+- [💡 为什么选择 Rust？](#-为什么选择-rust)
+- [📝 许可证](#-许可证)
 
 ---
 
@@ -155,7 +174,8 @@ kcptun-client -c config.json
 
 ## 📊 性能深度分析
 
-### 大吞吐测试（macOS M1，200 MB，AES-128-CFB，无压缩）
+<details open>
+<summary><strong>大吞吐测试（macOS M1，200 MB，AES-128-CFB，无压缩）</strong></summary>
 
 路径标签为 **Client → Server**（大流量由客户端发往服务端；见 `bench/run_bench.sh`）。
 
@@ -168,7 +188,10 @@ kcptun-client -c config.json
 
 > Rust-Tokio 在 M1 主机上明显快于 Go→Go。
 
-### 完整加密 × 压缩矩阵
+</details>
+
+<details>
+<summary><strong>完整加密 × 压缩矩阵</strong></summary>
 
 测试：10 并发连接，每连接 1 MB，所有 30+ 轮次全部通过（0 失败）。
 
@@ -204,7 +227,10 @@ kcptun-client -c config.json
 
 > **SM4 是最大亮点**：Rust 比 Go 快 4.6–5.4 倍，因为 Go 实现使用纯软件 S-box，而 Rust 受益于编译器的自动向量化和预计算查找表。
 
-### Linux VPS 基准测试（1 vCPU，AMD EPYC-Rome）
+</details>
+
+<details>
+<summary><strong>Linux VPS 基准测试（1 vCPU，AMD EPYC-Rome）</strong></summary>
 
 来自 Linux VPS（CentOS 8，1 vCPU / 2 线程，AMD EPYC-Rome @ 2.8 GHz，2 GB RAM）的结果 —— 正是 kcptun 常部署的低端云主机类型。测试前已调优内核 UDP 缓冲区（`net.core.rmem_max=4MB`）和 CFS 唤醒粒度（1 ms）（见下文[延迟调优指南](#-延迟调优指南linux)）。
 
@@ -261,7 +287,10 @@ kcptun-client -c config.json
 
 > **Linux VPS 结果：** Rust-Tokio 在 30 个加密×压缩组合中赢下 **28 个**。仅有的两个例外是 `salsa20`（Go 的 Salsa20 实现高度优化）和 `null`+压缩（无加密开销时 Go 的 Snappy 在可压缩数据上略胜）。突出倍率：**SM4+压缩 3.17×**、**AES-128+压缩 1.83×**、**XOR 1.60×**、**Blowfish 1.65×**、**Twofish 1.53×**。前提是调优内核 UDP 缓冲区（`net.core.rmem_max=4MB`）—— 默认 208 KB 缓冲区下，两端都会因静默丢包损失 ~80% 吞吐。
 
-### 压力测试（数据完整性）
+</details>
+
+<details>
+<summary><strong>压力测试（数据完整性）</strong></summary>
 
 全部 8 项压力测试通过 — 在并发负载下验证**逐字节精确性**：
 
@@ -274,6 +303,8 @@ kcptun-client -c config.json
 | 大数据（100 连接） | 100 | 各 64KB + 128KB | ✅ |
 | 页面刷新模拟 | 80（3 波） | 512B…128KB | ✅ |
 | 可压缩数据 | 1 | 压缩模式 | ✅ |
+
+</details>
 
 ---
 
@@ -348,7 +379,7 @@ kcptun-rs 与 Go kcptun（kcp-go v5）**完全线上兼容**。全部 68 项端�
 
 ### 端到端测试结果
 
-```
+```text
 加密算法:    15/15 种通过（Go→Rust + Rust→Go）
 KCP 模式:    4/4 通过
 SMUX:        2/2 版本通过
@@ -363,7 +394,7 @@ FEC:         2/2 配置通过
 
 ### 协议栈
 
-```
+```text
 ┌──────────────────────────────────┐
 │         TCP / UNIX Socket        │
 ├──────────────────────────────────┤
@@ -381,7 +412,7 @@ FEC:         2/2 配置通过
 
 ### 工作空间（9 个 crate）
 
-```
+```text
 kcptun-rs/
 ├── kcp-rs/          — KCP ARQ 协议状态机
 ├── kcrypt-rs/       — 13 种分组密码 + AES-128-GCM
@@ -473,7 +504,7 @@ sudo sysctl -w net.inet.udp.recvspace=4194304
 
 要使更改在重启后持久化，添加到 `/etc/sysctl.conf`：
 
-```
+```text
 kern.ipc.maxsockbuf=8388608
 net.inet.udp.recvspace=4194304
 ```

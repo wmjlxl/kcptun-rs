@@ -1,17 +1,16 @@
 <div align="center">
-
-# kcptun-rs ⚡
-
-**Rust port of kcptun — up to 5.38× faster than Go, fully wire-compatible**
-
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
-[![Tests](https://img.shields.io/badge/tests-334%20passed-brightgreen)](#)
-[![E2E](https://img.shields.io/badge/e2e-68%20passed-brightgreen)](#)
-[![License](https://img.shields.io/badge/license-MIT-blue)](#)
-[![Rust](https://img.shields.io/badge/rust-1.92+-orange)](#)
-[![Go Compatible](https://img.shields.io/badge/Go%20compat-v5-success)](#)
-
-English | [中文](README.zh.md)
+  <img src="docs/logo.png" alt="kcptun-rs logo" width="180">
+  <h1>kcptun-rs ⚡</h1>
+  <p><strong>Rust port of kcptun — up to 5.38× faster than Go, fully wire-compatible</strong></p>
+  <p>
+    <a href="#"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status"></a>
+    <a href="#"><img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests"></a>
+    <a href="#"><img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E"></a>
+    <a href="#"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+    <a href="#"><img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust"></a>
+    <a href="#"><img src="https://img.shields.io/badge/Go%20compat-v5-success" alt="Go Compatible"></a>
+  </p>
+  <p>English | <a href="README.zh.md">中文</a></p>
 
 </div>
 
@@ -26,6 +25,26 @@ English | [中文](README.zh.md)
 >
 > See [DISCLAIMER.md](DISCLAIMER.md) for the full disclaimer.
 > </details>
+
+---
+
+## 📑 Contents
+
+- [🔥 Performance at a Glance](#-performance-at-a-glance)
+- [📖 What is kcptun-rs?](#-what-is-kcptun-rs)
+- [✨ Features](#-features)
+- [🔐 Cipher authentication](#-cipher-authentication)
+- [🚀 Quick Start](#-quick-start)
+- [📊 Performance Deep Dive](#-performance-deep-dive)
+- [🔗 Go Compatibility](#-go-compatibility)
+- [🏗️ Architecture](#-architecture)
+- [🔧 Build & Run](#-build--run)
+- [🎛️ Latency Tuning Guide (Linux)](#-latency-tuning-guide-linux)
+- [🔬 Optimization Journey](#-optimization-journey)
+- [🧪 Testing Rigor](#-testing-rigor)
+- [📋 CLI Options](#-cli-options)
+- [💡 Why Rust?](#-why-rust)
+- [📝 License](#-license)
 
 ---
 
@@ -158,7 +177,8 @@ kcptun-client -c config.json
 
 ## 📊 Performance Deep Dive
 
-### Bulk Throughput (macOS M1, 200 MB, AES-128-CFB, no compression)
+<details open>
+<summary><strong>Bulk Throughput (macOS M1, 200 MB, AES-128-CFB, no compression)</strong></summary>
 
 Path labels are **Client → Server** (bulk data leaves the client toward the server; from `bench/run_bench.sh`).
 
@@ -171,7 +191,10 @@ Path labels are **Client → Server** (bulk data leaves the client toward the se
 
 > Rust-Tokio is clearly faster than Go→Go on this M1 host.
 
-### Full Cipher × Compression Matrix
+</details>
+
+<details>
+<summary><strong>Full Cipher × Compression Matrix</strong></summary>
 
 Tests: 10 concurrent connections, 1 MB each, all 30+ runs per cell passed (0 failures).
 
@@ -207,7 +230,10 @@ Tests: 10 concurrent connections, 1 MB each, all 30+ runs per cell passed (0 fai
 
 > **SM4** is the standout: Rust outperforms Go by **4.6–5.4×** because the Go implementation uses a pure software S-box while Rust benefits from compiler auto-vectorization and pre-computed lookup tables.
 
-### Linux VPS Benchmark (1 vCPU, AMD EPYC-Rome)
+</details>
+
+<details>
+<summary><strong>Linux VPS Benchmark (1 vCPU, AMD EPYC-Rome)</strong></summary>
 
 Results from a Linux VPS (CentOS 8, 1 vCPU / 2 threads, AMD EPYC-Rome @ 2.8 GHz, 2 GB RAM) — the kind of low-end cloud instance where kcptun is commonly deployed. Kernel UDP buffers (`net.core.rmem_max=4MB`) and CFS wakeup granularity (1 ms) were tuned before testing (see [Latency Tuning Guide](#-latency-tuning-guide-linux) below).
 
@@ -264,7 +290,10 @@ With compression (Snappy):
 
 > **Linux VPS result:** Rust-Tokio wins **28 out of 30** cipher×compression combinations on this 1-vCPU VPS. The only exceptions are `salsa20` (Go's Salsa20 implementation is highly optimized) and `null`+comp (where Go's Snappy edges ahead on trivially compressible data with no crypto overhead). Standout ratios: **SM4+comp 3.17×**, **AES-128+comp 1.83×**, **XOR 1.60×**, **Blowfish 1.65×**, **Twofish 1.53×**. The key prerequisite is tuning kernel UDP buffers (`net.core.rmem_max=4MB`) — with default 208 KB buffers, both backends lose ~80% throughput to silent packet drops.
 
-### Stress Tests (Data Integrity)
+</details>
+
+<details>
+<summary><strong>Stress Tests (Data Integrity)</strong></summary>
 
 All 8 stress tests pass — verifying **byte-for-byte accuracy** under concurrent load:
 
@@ -278,7 +307,10 @@ All 8 stress tests pass — verifying **byte-for-byte accuracy** under concurren
 | Page refresh simulation | 80 (3 waves) | 512B…128KB | ✅ |
 | Compressible data | 1 | patterns | ✅ |
 
-### Client I/O Modes
+</details>
+
+<details>
+<summary><strong>Client I/O Modes</strong></summary>
 
 The `latency_p99` example supports three client I/O modes to measure the effect of different KCP scheduling architectures on round-trip latency:
 
@@ -326,6 +358,8 @@ cargo run -p kcp-rs --features async --example latency_p99 -- \
 
 > **Conclusion:** Normal mode (per-connection tokio tasks) is the correct choice for clients. WorkerPool modes add cross-thread wake overhead that hurts P50 and throughput. WorkerPool's value is on the **server side** — shared UDP socket demux for many concurrent connections (not benchmarked here via `latency_p99`).
 
+</details>
+
 ---
 
 ## 🔗 Go Compatibility
@@ -349,7 +383,7 @@ kcptun-rs is **fully wire-compatible** with Go kcptun (kcp-go v5). All 68 end-to
 
 ### E2E Test Results
 
-```
+```text
 Encryption:  15/15 ciphers passed (Go→Rust + Rust→Go)
 KCP Modes:   4/4 passed
 SMUX:        2/2 versions passed
@@ -364,7 +398,7 @@ Total:       68 passed, 0 failed, 0 skipped 🎉
 
 ### Protocol Stack
 
-```
+```text
 ┌──────────────────────────────────┐
 │         TCP / UNIX Socket        │
 ├──────────────────────────────────┤
@@ -382,7 +416,7 @@ Total:       68 passed, 0 failed, 0 skipped 🎉
 
 ### Workspace (9 crates)
 
-```
+```text
 kcptun-rs/
 ├── kcp-rs/          — KCP ARQ protocol state machine
 ├── kcrypt-rs/       — 13 block ciphers + AES-128-GCM
@@ -487,7 +521,7 @@ sudo sysctl -w net.inet.udp.recvspace=4194304
 
 To make the change persistent across reboots, add to `/etc/sysctl.conf`:
 
-```
+```text
 kern.ipc.maxsockbuf=8388608
 net.inet.udp.recvspace=4194304
 ```
