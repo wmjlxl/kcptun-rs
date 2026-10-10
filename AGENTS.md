@@ -150,6 +150,26 @@ External deps are fetched from crates.io per platform (not vendored). Notable: `
 
 <!-- MANUAL: Any manually added notes below this line are preserved on regeneration -->
 
+## perf/opt-v2 notes (2026-10-10, branch perf/opt-v2)
+
+- v2 perf taskbook executed: A0, O0/O11/O5/O10-R closed with evidence
+  (docs/evidence/O*.txt), O9/O7/O8/O17/O3-R/O12/O13/O14/O15/O16 landed;
+  O1-R deferred by user decision. Breakdown + result table:
+  `docs/perf-v2-a0-change-breakdown.md`.
+- Published-crate surface: `knet::configure_worker_threads` is a NEW pub fn
+  (O16) ⇒ next knet-rs publish needs a minor bump; kcp-rs gains dependency
+  `rustc-hash` (O17 FxHashMap, internal-only) ⇒ note at next kcp-rs publish.
+  smux/kcrypt public signatures unchanged (O15 uses pub(crate); cfb16_decrypt
+  output bit-identical).
+- New user-visible flags: client/server `--threads N` (0=auto) — tokio
+  worker count for the global runtime (O16). No wire/format changes anywhere
+  in v2 (Go parity preserved; fast_retransmit ACK filter verified against
+  kcp-go v5.6.64).
+- Bench harness: `bench_rust_vs_go.py` gained default-`aes` coverage,
+  py3.6 compat, `KCPTUN_THREADS` passthrough; new examples
+  `kcrypt-rs/cfb_bench`, `knet-rs/cpu_block_alloc_bench`,
+  `smux-rs/{churn_bench,prepare_bench}` (prepare refill backpressure fix).
+
 ## Audit-fix notes (audit-fix/verify)
 
 - **L-4 (RTT only on snd_buf hit) intentionally NOT applied.** Go kcp-go
