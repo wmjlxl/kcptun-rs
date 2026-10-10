@@ -476,40 +476,40 @@ impl SmuxConn {
                     fin_ids.extend(need_fin);
                 }
 
+                let mut wrote = false;
                 if !buf.is_empty() {
                     // Only mark FINs as sent if the transport actually accepted the bytes.
                     // This preserves the "can't lose FIN" invariant.
                     if write.write_all(&buf).await.is_ok() {
                         session.mark_fins_sent(&fin_ids);
+                        wrote = true;
                     }
                 }
 
                 // Decide how the next wait can be parked:
-                // - unmarked FINs (write failed or batch truncated) retry on
-                //   the 10ms tick so the peer's EOF isn't delayed;
-                // - queued stream data preserves a notify permit so the next
-                //   64 KiB chunk goes out immediately — with the idle wait now
-                //   up to 1s, relying on the timer here would stall bulk
-                //   transfers.
+                // - work that could not move this round (buf empty because
+                //   the v2 peer window is closed, or a failed transport
+                //   write, or an unmarked FIN) retries on the 10ms tick —
+                //   the old fixed-poll behaviour;
+                // - data the transport DID accept keeps a notify permit so
+                //   the next 64 KiB chunk follows immediately;
+                // - notifying when nothing moved would busy-spin (empty buf
+                //   → immediate re-run → still empty → notify forever).
                 let streams = session.streams();
                 let guard = streams.lock();
-                fin_retry = false;
                 let mut more_data = false;
+                let mut fin_pending = false;
                 for stream in guard.values() {
                     if stream.pending_send() > 0 {
                         more_data = true;
-                        break;
                     }
                     if stream.is_local_closed() && !stream.is_fin_sent() {
-                        fin_retry = true;
+                        fin_pending = true;
                     }
                 }
                 drop(guard);
-                // Only data preserves a permit. A pending FIN must NOT
-                // notify: if the transport write keeps failing, notify →
-                // immediate re-run → fail → notify would spin the loop.
-                // `fin_retry` instead picks the 10ms timer at the top.
-                if more_data {
+                fin_retry = fin_pending || (more_data && !wrote);
+                if more_data && wrote {
                     flush_notify.notify_one();
                 }
             }

@@ -897,6 +897,7 @@ async fn write_loop(
         } else {
             Some(out.split().freeze())
         };
+        let mut wrote = false;
         if let Some(packet) = packet.filter(|p| !p.is_empty()) {
             // Compatibility fallback for callers that provide a pre-built
             // KcpStream. Production client/server transports rate-limit the
@@ -926,39 +927,35 @@ async fn write_loop(
             let mut all_fin_ids = fin_ids;
             all_fin_ids.extend_from_slice(&reap_need_fin);
             smux.mark_fins_sent(&all_fin_ids);
+            wrote = true;
+        }
 
-            // `prepare_outbound_into_controlled` deliberately caps each KCP
-            // write to 64 KiB. If a stream still has queued data, preserve a
-            // notify permit for the next iteration instead of imposing the
-            // idle poll delay between chunks (a 128 KiB TCP write commonly
-            // needs two iterations). Backpressure remains bounded by
-            // `write_all`, which waits when the KCP window is full.
-            //
-            // `fin_wait` covers the complementary case: a FIN that could not
-            // go out this round (KCP still draining / write failed) has no
-            // producer to notify us — poll it on the 10ms tick.
-            let mut more_data = false;
-            fin_wait = false;
-            {
-                let streams = smux.streams();
-                let guard = streams.lock();
-                for stream in guard.values() {
-                    if stream.pending_send() > 0 {
-                        more_data = true;
-                        break;
-                    }
-                    if stream.is_local_closed() && !stream.is_fin_sent() {
-                        fin_wait = true;
-                    }
+        // Scan every iteration — including when `out` was empty: a v2 peer
+        // window at 0 (queued data undrainable) or a FIN gated on
+        // `kcp.wait_send()` produces no packet, and skipping the scan would
+        // park that work until the health deadline (up to 500ms) instead of
+        // the old 10ms tick.
+        let mut more_data = false;
+        let mut fin_pending = false;
+        {
+            let streams = smux.streams();
+            let guard = streams.lock();
+            for stream in guard.values() {
+                if stream.pending_send() > 0 {
+                    more_data = true;
+                }
+                if stream.is_local_closed() && !stream.is_fin_sent() {
+                    fin_pending = true;
                 }
             }
-            // Only data preserves a permit. A pending FIN must NOT notify:
-            // if KCP still can't take it, notify → immediate re-run → still
-            // can't → notify would spin the loop. `fin_wait` instead picks
-            // the 10ms timer at the top of the loop.
-            if more_data {
-                flush.notify_one();
-            }
+        }
+        // Work that could not move this round (no packet accepted) retries
+        // on the old 10ms timer ONLY — notifying while nothing can change
+        // would busy-spin. Data that WAS accepted keeps its notify permit so
+        // the next 64 KiB chunk follows immediately.
+        fin_wait = fin_pending || (more_data && !wrote);
+        if more_data && wrote {
+            flush.notify_one();
         }
     }
     dead.store(true, Ordering::Release);
