@@ -467,7 +467,7 @@ def _aggregate_runs_mean(bench_fn, runs, **kwargs):
 
 
 CIPHERS = [
-    'null', 'none', 'xor', 'aes-128', 'aes-128-gcm',
+    'null', 'none', 'xor', 'aes-128', 'aes', 'aes-128-gcm',
     'salsa20', 'blowfish', 'twofish', 'cast5',
     '3des', 'tea', 'xtea', 'sm4',
 ]
