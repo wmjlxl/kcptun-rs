@@ -944,32 +944,35 @@ impl KCP {
         }
         let mtu = self.mtu as usize;
         let rcv_nxt = self.rcv_nxt;
-        let acks: Vec<(u32, u32)> = self
-            .acklist
-            .iter()
-            .enumerate()
-            .filter(|(i, entry)| itimediff(entry.sn, rcv_nxt) >= 0 || *i + 1 == self.acklist.len())
-            .map(|(_, entry)| (entry.sn, entry.ts))
-            .collect();
-        self.acklist.clear();
+        // O17: iterate `acklist` in place instead of filter-collecting into a
+        // temporary Vec. Entries are Copy, so each iteration starts with owned
+        // (sn, ts) and the remaining field accesses are disjoint — no aliasing
+        // with the `buffer`/`ack_seg` mutations below. Filter + order +
+        // "always keep the last entry" are byte-for-byte the old semantics.
+        let n = self.acklist.len();
 
         self.ack_seg.conv = self.conv;
         self.ack_seg.cmd = Command::Ack as u8;
         self.ack_seg.wnd = self.wnd_unused();
         self.ack_seg.una = rcv_nxt;
         self.ack_seg.len = 0;
-        for (sn, ts) in acks {
-            if self.buffer.len() + crate::segment::KCP_OVERHEAD > mtu && !self.buffer.is_empty() {
-                let data = self.buffer.copy_to_bytes(self.buffer.len());
-                (self.output)(data);
-                if self.buffer.capacity() < mtu {
-                    self.buffer.reserve(mtu);
+        for i in 0..n {
+            let (sn, ts) = (self.acklist[i].sn, self.acklist[i].ts);
+            if itimediff(sn, rcv_nxt) >= 0 || i + 1 == n {
+                if self.buffer.len() + crate::segment::KCP_OVERHEAD > mtu && !self.buffer.is_empty()
+                {
+                    let data = self.buffer.copy_to_bytes(self.buffer.len());
+                    (self.output)(data);
+                    if self.buffer.capacity() < mtu {
+                        self.buffer.reserve(mtu);
+                    }
                 }
+                self.ack_seg.sn = sn;
+                self.ack_seg.ts = ts;
+                Segment::encode(&self.ack_seg, &mut self.buffer);
             }
-            self.ack_seg.sn = sn;
-            self.ack_seg.ts = ts;
-            Segment::encode(&self.ack_seg, &mut self.buffer);
         }
+        self.acklist.clear();
         if !self.buffer.is_empty() {
             let data = self.buffer.copy_to_bytes(self.buffer.len());
             (self.output)(data);

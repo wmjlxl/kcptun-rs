@@ -521,7 +521,11 @@ impl Session {
             )));
         }
 
-        let mut results = Vec::new();
+        // Frame-count hint: a KCP read chunk usually carries either a couple
+        // of near-max frames or a burst of small ones. len/256 clamped to
+        // [2, 16] lands the allocation on the common cases without the
+        // 4→8→16→32 growth ladder `Vec::new()` pays for control bursts.
+        let mut results = Vec::with_capacity((data.len() >> 8).clamp(2, 16));
 
         while let Some(frame) = codec.decode() {
             // Any received frame confirms peer is alive.
@@ -1042,9 +1046,10 @@ impl Session {
             return;
         }
         let snapshot = self.stream_snapshot();
-        let id_set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        // fin_ids is 0–2 entries per flush cycle; a linear scan over `ids`
+        // (≤2 comparisons per stream) beats heap-allocating a HashSet.
         for &(stream_id, ref s) in snapshot.iter() {
-            if id_set.contains(&stream_id) {
+            if ids.contains(&stream_id) {
                 s.mark_fin_sent();
             }
         }

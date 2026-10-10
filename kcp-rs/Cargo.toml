@@ -11,6 +11,7 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 reed-solomon-erasure = "6"
 smallvec = "1"
+rustc-hash = "2"
 thiserror.workspace = true
 async-trait.workspace = true
 # Optional async runtime + I/O (KcpStream). Enable via `async` feature.

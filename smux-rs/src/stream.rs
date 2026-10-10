@@ -154,6 +154,14 @@ pub struct Stream {
     opened: AtomicBool,
     /// Whether the remote has closed.
     remote_closed: AtomicBool,
+    /// One-shot gate: only the first read inside the EOF grace arms the
+    /// expiry wakeup task. A reader polling every few ms used to spawn one
+    /// sleeper task *per read* for the whole 300ms window (task pileup).
+    grace_wakeup_spawned: AtomicBool,
+    /// Number of grace wakeups actually armed; `cfg(test)` only, asserted
+    /// `== 1` by the EOF-grace regression test.
+    #[cfg(test)]
+    grace_spawns: AtomicUsize,
     /// Whether the local has closed.
     local_closed: AtomicBool,
     /// Whether a FIN frame has been sent for this stream.
@@ -230,6 +238,9 @@ impl Stream {
             bytes_written: AtomicU32::new(0),
             opened: AtomicBool::new(false),
             remote_closed: AtomicBool::new(false),
+            grace_wakeup_spawned: AtomicBool::new(false),
+            #[cfg(test)]
+            grace_spawns: AtomicUsize::new(0),
             local_closed: AtomicBool::new(false),
             fin_sent: AtomicBool::new(false),
             syn_pending: AtomicBool::new(false),
@@ -493,13 +504,25 @@ impl Stream {
                 let closed_at = self.recv.lock().remote_closed_at;
                 if let Some(t) = closed_at {
                     if t.elapsed() < EOF_GRACE {
-                        if let Some(w) = self.self_ref.lock().clone() {
-                            knet::spawn_task(async move {
-                                knet::sleep_ms(EOF_GRACE_MS).await;
-                                if let Some(s) = w.upgrade() {
-                                    s.wakeup_reader();
-                                }
-                            });
+                        // One-shot: only the first read that can actually arm
+                        // the wakeup claims the gate; later polls within the
+                        // grace skip the spawn entirely. The gate is left
+                        // untouched when `self_ref` is not set yet, so a later
+                        // read can still arm it (matches old behaviour).
+                        let w = self.self_ref.lock().clone();
+                        let schedule =
+                            w.is_some() && !self.grace_wakeup_spawned.swap(true, Ordering::AcqRel);
+                        if schedule {
+                            #[cfg(test)]
+                            self.grace_spawns.fetch_add(1, Ordering::Relaxed);
+                            if let Some(w) = w {
+                                knet::spawn_task(async move {
+                                    knet::sleep_ms(EOF_GRACE_MS).await;
+                                    if let Some(s) = w.upgrade() {
+                                        s.wakeup_reader();
+                                    }
+                                });
+                            }
                         }
                         return Err(StreamError::WouldBlock);
                     }
@@ -1405,6 +1428,42 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 4);
             let _ = knet::timeout(std::time::Duration::from_millis(200), waiter).await;
+        });
+    }
+
+    /// O17: a reader polling throughout the EOF grace must arm the expiry
+    /// wakeup task exactly once (it used to spawn one sleeper per read).
+    #[test]
+    fn eof_grace_arms_wakeup_once_per_fin() {
+        // block_on: arming the wakeup calls `knet::spawn_task`, which needs
+        // the global tokio reactor.
+        knet::block_on(async {
+            let s = Arc::new(Stream::new(1));
+            s.set_self_ref(Arc::downgrade(&s));
+            {
+                let mut inner = s.recv.lock();
+                inner.remote_closed_at = Some(Instant::now());
+            }
+            s.remote_closed.store(true, Ordering::Release);
+
+            let mut buf = [0u8; 8];
+            for _ in 0..5 {
+                assert!(
+                    matches!(s.read(&mut buf), Err(StreamError::WouldBlock)),
+                    "reads inside the grace must stay pending"
+                );
+            }
+            assert_eq!(
+                s.grace_spawns.load(Ordering::Relaxed),
+                1,
+                "grace wakeup must be armed exactly once for 5 polls"
+            );
+
+            // After the window the same read reports the real EOF — and the
+            // one-shot gate is not re-armed on the way out.
+            knet::sleep_ms(EOF_GRACE_MS + 30).await;
+            assert!(matches!(s.read(&mut buf), Err(StreamError::Closed)));
+            assert_eq!(s.grace_spawns.load(Ordering::Relaxed), 1);
         });
     }
 }
