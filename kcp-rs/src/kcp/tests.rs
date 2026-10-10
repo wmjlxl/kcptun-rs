@@ -507,9 +507,11 @@ fn test_fast_retransmit_fires_on_duplicate_acks() {
     sender.send(b"BBB").unwrap();
     sender.send(b"CCC").unwrap();
 
-    // Flush at t=100 → moves segments to snd_buf, sends them
+    // Flush at t=100 → moves segments to snd_buf, sends them.
+    // Stay on the simulated clock: a wall-clock `flush()` would see
+    // resendts=100+rto as ancient and spuriously RTO-retransmit everything.
     sender.update(100);
-    sender.flush();
+    sender.flush_with_current(100, true);
 
     // Extract individual KCP segments from wire packets (a wire packet
     // may contain multiple KCP segments packed up to MTU).
@@ -552,8 +554,9 @@ fn test_fast_retransmit_fires_on_duplicate_acks() {
     }
 
     // Step 3: Receiver flushes → sends ACKs for received segments
+    // (simulated clock — see the t=100 note above)
     receiver.update(110);
-    receiver.flush();
+    receiver.flush_with_current(110, true);
 
     let receiver_segs = extract_segments(&receiver_out.lock().unwrap().clone());
     let ack_segs: Vec<_> = receiver_segs
@@ -574,9 +577,11 @@ fn test_fast_retransmit_fires_on_duplicate_acks() {
     }
 
     // Step 5: Sender flushes → should fast retransmit segment 0
+    // (simulated clock: wall-clock flush would RTO-retransmit and trip
+    // the `lost == 0` assertion below)
     sender_out.lock().unwrap().clear();
     sender.update(120);
-    sender.flush();
+    sender.flush_with_current(120, true);
 
     let fast_retrans = crate::snmp::DEFAULT_SNMP
         .fast_retrans
