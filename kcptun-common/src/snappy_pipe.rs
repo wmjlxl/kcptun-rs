@@ -68,12 +68,6 @@ where
         &mut self.inner
     }
 
-    /// Unwrap back to the inner transport.
-    #[allow(dead_code)]
-    pub(crate) fn into_inner(self) -> T {
-        self.inner
-    }
-
     // ── read side ───────────────────────────────────────────────────────────
 
     fn poll_read_into(&mut self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {

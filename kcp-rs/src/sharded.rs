@@ -114,6 +114,14 @@ pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
     }
 }
 
+/// Return a whole burst to the pool on a drop path (listener closed, session
+/// cap hit, integrity gate failed).
+fn recycle_all(datagrams: Vec<Vec<u8>>) {
+    for buf in datagrams {
+        recycle_buf(buf);
+    }
+}
+
 /// Take a pooled buffer, or `None` when the pool is empty. The returned buffer
 /// has capacity `≥ MAX_DATAGRAM` and length 0.
 #[inline]
@@ -874,82 +882,57 @@ fn process_burst(
     }
 }
 
-/// Push one peer's burst at its existing session, or start building one.
-fn deliver_group(
+/// Outcome of the established-session lookup (one `sessions` lock).
+enum Established {
+    Live(KcpStream),
+    Reaped(KcpStream),
+    None,
+}
+
+/// Phase 1 of [`deliver_group`]: a peer whose session is being built is
+/// claimed even when its queue is full. Falling through would open a second
+/// session for the same address and split one handshake across two state
+/// machines. Returns `None` when the burst was consumed by the build's queue.
+fn push_to_building(
     args: &RxArgs,
     peer: SocketAddr,
     datagrams: Vec<Vec<u8>>,
     inbox_cap: usize,
-    watched: &mut Vec<(SocketAddr, u64)>,
-) {
-    // A peer whose session is being built is claimed even when its queue is
-    // full. Falling through would open a second session for the same address
-    // and split one handshake across two state machines.
-    if let Some((queue, _, _)) = args.building.lock().get(&peer).cloned() {
-        for buf in datagrams {
-            if !queue.push(buf, inbox_cap) {
-                args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        return;
-    }
-
-    // One `sessions` lock for lookup + optional reap. `close()` runs outside
-    // the guard: holding the map across it stalls every other peer's deliver.
-    enum Established {
-        Live(KcpStream),
-        Reaped(KcpStream),
-        None,
-    }
-    let established = {
-        let mut sessions = args.sessions.lock();
-        match sessions.get(&peer) {
-            Some(s) if !s.conn.is_closed() && !s.conn.is_dead() => {
-                Established::Live(s.conn.clone())
-            }
-            Some(_) => Established::Reaped(sessions.remove(&peer).unwrap().conn),
-            None => Established::None,
-        }
+) -> Option<Vec<Vec<u8>>> {
+    // None => the burst was consumed by an in-flight build's queue;
+    // Some => no build owns this peer, continue with the established lookup.
+    let queue = match args.building.lock().get(&peer) {
+        Some((q, _, _)) => q.clone(),
+        None => return Some(datagrams),
     };
-    match established {
-        Established::Live(conn) => {
-            // Feed the whole group straight into KCP on this task and send the
-            // ACKs it produces before returning to the socket. Queueing it for
-            // the session's own input task costs a scheduling hop, and on a
-            // coarse timer wheel that hop measured 6–13ms — the whole of the
-            // fast-mode round trip. The count is taken first:
-            // `feed_raw_batch` updates it synchronously, and `evict_stale`
-            // compares against it once this burst has been delivered. The
-            // batch is the stale-session guard's unit: a group counts as a
-            // previous generation only when every datagram in it mismatched.
-            let before = conn.stale_burst_count();
-            conn.feed_raw_batch(datagrams);
-            watched.push((peer, before));
-            return;
+    for buf in datagrams {
+        if !queue.push(buf, inbox_cap) {
+            args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
         }
-        Established::Reaped(conn) => {
-            conn.close();
-            // Fall through: the group now counts as traffic from an unknown
-            // peer and may open a fresh session below.
-        }
-        Established::None => {}
     }
+    None
+}
 
-    // No session yet. A closed listener takes no new peers; datagrams for one
-    // already being built still go to its queue above.
-    if args.closed.load(Ordering::Acquire) {
-        for buf in datagrams {
-            recycle_buf(buf);
-        }
-        return;
+/// Phase 2: one `sessions` lock for lookup + optional reap. `close()` runs
+/// outside the guard: holding the map across it stalls every other peer's
+/// deliver.
+fn lookup_established(args: &RxArgs, peer: SocketAddr) -> Established {
+    let mut sessions = args.sessions.lock();
+    match sessions.get(&peer) {
+        Some(s) if !s.conn.is_closed() && !s.conn.is_dead() => Established::Live(s.conn.clone()),
+        Some(_) => Established::Reaped(sessions.remove(&peer).unwrap().conn),
+        None => Established::None,
     }
+}
 
-    // Admission is decided before any state is allocated. In-flight builds
-    // count against the cap: with `--crypt none`/`null` the integrity gate
-    // below is a no-op, so a spoofed source-address flood would otherwise
-    // pile up unbounded `building` entries (each a spawn task + PeerQueue)
-    // while every published session is still under the limit.
-    //
+/// Phase 3: admission is decided before any state is allocated. In-flight
+/// builds count against the cap: with `--crypt none`/`null` the integrity
+/// gate is a no-op, so a spoofed source-address flood would otherwise pile
+/// up unbounded `building` entries (each a spawn task + PeerQueue) while
+/// every published session is still under the limit.
+///
+/// Returns `false` when the burst must be dropped (stats already counted).
+fn admit_new_session(args: &RxArgs, peer: SocketAddr) -> bool {
     // Lock order is `building` then `sessions`, matching the publish path.
     {
         let building = args.building.lock();
@@ -960,10 +943,7 @@ fn deliver_group(
             drop(sessions);
             drop(building);
             args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
-            for buf in datagrams {
-                recycle_buf(buf);
-            }
-            return;
+            return false;
         }
     }
 
@@ -972,10 +952,7 @@ fn deliver_group(
     if !allow_new_session(&args.ip_limiter, peer.ip(), args.limits.per_ip_session_rate) {
         args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
         log::debug!("listener: per-IP session rate limit hit for {}", peer.ip());
-        for buf in datagrams {
-            recycle_buf(buf);
-        }
-        return;
+        return false;
     }
 
     // Opt-in per-IP cap on pinned session state. The rate limit above does
@@ -1003,18 +980,26 @@ fn deliver_group(
                 building_for_ip,
                 sessions_for_ip
             );
-            for buf in datagrams {
-                recycle_buf(buf);
-            }
-            return;
+            return false;
         }
     }
+    true
+}
 
-    // Integrity-gate a *copy* of the first datagram: one that fails the
-    // transport's CRC32 / AEAD check buys no state at all. The copy is
-    // discarded — the originals stay ciphertext and are what the queue
-    // receives, so the session input loop decrypts exactly once (decrypting
-    // here *and* there would drop the handshake burst).
+/// Phase 4: integrity-gate a *copy* of the first datagram: one that fails
+/// the transport's CRC32 / AEAD check buys no state at all. The copy is
+/// discarded — the originals stay ciphertext and are what the queue
+/// receives, so the session input loop decrypts exactly once (decrypting
+/// here *and* there would drop the handshake burst).
+///
+/// On success the fresh `PeerQueue` and the (possibly wrapped) transport for
+/// the upcoming build are returned; on failure `unauthenticated_drops` is
+/// counted and the caller drops the burst.
+fn gate_new_session(
+    args: &RxArgs,
+    peer: SocketAddr,
+    datagrams: &[Vec<u8>],
+) -> Option<(Arc<PeerQueue>, Arc<dyn crate::transport::PacketTransport>)> {
     let mut gate = vec![datagrams[0].clone()];
     let queue = Arc::new(PeerQueue::new());
     let transport = Arc::new(PeerTransport {
@@ -1032,15 +1017,25 @@ fn deliver_group(
         args.stats
             .unauthenticated_drops
             .fetch_add(1, Ordering::Relaxed);
-        for buf in datagrams {
-            recycle_buf(buf);
-        }
-        return;
+        return None;
     }
+    Some((queue, transport))
+}
 
-    // Build on its own task. `deliver_group` runs inside the receive task, and
-    // nesting a runtime there panics; the datagrams wait in the queue, which
-    // is registered before the spawn so the next datagram finds it.
+/// Phase 5: hand the burst to a fresh build. The build runs on its own task
+/// — `deliver_group` runs inside the receive task, and nesting a runtime
+/// there panics; the datagrams wait in the queue, which is registered before
+/// the spawn so the next datagram finds it. Returns `false` when the second
+/// admission check rejected the burst (it counts the stat and recycles the
+/// burst itself).
+fn register_and_spawn_build(
+    args: &RxArgs,
+    peer: SocketAddr,
+    datagrams: Vec<Vec<u8>>,
+    inbox_cap: usize,
+    queue: Arc<PeerQueue>,
+    transport: Arc<dyn crate::transport::PacketTransport>,
+) {
     let gen = args.build_gen.fetch_add(1, Ordering::Relaxed);
     {
         // Second admission check: the integrity gate above can take long
@@ -1054,9 +1049,7 @@ fn deliver_group(
             drop(sessions);
             drop(b);
             args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
-            for buf in datagrams {
-                recycle_buf(buf);
-            }
+            recycle_all(datagrams);
             return;
         }
         b.insert(peer, (queue.clone(), Instant::now(), gen));
@@ -1066,6 +1059,18 @@ fn deliver_group(
             args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
+    spawn_build_task(args, peer, gen, queue, transport);
+}
+
+/// Spawn the build task with the `RxArgs` handles it needs after
+/// [`register_and_spawn_build`] registered the `building` slot.
+fn spawn_build_task(
+    args: &RxArgs,
+    peer: SocketAddr,
+    gen: u64,
+    queue: Arc<PeerQueue>,
+    transport: Arc<dyn crate::transport::PacketTransport>,
+) {
     let sessions = args.sessions.clone();
     let building = args.building.clone();
     let pending = args.pending.clone();
@@ -1155,6 +1160,67 @@ fn deliver_group(
         }
         accept_notify.notify_one();
     });
+}
+
+/// Push one peer's burst at its existing session, or start building one.
+///
+/// Orchestrates the five phases: [`push_to_building`], the established
+/// lookup (inline feed / reap), the closed-listener check,
+/// [`admit_new_session`], [`gate_new_session`] and
+/// [`register_and_spawn_build`].
+fn deliver_group(
+    args: &RxArgs,
+    peer: SocketAddr,
+    datagrams: Vec<Vec<u8>>,
+    inbox_cap: usize,
+    watched: &mut Vec<(SocketAddr, u64)>,
+) {
+    let Some(datagrams) = push_to_building(args, peer, datagrams, inbox_cap) else {
+        return;
+    };
+
+    match lookup_established(args, peer) {
+        Established::Live(conn) => {
+            // Feed the whole group straight into KCP on this task and send the
+            // ACKs it produces before returning to the socket. Queueing it for
+            // the session's own input task costs a scheduling hop, and on a
+            // coarse timer wheel that hop measured 6–13ms — the whole of the
+            // fast-mode round trip. The count is taken first:
+            // `feed_raw_batch` updates it synchronously, and `evict_stale`
+            // compares against it once this burst has been delivered. The
+            // batch is the stale-session guard's unit: a group counts as a
+            // previous generation only when every datagram in it mismatched.
+            let before = conn.stale_burst_count();
+            conn.feed_raw_batch(datagrams);
+            watched.push((peer, before));
+            return;
+        }
+        Established::Reaped(conn) => {
+            conn.close();
+            // Fall through: the group now counts as traffic from an unknown
+            // peer and may open a fresh session below.
+        }
+        Established::None => {}
+    }
+
+    // No session yet. A closed listener takes no new peers; datagrams for one
+    // already being built still went to its queue in phase 1.
+    if args.closed.load(Ordering::Acquire) {
+        recycle_all(datagrams);
+        return;
+    }
+
+    if !admit_new_session(args, peer) {
+        recycle_all(datagrams);
+        return;
+    }
+
+    let Some((queue, transport)) = gate_new_session(args, peer, &datagrams) else {
+        recycle_all(datagrams);
+        return;
+    };
+
+    register_and_spawn_build(args, peer, datagrams, inbox_cap, queue, transport);
 }
 
 /// Evict sessions whose drained burst belonged entirely to a previous

@@ -80,255 +80,214 @@ impl LocalListener {
 
 /// Main async entry point — configuration, session setup, accept loop, and
 /// graceful shutdown.  Mirrors the Go kcptun client lifecycle.
-pub(crate) async fn async_main() -> Result<()> {
-    // Ignore SIGPIPE to prevent crashes when writing to closed sockets.
-    knet::ignore_sigpipe();
-    // Install SIGUSR1 handler for SNMP stats dump (matching Go kcptun).
-    knet::install_sigusr1_handler();
-    kcp_rs::snmp_enable();
+/// Everything startup needs after parsing and validating the CLI/JSON
+/// config: addresses, derived key, dial options, and pool tunables.
+/// Resolved once by [`ClientSetup::resolve`] before any socket or task
+/// is created.
+#[derive(Clone)]
+struct ClientSetup {
+    local_addr: String,
+    remote_addr: String,
+    key: [u8; 32],
+    session_cfg: ClientDialOptions,
+    conn_count: u32,
+    sockbuf: u32,
+    dscp: u32,
+    autoexpire: i64,
+    scavengettl: i64,
+    closewait: u64,
+    ratelimit: u32,
+    quiet: bool,
+    tcp: bool,
+    qpp_enabled: bool,
+    qpp_count: u16,
+}
 
-    let cli = Cli::parse_go_compatible();
-    if cli.version_flag {
-        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+impl ClientSetup {
+    /// Apply CLI/JSON defaults, validate every tunable (crypt, DSCP, QPP,
+    /// conn count, remote address), derive the encryption key, and build
+    /// the dial options. All startup errors surface here, before the pool
+    /// dials anything.
+    fn resolve(cli: &Cli) -> Result<Self> {
+        let local_addr = cli.localaddr.as_deref().unwrap_or(":12948");
+        let remote_addr_str = cli.remoteaddr.as_deref().unwrap_or("vps:29900");
 
-    // Load config file if specified
-    let cli = if let Some(ref config_path) = cli.c {
-        let config_str = knet::read_to_string(config_path.clone()).await?;
-        let cfg: Config = serde_json::from_str(&config_str)?;
-        Cli::merge(cli, cfg)
-    } else {
-        cli
-    };
+        let key_str = cli.key.as_deref().unwrap_or("it's a secrect");
+        let crypt = cli.crypt.as_deref().unwrap_or("aes");
+        // P2 / L-9: unknown --crypt used to silently fall back to aes.
+        if let Err(e) = kcrypt_rs::validate_crypt_method(crypt) {
+            anyhow::bail!("{e}");
+        }
+        let mode = cli.mode.as_deref().unwrap_or("fast");
+        let conn_count = cli.conn.unwrap_or(1);
+        // P1-3 / M-8: `--conn` used to be only `> 0`, so `--conn 1000000` opened
+        // millions of tasks + fds and wedged the start-up loop.
+        validate_conn_count(conn_count)?;
+        let mtu = cli.mtu.unwrap_or(1350);
+        let sndwnd = cli.sndwnd.unwrap_or(128);
+        let rcvwnd = cli.rcvwnd.unwrap_or(512);
+        let datashard = cli.datashard.unwrap_or(10);
+        let parityshard = cli.parityshard.unwrap_or(3);
+        let nocomp = cli.nocomp;
+        let quiet = cli.quiet;
+        let acknodelay = cli.acknodelay;
+        let nodelay = cli.nodelay.unwrap_or(0);
+        let interval = cli.interval.unwrap_or(50);
+        let resend = cli.resend.unwrap_or(0);
+        let nc = cli.nc.unwrap_or(0);
+        let smuxver = cli.smuxver.unwrap_or(2);
+        let smuxbuf = cli.smuxbuf.unwrap_or(4 * 1024 * 1024);
+        let streambuf = cli.streambuf.unwrap_or(2097152);
+        let framesize = cli.framesize.unwrap_or(8192);
+        let sockbuf = cli.sockbuf.unwrap_or(4 * 1024 * 1024);
+        let keepalive = cli.keepalive.unwrap_or(10);
+        let keepalivetimeout = cli.keepalivetimeout.unwrap_or(30).max(0) as u64;
+        let ackstalltimeout = cli
+            .ackstalltimeout
+            .unwrap_or(kcptun_common::ACK_STALL_DEFAULT_SECS as i64)
+            .max(0) as u64;
+        let autoexpire = cli.autoexpire.unwrap_or(0);
+        let scavengettl = cli.scavengettl.unwrap_or(600);
+        let closewait = cli.closewait.unwrap_or(0).max(0) as u64;
+        let ratelimit = cli.ratelimit;
+        let dscp = cli.dscp.unwrap_or(0);
+        // P2 / L-11: DSCP is a 6-bit field (0–63).
+        anyhow::ensure!(dscp <= 63, "dscp {dscp} out of range (must be 0–63)");
+        #[cfg(feature = "qpp")]
+        let qpp_enabled = cli.qpp;
+        #[cfg(not(feature = "qpp"))]
+        let qpp_enabled = false;
+        #[cfg(feature = "qpp")]
+        let qpp_count = cli.qppcount.unwrap_or(61);
+        #[cfg(not(feature = "qpp"))]
+        let qpp_count = 0u16;
 
-    // Logging: controlled by RUST_LOG env var, defaults to "info".
-    if let Some(ref log_path) = cli.log.as_ref().filter(|s| !s.is_empty()) {
-        crate::rotate_log(log_path, 10 * 1024 * 1024);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)?;
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .format_timestamp_secs()
-            .target(env_logger::Target::Pipe(Box::new(file)))
-            .init();
-    } else {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .format_timestamp_secs()
-            .init();
-        info!(
-            "log level: {} (set RUST_LOG=debug for verbose output)",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())
+        kcptun_common::validate_qpp_config(qpp_enabled, qpp_count, key_str.as_bytes())?;
+
+        // Derive encryption key
+        let key = kcptun_common::derive_key(key_str);
+        let session_cfg = ClientDialOptions {
+            crypt: crypt.to_string(),
+            mode: mode.to_string(),
+            mtu,
+            sndwnd,
+            rcvwnd,
+            datashard,
+            parityshard,
+            acknodelay,
+            nodelay,
+            interval,
+            resend,
+            nc,
+            smuxver,
+            smuxbuf,
+            streambuf,
+            framesize,
+            keepalive: keepalive.max(0) as u64,
+            keepalivetimeout,
+            ackstalltimeout,
+            nocomp,
+            ratelimit,
+        };
+
+        kcptun_common::log_session_bootstrap(
+            crypt,
+            key.len(),
+            session_cfg.ackstalltimeout,
+            session_cfg.keepalive,
+            session_cfg.keepalivetimeout,
         );
+        // Validate the remote address once; each actual dial re-resolves DNS
+        // and randomly selects a configured port, matching Go.
+        kcptun_common::parse_multi_port(remote_addr_str)?;
+
+        Ok(Self {
+            local_addr: local_addr.to_string(),
+            remote_addr: remote_addr_str.to_string(),
+            key,
+            session_cfg,
+            conn_count,
+            sockbuf,
+            dscp,
+            autoexpire,
+            scavengettl,
+            closewait,
+            ratelimit,
+            quiet,
+            tcp: cli.tcp,
+            qpp_enabled,
+            qpp_count,
+        })
     }
+}
 
-    let local_addr = cli.localaddr.as_deref().unwrap_or(":12948");
-    let remote_addr_str = cli.remoteaddr.as_deref().unwrap_or("vps:29900");
-
-    let key_str = cli.key.as_deref().unwrap_or("it's a secrect");
-    let crypt = cli.crypt.as_deref().unwrap_or("aes");
-    // P2 / L-9: unknown --crypt used to silently fall back to aes.
-    if let Err(e) = kcrypt_rs::validate_crypt_method(crypt) {
-        anyhow::bail!("{e}");
-    }
-    let mode = cli.mode.as_deref().unwrap_or("fast");
-    let conn_count = cli.conn.unwrap_or(1);
-    // P1-3 / M-8: `--conn` used to be only `> 0`, so `--conn 1000000` opened
-    // millions of tasks + fds and wedged the start-up loop.
-    validate_conn_count(conn_count)?;
-    let mtu = cli.mtu.unwrap_or(1350);
-    let sndwnd = cli.sndwnd.unwrap_or(128);
-    let rcvwnd = cli.rcvwnd.unwrap_or(512);
-    let datashard = cli.datashard.unwrap_or(10);
-    let parityshard = cli.parityshard.unwrap_or(3);
-    let nocomp = cli.nocomp;
-    let quiet = cli.quiet;
-    let acknodelay = cli.acknodelay;
-    let nodelay = cli.nodelay.unwrap_or(0);
-    let interval = cli.interval.unwrap_or(50);
-    let resend = cli.resend.unwrap_or(0);
-    let nc = cli.nc.unwrap_or(0);
-    let smuxver = cli.smuxver.unwrap_or(2);
-    let smuxbuf = cli.smuxbuf.unwrap_or(4 * 1024 * 1024);
-    let streambuf = cli.streambuf.unwrap_or(2097152);
-    let framesize = cli.framesize.unwrap_or(8192);
-    let sockbuf = cli.sockbuf.unwrap_or(4 * 1024 * 1024);
-    let keepalive = cli.keepalive.unwrap_or(10);
-    let keepalivetimeout = cli.keepalivetimeout.unwrap_or(30).max(0) as u64;
-    let ackstalltimeout = cli
-        .ackstalltimeout
-        .unwrap_or(kcptun_common::ACK_STALL_DEFAULT_SECS as i64)
-        .max(0) as u64;
-    let autoexpire = cli.autoexpire.unwrap_or(0);
-    let scavengettl = cli.scavengettl.unwrap_or(600);
-    let closewait = cli.closewait.unwrap_or(0).max(0) as u64;
-    let ratelimit = cli.ratelimit;
-    let dscp = cli.dscp.unwrap_or(0);
-    // P2 / L-11: DSCP is a 6-bit field (0–63).
-    anyhow::ensure!(dscp <= 63, "dscp {dscp} out of range (must be 0–63)");
-    #[cfg(feature = "qpp")]
-    let qpp_enabled = cli.qpp;
-    #[cfg(not(feature = "qpp"))]
-    let qpp_enabled = false;
-    #[cfg(feature = "qpp")]
-    let qpp_count = cli.qppcount.unwrap_or(61);
-    #[cfg(not(feature = "qpp"))]
-    let qpp_count = 0u16;
-
-    // Validate QPP parameters (matching Go's ValidateQPPParams)
-    #[cfg(feature = "qpp")]
-    if qpp_enabled {
-        match kcptun_common::validate_qpp_params(qpp_count, key_str.as_bytes()) {
-            Ok(warnings) => {
-                for w in &warnings {
-                    log::warn!("{}", w);
-                }
-            }
-            Err(e) => {
-                error!("QPP configuration error: {}", e);
-                return Err(anyhow::anyhow!("QPP: {}", e));
-            }
-        }
-    }
-
-    // Derive encryption key
-    let key = kcptun_common::derive_key(key_str);
-    let session_cfg = ClientDialOptions {
-        crypt: crypt.to_string(),
-        mode: mode.to_string(),
-        mtu,
-        sndwnd,
-        rcvwnd,
-        datashard,
-        parityshard,
-        acknodelay,
-        nodelay,
-        interval,
-        resend,
-        nc,
-        smuxver,
-        smuxbuf,
-        streambuf,
-        framesize,
-        keepalive: keepalive.max(0) as u64,
-        keepalivetimeout,
-        ackstalltimeout,
-        nocomp,
-        ratelimit,
-    };
-
-    info!(
-        "key derived: crypt={}, key=[REDACTED len={}]",
-        crypt,
-        key.len()
-    );
-    info!(
-        "session watchdog: ack-stall window={}s ({}), fast path needs peer-restart evidence",
-        session_cfg.ackstalltimeout,
-        if session_cfg.ackstalltimeout == 0 {
-            "disabled"
-        } else {
-            "closes after that much unacknowledged outbound data"
-        }
-    );
-    info!(
-        "smux keepalive: interval={}s timeout={}s ({})",
-        session_cfg.keepalive,
-        session_cfg.keepalivetimeout,
-        if session_cfg.keepalivetimeout == 0 {
-            "timeout check disabled"
-        } else {
-            "session closed after that much inbound silence"
-        }
-    );
-
-    // Validate the remote address once; each actual dial re-resolves DNS and
-    // randomly selects a configured port, matching Go.
-    kcptun_common::parse_multi_port(remote_addr_str)?;
-
-    if !cli.tcp {
-        info!("using shared kcptun session stack");
-    }
-
-    // Create KCP connection pool (shared with scavenger for auto-expire)
+/// Dial the KCP connection pool: `conn_count` UDP (or raw-TCP) sessions,
+/// tracked for auto-expire when `autoexpire > 0` (shared with the
+/// scavenger — Go keeps every timed session in a separate list so a
+/// replaced session stays closeable after its pool slot moves on).
+async fn create_pool(setup: &ClientSetup) -> Result<(client::SessionPool, client::SessionPool)> {
+    let ClientSetup {
+        remote_addr,
+        key,
+        session_cfg,
+        conn_count,
+        sockbuf,
+        dscp,
+        autoexpire,
+        tcp,
+        ..
+    } = setup;
     let conns: client::SessionPool = Arc::new(parking_lot::Mutex::new(Vec::with_capacity(
-        conn_count as usize,
+        *conn_count as usize,
     )));
     // Go keeps every timed session in a separate scavenger list.  Keeping Arc
     // references here ensures a session remains closeable after its pool slot
     // is replaced by a reconnect.
     let tracked_sessions: client::SessionPool = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    if cli.tcp {
+    if *tcp {
         // Go maintains `conn` independently of the underlying UDP/tcpraw
         // transport. Build the requested number of tcpraw sessions so the
         // round-robin pool and its configured size cannot diverge.
-        for i in 0..conn_count as usize {
-            let remote = kcptun_common::random_remote_addr(remote_addr_str)?;
+        for i in 0..*conn_count as usize {
+            let remote = kcptun_common::random_remote_addr(remote_addr)?;
             info!(
                 "creating TCP raw KCP connection {}/{} -> {}",
                 i + 1,
                 conn_count,
                 remote
             );
-            let socket = socket::create_client_socket(remote, true, sockbuf, dscp)?;
-            let conn = Arc::new(client::build_session(remote, &key, &session_cfg, socket).await?);
+            let socket = socket::create_client_socket(remote, true, *sockbuf, *dscp)?;
+            let conn = Arc::new(client::build_session(remote, key, session_cfg, socket).await?);
             conns.lock().push(conn.clone());
-            if autoexpire > 0 {
+            if *autoexpire > 0 {
                 tracked_sessions.lock().push(conn);
             }
         }
     } else {
         // UDP mode: create conn_count connections
-        for i in 0..conn_count as usize {
-            let remote = kcptun_common::random_remote_addr(remote_addr_str)?;
+        for i in 0..*conn_count as usize {
+            let remote = kcptun_common::random_remote_addr(remote_addr)?;
             info!(
                 "creating KCP connection {}/{} -> {}",
                 i + 1,
                 conn_count,
                 remote
             );
-            let socket = socket::create_client_udp_socket(remote, sockbuf, dscp)?;
+            let socket = socket::create_client_udp_socket(remote, *sockbuf, *dscp)?;
             let socket = Arc::new(knet::DatagramSocket::Udp(socket));
-            let conn = Arc::new(client::build_session(remote, &key, &session_cfg, socket).await?);
+            let conn = Arc::new(client::build_session(remote, key, session_cfg, socket).await?);
             conns.lock().push(conn.clone());
-            if autoexpire > 0 {
+            if *autoexpire > 0 {
                 tracked_sessions.lock().push(conn);
             }
         }
     }
+    Ok((conns, tracked_sessions))
+}
 
-    info!("established {} KCP connections", conns.lock().len());
-    if ratelimit > 0 {
-        info!("ratelimit: {} bytes/sec", ratelimit);
-    }
-    if dscp > 0 {
-        info!("dscp: {}", dscp);
-    }
-    info!("sockbuf: requested={}", sockbuf);
-
-    // Start SNMP logger if configured
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    {
-        let signal_stop = stop_flag.clone();
-        knet::spawn_task(async move {
-            kcptun_common::snmp_signal_logger(signal_stop).await;
-        });
-    }
-    if let Some(ref snmplog_path) = cli.snmplog {
-        let secs = cli.snmpperiod.unwrap_or(60).max(0) as u64;
-        if secs > 0 && !snmplog_path.is_empty() {
-            let period = Duration::from_secs(secs);
-            let s = stop_flag.clone();
-            let p = snmplog_path.clone();
-            knet::spawn_task(async move {
-                kcptun_common::snmp_logger(p, period, s).await;
-            });
-        } else {
-            log::warn!("snmplog set but snmpperiod=0 or empty path — SNMP collection disabled");
-        }
-    }
-
+/// Start the pprof HTTP endpoint when `--pprof` is set (requires the
+/// `pprof` feature; warns otherwise).
+fn start_pprof(cli: &Cli, stop_flag: &Arc<AtomicBool>) {
     // Start pprof if configured (requires --features pprof)
     #[cfg(feature = "pprof")]
     if cli.pprof {
@@ -349,18 +308,26 @@ pub(crate) async fn async_main() -> Result<()> {
     if cli.pprof {
         log::warn!("--pprof requested but binary built without `pprof` feature; rebuild with --features pprof");
     }
+}
 
-    // Start auto-expire scavenger if enabled (matching Go client).
-    //
-    // Go scavenger deadline = creation + autoexpire + scavengeTTL.
-    // Uses absolute creation time, NOT last activity — keepalive does NOT
-    // delay expiry.  The accept loop proactively replaces sessions at
-    // `creation + autoexpire`; the scavenger retires any session still alive
-    // past `creation + autoexpire + scavengeTTL` **and** done serving, so a
-    // replaced session finishes the streams it was already carrying instead of
-    // aborting them (see `client::should_retire_session`).
+/// Spawn the auto-expire scavenger if enabled (matching Go client).
+///
+/// Go scavenger deadline = creation + autoexpire + scavengeTTL.
+/// Uses absolute creation time, NOT last activity — keepalive does NOT
+/// delay expiry.  The accept loop proactively replaces sessions at
+/// `creation + autoexpire`; the scavenger retires any session still alive
+/// past `creation + autoexpire + scavengeTTL` **and** done serving, so a
+/// replaced session finishes the streams it was already carrying instead of
+/// aborting them (see `client::should_retire_session`).
+fn spawn_scavenger(
+    setup: &ClientSetup,
+    tracked_sessions: &client::SessionPool,
+    stop_flag: Arc<AtomicBool>,
+) {
+    let autoexpire = setup.autoexpire;
+    let scavengettl = setup.scavengettl;
     if autoexpire > 0 {
-        let s = stop_flag.clone();
+        let s = stop_flag;
         let scavenge_sessions = tracked_sessions.clone();
         let scavenge_autoexpire = autoexpire.max(0) as u64;
         let scavenge_ttl = scavengettl.max(0) as u64;
@@ -406,19 +373,85 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         });
     }
+}
 
-    // Go accepts either a TCP address or a Unix-domain socket path here.
-    let listener = LocalListener::bind(local_addr).await?;
-    info!("listening on {}", local_addr);
+pub(crate) async fn async_main() -> Result<()> {
+    // Ignore SIGPIPE to prevent crashes when writing to closed sockets.
+    knet::ignore_sigpipe();
+    // Install SIGUSR1 handler for SNMP stats dump (matching Go kcptun).
+    knet::install_sigusr1_handler();
+    kcp_rs::snmp_enable();
 
-    // Spawn Ctrl-C handler (runtime-agnostic)
+    let cli = Cli::parse_go_compatible();
+    if cli.version_flag {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // Load config file if specified
+    let cli = if let Some(ref config_path) = cli.c {
+        let config_str = knet::read_to_string(config_path.clone()).await?;
+        let cfg: Config = serde_json::from_str(&config_str)?;
+        Cli::merge(cli, cfg)
+    } else {
+        cli
+    };
+
+    // Logging: append to --log (rotated at 10 MiB) or stderr; default info.
+    kcptun_common::init_logging(cli.log.as_deref())?;
+
+    // Resolve + validate every tunable, derive key, build dial options.
+    let setup = ClientSetup::resolve(&cli)?;
+
+    if !setup.tcp {
+        info!("using shared kcptun session stack");
+    }
+
+    // Create KCP connection pool (shared with scavenger for auto-expire)
+    let (conns, tracked_sessions) = create_pool(&setup).await?;
+
+    info!("established {} KCP connections", conns.lock().len());
+    if setup.ratelimit > 0 {
+        info!("ratelimit: {} bytes/sec", setup.ratelimit);
+    }
+    if setup.dscp > 0 {
+        info!("dscp: {}", setup.dscp);
+    }
+    info!("sockbuf: requested={}", setup.sockbuf);
+
+    // Stop flag + SIGUSR1 -> in-memory SNMP dump (matching Go kcptun).
+    let stop_flag = Arc::new(AtomicBool::new(false));
     {
-        let stop = stop_flag.clone();
+        let signal_stop = stop_flag.clone();
         knet::spawn_task(async move {
-            let _ = knet::ctrl_c().await;
-            stop.store(true, Ordering::Relaxed);
+            kcptun_common::snmp_signal_logger(signal_stop).await;
         });
     }
+    kcptun_common::spawn_snmp_logger(cli.snmplog.as_deref(), cli.snmpperiod, stop_flag.clone());
+    start_pprof(&cli, &stop_flag);
+    spawn_scavenger(&setup, &tracked_sessions, stop_flag.clone());
+
+    // The accept loop works on plain locals; destructure the resolved
+    // setup once instead of threading `setup.` through every retry branch.
+    let ClientSetup {
+        local_addr,
+        remote_addr: remote_addr_str,
+        key,
+        session_cfg,
+        sockbuf,
+        dscp,
+        autoexpire,
+        closewait,
+        quiet,
+        qpp_enabled,
+        qpp_count,
+        ..
+    } = setup;
+
+    // Go accepts either a TCP address or a Unix-domain socket path here.
+    let listener = LocalListener::bind(&local_addr).await?;
+    info!("listening on {}", local_addr);
+    kcptun_common::spawn_ctrl_c(stop_flag.clone());
 
     // Accept loop with round-robin across KCP connections
     let round_robin = Arc::new(AtomicUsize::new(0));
@@ -504,7 +537,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         &conns,
                         (autoexpire > 0).then_some(&tracked_sessions),
                         idx,
-                        remote_addr_str,
+                        &remote_addr_str,
                         &key,
                         &session_cfg,
                         cli.tcp,

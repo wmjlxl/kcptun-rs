@@ -112,7 +112,7 @@ impl TestEnv {
             srv_args.push("--nocomp".into());
         }
 
-        let sv = Command::new(&find_bin("kcptun-server"))
+        let sv = Command::new(find_bin("kcptun-server"))
             .args(&srv_args)
             .env("RUST_LOG", "")
             .stdout(Stdio::null())
@@ -149,7 +149,7 @@ impl TestEnv {
             cli_args.push("--nocomp".into());
         }
 
-        let cl = Command::new(&find_bin("kcptun-client"))
+        let cl = Command::new(find_bin("kcptun-client"))
             .args(&cli_args)
             .env("RUST_LOG", "")
             .stdout(Stdio::null())
@@ -194,12 +194,6 @@ fn make_payload(conn_id: usize, size: usize) -> Vec<u8> {
 /// then reads until either:
 ///   - EOF (server closed connection after echoing), or
 ///   - All expected bytes received (for echo, response length == request length)
-/// Send data through the tunnel and receive the full echo response.
-///
-/// Sends data, half-closes the write side (signals EOF to echo server),
-/// then reads until either:
-///   - EOF (server closed connection after echoing), or
-///   - All expected bytes received (for echo, response length == request length)
 fn send_and_recv(cli_port: u16, data: &[u8], timeout_secs: u64) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
@@ -221,7 +215,7 @@ fn send_and_recv(cli_port: u16, data: &[u8], timeout_secs: u64) -> Result<Vec<u8
     }
     let mut s = match s {
         Some(stream) => stream,
-        None => return Err(format!("connect: Connection refused (os error 61)")),
+        None => return Err("connect: Connection refused (os error 61)".to_string()),
     };
 
     s.set_write_timeout(Some(Duration::from_secs(15))).ok();
@@ -755,8 +749,8 @@ fn test_server_multi_port() {
     thread::sleep(Duration::from_millis(500));
 
     // Server listens on port range 29950-29951
-    let mut sv = Command::new(&find_bin("kcptun-server"))
-        .args(&[
+    let mut sv = Command::new(find_bin("kcptun-server"))
+        .args([
             "-t",
             &format!("127.0.0.1:{}", target_port),
             "-l",
@@ -785,8 +779,8 @@ fn test_server_multi_port() {
     thread::sleep(Duration::from_secs(2));
 
     // Client 1 connects to first port in range
-    let mut cl1 = Command::new(&find_bin("kcptun-client"))
-        .args(&[
+    let mut cl1 = Command::new(find_bin("kcptun-client"))
+        .args([
             "-r",
             &format!("127.0.0.1:{}", srv_port_min),
             "-l",
@@ -834,10 +828,11 @@ fn test_server_multi_port() {
 
     // Kill client 1 and test through port 2
     let _ = cl1.kill();
+    let _ = cl1.wait();
     kill_port(cli_port1);
 
-    let mut cl2 = Command::new(&find_bin("kcptun-client"))
-        .args(&[
+    let mut cl2 = Command::new(find_bin("kcptun-client"))
+        .args([
             "-r",
             &format!("127.0.0.1:{}", srv_port_max),
             "-l",
@@ -884,8 +879,11 @@ fn test_server_multi_port() {
 
     // Cleanup
     let _ = sv.kill();
+    let _ = sv.wait();
     let _ = echo.kill();
+    let _ = echo.wait();
     let _ = cl2.kill();
+    let _ = cl2.wait();
     for p in &[target_port, srv_port_min, srv_port_max, cli_port2] {
         kill_port(*p);
     }
@@ -922,8 +920,8 @@ fn test_closewait_smoke() {
         .expect("echo");
     thread::sleep(Duration::from_millis(500));
 
-    let mut sv = Command::new(&find_bin("kcptun-server"))
-        .args(&[
+    let mut sv = Command::new(find_bin("kcptun-server"))
+        .args([
             "-t",
             &format!("127.0.0.1:{}", target_port),
             "-l",
@@ -953,8 +951,8 @@ fn test_closewait_smoke() {
         .expect("srv");
     thread::sleep(Duration::from_secs(2));
 
-    let mut cl = Command::new(&find_bin("kcptun-client"))
-        .args(&[
+    let mut cl = Command::new(find_bin("kcptun-client"))
+        .args([
             "-r",
             &format!("127.0.0.1:{}", srv_port),
             "-l",
@@ -993,8 +991,11 @@ fn test_closewait_smoke() {
     assert_eq!(data, resp, "closewait smoke: data mismatch");
 
     let _ = sv.kill();
+    let _ = sv.wait();
     let _ = echo.kill();
+    let _ = echo.wait();
     let _ = cl.kill();
+    let _ = cl.wait();
     for p in &[target_port, srv_port, cli_port] {
         kill_port(*p);
     }

@@ -138,18 +138,8 @@ impl CryptoTransport {
         }
     }
 
-    /// Access the underlying socket (diagnostics / local_addr).
-    #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> &Arc<dyn PacketTransport> {
-        &self.inner
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn crypt(&self) -> &Arc<CryptEngine> {
-        &self.crypt
-    }
-
-    #[allow(dead_code)]
+    /// Whether this transport negotiated encryption (tests/diagnostics).
+    #[cfg(test)]
     pub(crate) fn has_encryption(&self) -> bool {
         self.has_encryption
     }

@@ -121,9 +121,7 @@ struct ReconnectEnv {
 
 impl ReconnectEnv {
     fn start(
-        target_port: u16,
-        srv_port: u16,
-        cli_port: u16,
+        (target_port, srv_port, cli_port): (u16, u16, u16),
         crypt: &str,
         nocomp: bool,
         conn: usize,
@@ -177,7 +175,7 @@ impl ReconnectEnv {
             srv_args.push("--nocomp".into());
         }
 
-        let sv = Command::new(&find_bin("kcptun-server"))
+        let sv = Command::new(find_bin("kcptun-server"))
             .args(&srv_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -213,7 +211,7 @@ impl ReconnectEnv {
             cli_args.push("--nocomp".into());
         }
 
-        let cl = Command::new(&find_bin("kcptun-client"))
+        let cl = Command::new(find_bin("kcptun-client"))
             .args(&cli_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -314,7 +312,7 @@ impl ReconnectEnv {
             srv_args.push("--nocomp".into());
         }
 
-        let sv = Command::new(&find_bin("kcptun-server"))
+        let sv = Command::new(find_bin("kcptun-server"))
             .args(&srv_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -354,7 +352,7 @@ fn make_payload(seed: usize, size: usize) -> Vec<u8> {
 /// --conn 4: all connections pass data (round-robin).
 #[test]
 fn test_multi_conn_baseline() {
-    let e = ReconnectEnv::start(19700, 39700, 19701, "null", true, 4, 30, "fast");
+    let e = ReconnectEnv::start((19700, 39700, 19701), "null", true, 4, 30, "fast");
     let mut ok = 0usize;
     let mut fail = 0usize;
     for i in 0..24 {
@@ -375,7 +373,7 @@ fn test_reconnect_after_restart() {
     let conn_n = 4;
     let base = 19600 + (std::process::id() % 1000) as u16;
     // Use mode "fast" (not fast3) — fast3 + --conn 4 has baseline timeout issues.
-    let mut e = ReconnectEnv::start(base, base + 1, base + 2, "null", true, conn_n, 2, "fast");
+    let mut e = ReconnectEnv::start((base, base + 1, base + 2), "null", true, conn_n, 2, "fast");
 
     // Baseline
     for i in 0..8 {

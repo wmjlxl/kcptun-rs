@@ -3,14 +3,6 @@
 use clap::Parser;
 use serde::Deserialize;
 
-fn normalize_go_alias(arg: std::ffi::OsString) -> std::ffi::OsString {
-    match arg.to_str() {
-        Some("-ds") => "--datashard".into(),
-        Some("-ps") => "--parityshard".into(),
-        _ => arg,
-    }
-}
-
 /// Configuration struct matching the kcptun JSON config format.
 ///
 /// Numeric fields match Go kcptun: time/duration fields that may be negative
@@ -261,7 +253,7 @@ pub(crate) struct Cli {
 
 impl Cli {
     pub(crate) fn parse_go_compatible() -> Self {
-        Self::parse_from(std::env::args_os().map(normalize_go_alias))
+        Self::parse_from(std::env::args_os().map(kcptun_common::normalize_go_alias))
     }
 
     /// Merge CLI args with the JSON config taking precedence, matching Go.
@@ -369,7 +361,7 @@ mod tests {
         let args = ["kcptun-client", "-ds", "4", "-ps", "2"]
             .into_iter()
             .map(std::ffi::OsString::from)
-            .map(normalize_go_alias);
+            .map(kcptun_common::normalize_go_alias);
         let cli = Cli::try_parse_from(args).unwrap();
         assert_eq!(cli.datashard, Some(4));
         assert_eq!(cli.parityshard, Some(2));

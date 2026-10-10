@@ -101,7 +101,7 @@ fn send_and_recv(cli_port: u16, data: &[u8], timeout_secs: u64) -> Result<Vec<u8
     }
     let mut s = match s {
         Some(stream) => stream,
-        None => return Err(format!("connect: Connection refused")),
+        None => return Err("connect: Connection refused".to_string()),
     };
 
     s.set_write_timeout(Some(Duration::from_secs(15))).ok();
@@ -177,8 +177,8 @@ fn test_autoexpire_and_multi_port() {
     thread::sleep(Duration::from_millis(500));
 
     // Server listens on a multi-port range.
-    let sv = Command::new(&find_bin("kcptun-server"))
-        .args(&[
+    let sv = Command::new(find_bin("kcptun-server"))
+        .args([
             "-t",
             &format!("127.0.0.1:{}", target_port),
             "-l",
@@ -209,8 +209,8 @@ fn test_autoexpire_and_multi_port() {
     // Client dials the whole range; each of the two sessions randomly selects
     // a configured server port. Stderr is captured for scavenger assertions.
     let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let mut cli = Command::new(&find_bin("kcptun-client"))
-        .args(&[
+    let mut cli = Command::new(find_bin("kcptun-client"))
+        .args([
             "-r",
             &format!("127.0.0.1:{}-{}", srv_port_min, srv_port_max),
             "-l",

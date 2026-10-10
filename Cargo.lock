@@ -788,7 +788,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "env_logger",
  "kcp-rs",
  "kcptun-common",
  "kcrypt-rs",
@@ -810,6 +809,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "env_logger",
  "getrandom 0.2.17",
  "kcp-rs",
  "kcrypt-rs",
@@ -833,7 +833,6 @@ dependencies = [
  "async-channel 1.9.0",
  "async-trait",
  "clap",
- "env_logger",
  "kcp-rs",
  "kcptun-common",
  "kcrypt-rs",

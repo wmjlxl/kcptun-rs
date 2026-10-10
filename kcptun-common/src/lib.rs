@@ -10,11 +10,18 @@
 //! (see `kcptun-server/src/app.rs`); raw-TCP sockets are per-peer and connect
 //! directly via `KcptunSession::serve_transport`.
 
+mod app_support;
 mod key;
 mod mode;
 mod multiport;
 mod ratelimit;
 mod snappy_frame;
+
+pub use app_support::{
+    init_logging, log_session_bootstrap, normalize_go_alias, rotate_log, validate_qpp_config,
+};
+#[cfg(feature = "tokio")]
+pub use app_support::{spawn_ctrl_c, spawn_snmp_logger};
 
 pub use key::derive_key;
 pub use mode::apply_mode;

@@ -22,7 +22,7 @@ UDP/raw TCP → BlockCrypt/AEAD (+ optional QPP) → (+ optional FEC) → KCP AR
 | `kcrypt-rs` | 13 BlockCrypt + AES-128-GCM + wire packing (`CryptoBuf`/`encrypt_batch`) | no crypto lives in kcp-rs. AES-CFB picks its backend at construction: hardware AES (AES-NI/ARMv8) → `aes` crate; otherwise Go-style T-table soft AES (`crypt/aes_soft.rs`) — CFB can't amortize fixslice batching (3.6× slower per block). Soft tables are NOT constant-time, same posture as Go's `crypto/aes` fallback. |
 | `kcp-rs` | KCP ARQ state machine, FEC, SNMP; feature `async` adds `KcpStream`/`KcpListener`/`PacketTransport` | deps: knet-rs (optional) |
 | `smux-rs` | SMUX v1/v2; `SmuxConn` Builder, `Session`, `Arc<Stream>` | deps: knet-rs |
-| `kcptun-common` | Production stack: `KcptunConfig`, `CryptoTransport`, `kcp_transport`, `KcptunSession`, `KcptunListener`, Snappy pipes, ratelimit, snmp_log | deps: kcp-rs + kcrypt-rs + smux-rs |
+| `kcptun-common` | Production stack: `KcptunConfig`, `CryptoTransport`, `kcp_transport`, `KcptunSession`, `KcptunListener`, Snappy pipes, ratelimit, snmp_log; `app_support` = shared binary bootstrap (log rotation/init, QPP validate, SNMP/Ctrl-C task spawns, Go `-ds/-ps` alias) used by both client & server | deps: kcp-rs + kcrypt-rs + smux-rs + env_logger |
 | `kcptun-client` | Client binary (`app.rs` parses CLI inside `async_main`) | default = `["tokio","qpp","pprof"]` |
 | `kcptun-server` | Server binary (CLI parsed in `main`) + stress tests | same defaults |
 
@@ -60,7 +60,7 @@ make build / release          # debug / release (LTO, stripped)
 make test                     # unit tests
 make stress                   # needs release build first
 make e2e                      # Go↔Rust interop — REQUIRES user confirmation first
-make clippy                   # -D warnings (kcptun-server/tests currently carries pre-existing lint debt)
+make clippy                   # -D warnings (workspace-wide clean as of 2026-10-09)
 make fmt
 make bench / profile / profile-rust-go / profiling-bins
 make release-armv7 / release-arm64
@@ -126,6 +126,7 @@ the retirement path aborts in-flight downloads whenever a slot is replaced.
 ### Testing
 
 - `cargo test --workspace` / `make test`; kcp-rs integration tests need `--features async` (or `--all-features`).
+- Large inline `#[cfg(test)]` modules live in sibling files (`mod tests;` in `foo.rs` → `foo/tests.rs`); keep new unit tests there, do not re-inline. Production code in `kcp.rs`/`conn.rs` stays a Go-mirror only — the tests are exempt.
 - `cargo test --release -p kcptun-server --test session_retirement_test -- --nocapture` — asserts the
   three-phase autoexpire lifecycle (retired session keeps serving → new connection uses the new
   session → old session closed only after it finished).
@@ -166,29 +167,30 @@ External deps are fetched from crates.io per platform (not vendored). Notable: `
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **kcptun-rs** (6365 symbols, 14814 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **kcptun-rs** (7192 symbols, 17522 relationships, 596 execution flows).
 
-> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+> Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "master"})`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- **MUST run impact before editing.** Use `impact({target: "symbolName", direction: "upstream"})` or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .`; report callers, processes, and risk. Never substitute grep for graph analysis.
+- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "master"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "master" --repo .`.
+- MUST warn on HIGH/CRITICAL `risk` pre-edit; never use `riskSharedAxes` to waive a HIGH/CRITICAL `risk` warning. Compare File/symbol: MCP File omits axes; Graph-RAG expands File.
+- **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
+- **MUST use `query({search_query: "concept"})` for concepts/flows, `context({name: "symbolName"})` for a named symbol, or `impact` for blast radius, on read-only callers, dependencies, imports, or execution flow.** Graph first; text search only for empty/`UNKNOWN`/literals.
+- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running `impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER edit a function, class, or method before MCP/CLI impact analysis.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis, and never read `UNKNOWN` as an all-clear — it means the walk could not answer, which is the one verdict that requires confirming by other means.
 - NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit changes without running `detect_changes()` to check affected scope.
+- NEVER commit before MCP/CLI graph change analysis.
 
 ## Resources
 
 | Resource | Use for |
-|----------|---------|
+| --- | --- |
 | `gitnexus://repo/kcptun-rs/context` | Codebase overview, check index freshness |
 | `gitnexus://repo/kcptun-rs/clusters` | All functional areas |
 | `gitnexus://repo/kcptun-rs/processes` | All execution flows |
@@ -197,12 +199,12 @@ This project is indexed by GitNexus as **kcptun-rs** (6365 symbols, 14814 relati
 ## CLI
 
 | Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+| --- | --- |
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->

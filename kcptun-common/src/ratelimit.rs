@@ -94,7 +94,7 @@ impl RateLimiter {
     }
 
     /// Current configured rate in bytes/sec (0 = unlimited).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn rate(&self) -> u32 {
         self.inner.lock().rate as u32
     }
