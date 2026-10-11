@@ -1,52 +1,58 @@
 <div align="center">
-  <img src="docs/logo.png" alt="kcptun-rs logo" width="180">
-  <h1>kcptun-rs ⚡</h1>
+ <img align="absmiddle" src="docs/logo.png" alt="kcptun-rs logo" width="256" height="256"> 
+
   <p><strong>Rust 移植 kcptun — 性能最高达到 Go 版本的 5.38 倍，完全线上兼容</strong></p>
+
   <p>
-    <a href="#"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status"></a>
-    <a href="#"><img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests"></a>
-    <a href="#"><img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E"></a>
-    <a href="#"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
-    <a href="#"><img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust"></a>
-    <a href="#"><img src="https://img.shields.io/badge/Go%20compat-v5-success" alt="Go Compatible"></a>
+    <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
+    <img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests">
+    <img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+    <img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust">
+    <img src="https://img.shields.io/badge/Go%20compat-v5-success" alt="Go Compatible">
   </p>
+
   <p><a href="README.md">English</a> | 中文</p>
 
+  <table align="center">
+    <tr>
+      <td align="center" width="25%"><b>5.38×</b><br><sub>相对 Go 最高加速</sub></td>
+      <td align="center" width="25%"><b>68 / 68</b><br><sub>Go↔Rust 端到端测试</sub></td>
+      <td align="center" width="25%"><b>334</b><br><sub>单元测试</sub></td>
+      <td align="center" width="25%"><b>~2 MB</b><br><sub>strip 后二进制</sub></td>
+    </tr>
+  </table>
 </div>
 
----
+<details>
+<summary><b>免责声明</b> — 本项目是 Vibe Coding 移植测试，仅供学习交流使用。</summary>
 
-> <details>
-> <summary><b>免责声明</b> — 本项目是 Vibe Coding 移植测试，仅供学习交流使用。</summary>
->
-> 本项目是一次 **Vibe Coding**（利用 AI 辅助编程的实践方式）的移植测试——通过尝试移植现有代码库来实践 AI 辅助编程。核心是探索和验证 Vibe Coding 这套工作流本身，而非专门做一个生产级软件移植。本项目**不是**生产级软件，不保证功能正确性、稳定性和安全性。
->
-> **严禁用于任何违法违规用途**，包括但不限于翻墙、非法数据传输、网络攻击等。使用者的任何违法行为均与本项目及作者无关，由行为人自行承担全部法律责任。
->
-> 完整免责声明请参阅 [DISCLAIMER.zh.md](DISCLAIMER.zh.md)。
-> </details>
+本项目是一次 **Vibe Coding**（利用 AI 辅助编程的实践方式）的移植测试——通过尝试移植现有代码库来实践 AI 辅助编程。核心是探索和验证 Vibe Coding 这套工作流本身，而非专门做一个生产级软件移植。本项目**不是**生产级软件，不保证功能正确性、稳定性和安全性。
 
----
+**严禁用于任何违法违规用途**，包括但不限于翻墙、非法数据传输、网络攻击等。使用者的任何违法行为均与本项目及作者无关，由行为人自行承担全部法律责任。
+
+完整免责声明请参阅 [DISCLAIMER.zh.md](DISCLAIMER.zh.md)。
+</details>
 
 ## 📑 目录
 
-- [🔥 性能概览](#-性能概览)
-- [📖 什么是 kcptun-rs？](#-什么是-kcptun-rs)
-- [✨ 功能特性](#-功能特性)
-- [🔐 加密认证说明](#-加密认证说明)
-- [🚀 快速开始](#-快速开始)
-- [📊 性能深度分析](#-性能深度分析)
-- [📡 客户端 I/O 模式对比](#-客户端io-模式对比)
-- [🔗 Go 兼容性](#-go-兼容性)
-- [🏗️ 架构](#-架构)
-- [🔧 构建与运行](#-构建与运行)
-- [🎛️ 延迟调优指南（Linux）](#-延迟调优指南linux)
-- [🔬 优化历程](#-优化历程)
-- [🧪 测试严谨性](#-测试严谨性)
-- [💡 为什么选择 Rust？](#-为什么选择-rust)
-- [📝 许可证](#-许可证)
-
----
+<p align="center">
+  🔥 <a href="#-性能概览">性能概览</a> ·
+  📖 <a href="#-什么是-kcptun-rs">什么是 kcptun-rs？</a> ·
+  ✨ <a href="#-功能特性">功能特性</a> ·
+  🔐 <a href="#-加密认证说明">加密认证说明</a> ·
+  🚀 <a href="#-快速开始">快速开始</a> ·
+  📊 <a href="#-性能深度分析">性能深度分析</a> ·
+  📡 <a href="#-客户端io-模式对比">客户端 I/O 模式对比</a> ·
+  🔗 <a href="#-go-兼容性">Go 兼容性</a> ·
+  🏗️ <a href="#-架构">架构</a> ·
+  🔧 <a href="#-构建与运行">构建与运行</a> ·
+  🎛️ <a href="#-延迟调优指南linux">延迟调优指南（Linux）</a> ·
+  🔬 <a href="#-优化历程">优化历程</a> ·
+  🧪 <a href="#-测试严谨性">测试严谨性</a> ·
+  💡 <a href="#-为什么选择-rust">为什么选择 Rust？</a> ·
+  📝 <a href="#-许可证">许可证</a>
+</p>
 
 ## 🔥 性能概览
 
@@ -66,8 +72,6 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 
 *macOS M1：10 连接 × 每连接 1 MB。Linux VPS：1 vCPU AMD EPYC-Rome，4 连接 × 每连接 1 MB。完整矩阵见下文。*
 
----
-
 ## 📖 什么是 kcptun-rs？
 
 **kcptun** 是一个稳定、安全的 TCP-over-UDP 隧道工具，利用 [KCP](https://github.com/skywind3000/kcp)（快速 ARQ 协议）在高延迟或丢包网络环境下加速 TCP 流。它具备 SMUX 多路复用、Reed-Solomon 前向纠错（FEC）、Snappy 压缩以及可选的加密功能，全部整合在一个二进制文件中。
@@ -80,8 +84,6 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 - ⚡ **单一异步运行时**：tokio（多线程，高并发）
 - 🎯 **生产级功能**：FEC、SMUX v1/v2、QPP 混淆、SNMP 统计、速率限制、pprof 性能分析
 - 🔄 **跨平台**：macOS、Linux、ARMv7（树莓派）、ARM64（AWS Graviton）
-
----
 
 ## ✨ 功能特性
 
@@ -100,8 +102,6 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 | **SNMP 统计** | 与 Go 兼容的 SNMP 字段，零开销按需采集 |
 | **交叉编译** | ARMv7（树莓派）、ARM64（Graviton）、Linux musl — 全部可从 macOS 编译 |
 | **日志** | 结构化日志级别（RUST_LOG），支持文件日志 |
-
----
 
 ## 🔐 加密认证说明
 
@@ -170,11 +170,9 @@ kcptun-client -c config.json
 - 服务端专属字段 `"shards"` 已支持（语义同 `--shards`）。
 - 非法值启动即失败：`--crypt` 必须是已知算法，`--mtu` ≥ 50，`--dscp` 0–63，`--conn` ≤ 256，`--shards` ≤ 64。
 
----
-
 ## 📊 性能深度分析
 
-<details open>
+<details>
 <summary><strong>大吞吐测试（macOS M1，200 MB，AES-128-CFB，无压缩）</strong></summary>
 
 路径标签为 **Client → Server**（大流量由客户端发往服务端；见 `bench/run_bench.sh`）。
@@ -306,8 +304,6 @@ kcptun-client -c config.json
 
 </details>
 
----
-
 ## 📡 客户端 I/O 模式对比
 
 `latency_p99` 示例支持三种客户端 I/O 模式，用于测量不同 KCP 调度架构对往返延迟的影响：
@@ -356,8 +352,6 @@ cargo run -p kcp-rs --features async --example latency_p99 -- \
 
 > **结论：** 普通模式（per-connection tokio task）是客户端的正确选择。WorkerPool 模式引入跨线程唤醒开销，导致 P50 和吞吐量下降。WorkerPool 的价值在**服务端** — 共享 UDP socket 的多连接 demux（此处未通过 `latency_p99` 基准测试覆盖）。
 
----
-
 ## 🔗 Go 兼容性
 
 kcptun-rs 与 Go kcptun（kcp-go v5）**完全线上兼容**。全部 68 项端到端互通测试全部通过：
@@ -387,8 +381,6 @@ SMUX:        2/2 版本通过
 FEC:         2/2 配置通过
 总计:        68 通过，0 失败，0 跳过 🎉
 ```
-
----
 
 ## 🏗️ 架构
 
@@ -442,8 +434,6 @@ kcptun-rs/
 | 4 | `kcp.send()` + `kcp.update()` + `kcp.flush()` | ✅ 短暂持有 |
 
 这使得 UDP 接收循环可以在刷新循环准备下一批帧的同时将数据输入 KCP — 消除了高并发下的锁争用问题。
-
----
 
 ## 🔧 构建与运行
 
@@ -528,8 +518,6 @@ net.inet.udp.recvspace=4194304
 
 库默认值保持 `0`，生产部署保持事件驱动语义。`KcpListener` 每个 shard 使用一个独立 current-thread runtime。共享多线程 Tokio runtime 使用 Tokio 根据系统环境选择的默认 worker 数量。
 
----
-
 ## 🎛️ 延迟调优指南（Linux）
 
 来自 P99 优化工作（2026-09）的实用调优结论。全部数据来自 1 vCPU Linux 虚拟机上
@@ -588,8 +576,6 @@ sudo sysctl -w net.core.wmem_max=4194304
 | 高丢包网络 | 保持默认；FEC（`--datashard/--parityshard`）用带宽换尾延迟 |
 | 吞吐基准测试 | 恢复 `wakeup_granularity` 默认值（1ms 会略微增加公平切换开销） |
 
----
-
 ## 🔬 优化历程
 
 本项目通过火焰图驱动的性能分析，从最初的 **5.4 MB/s** 进化到超过 **108 MB/s**：
@@ -610,7 +596,8 @@ sudo sysctl -w net.core.wmem_max=4194304
 | + 直连 worker 拓扑（单 worker 直排 + Linux SO_REUSEPORT 组） | 闭环吞吐 +4.1~6.6%，p99 再降 −6~8% | — |
 | → **最终（tokio）** | **85.6 MB/s** | **1.67×** |
 
-### 沿途发现的关键 Bug 修复
+<details>
+<summary><b>沿途发现的关键 Bug 修复</b></summary>
 
 | Bug | 影响 | 修复 |
 |:----|:----|:-----|
@@ -621,7 +608,10 @@ sudo sysctl -w net.core.wmem_max=4194304
 | `snd_buf` 从不清理 | 窗口卡在 32 个包 | flush() 中前缓冲清理 |
 | Twofish 256 位密钥 S-box | 与 Go 密文不符 | 增加第 5 层 sbox |
 
-### p99 延迟崩塌排查（256KB @ 高并发）
+</details>
+
+<details>
+<summary><b>p99 延迟崩塌排查（256KB @ 高并发）</b></summary>
 
 症状：裸 `kcp-rs` KcpStream（无隧道层）在大包高并发下崩塌 —— 256KB 回环
 **RPS=300 时从 ~4ms 飙到 p50=3.2s**，而 Go 用*完全相同*的 512/512 窗口 +
@@ -665,7 +655,7 @@ wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）�
 | 排空优先 recv 循环（+ `yield_now`）| 死锁 —— reactor 等待原本就是隐式 yield |
 | listener reader 批量排空 | 更差 3.7× |
 
----
+</details>
 
 ## 🧪 测试严谨性
 
@@ -677,8 +667,6 @@ wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）�
 | Clippy | `-D warnings` | 零警告强制 |
 | Fmt | `cargo fmt --check` | 一致的代码格式 |
 
----
-
 ## 💡 为什么选择 Rust？
 
 - **内存安全** — 无野指针、无缓冲区溢出、无释放后使用
@@ -689,16 +677,12 @@ wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）�
 - **小体积二进制** — 剥离后的发布版二进制约 2 MB，远小于 Go 的静态链接文件
 - **交叉编译** — 一条 `make` 命令即可在 macOS 上编译 ARM Linux 二进制
 
----
-
 ## 📝 许可证
 
 MIT — 详见 [LICENSE](LICENSE)。
 
 本项目是 [kcptun](https://github.com/xtaci/kcptun)（作者 [xtaci](https://github.com/xtaci)）的 Rust 移植版本。  
 源码： [github.com/xsean2020/kcptun-rs](https://github.com/xsean2020/kcptun-rs)
-
----
 
 <div align="center">
 

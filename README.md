@@ -1,52 +1,58 @@
 <div align="center">
-  <img src="docs/logo.png" alt="kcptun-rs logo" width="180">
-  <h1>kcptun-rs ⚡</h1>
+  <img align="absmiddle" src="docs/logo.png" alt="kcptun-rs logo"  width="256" height="256" > 
+
   <p><strong>Rust port of kcptun — up to 5.38× faster than Go, fully wire-compatible</strong></p>
+
   <p>
-    <a href="#"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status"></a>
-    <a href="#"><img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests"></a>
-    <a href="#"><img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E"></a>
-    <a href="#"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
-    <a href="#"><img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust"></a>
-    <a href="#"><img src="https://img.shields.io/badge/Go%20compat-v5-success" alt="Go Compatible"></a>
+    <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
+    <img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests">
+    <img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+    <img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust">
+    <img src="https://img.shields.io/badge/Go%20compat-v5-success" alt="Go Compatible">
   </p>
+
   <p>English | <a href="README.zh.md">中文</a></p>
 
+  <table align="center">
+    <tr>
+      <td align="center" width="25%"><b>5.38×</b><br><sub>max speedup vs Go</sub></td>
+      <td align="center" width="25%"><b>68 / 68</b><br><sub>Go↔Rust e2e tests</sub></td>
+      <td align="center" width="25%"><b>334</b><br><sub>unit tests</sub></td>
+      <td align="center" width="25%"><b>~2 MB</b><br><sub>stripped binary</sub></td>
+    </tr>
+  </table>
 </div>
 
----
+<details>
+<summary><b>Disclaimer</b> — This project is a Vibe Coding porting test, for educational purposes only.</summary>
 
-> <details>
-> <summary><b>Disclaimer</b> — This project is a Vibe Coding porting test, for educational purposes only.</summary>
->
-> This project is a **Vibe Coding** experiment — using AI-assisted programming to port an existing codebase. The core focus is exploring and validating the Vibe Coding workflow itself, not producing a production-grade software port. This is **not** production software. No guarantees are made regarding correctness, stability, or security.
->
-> **It is strictly prohibited for any illegal use**, including but not limited to circumventing censorship, illegal data transmission, network attacks, etc. Any illegal activities by users are not related to this project or its author. Users bear all legal responsibilities.
->
-> See [DISCLAIMER.md](DISCLAIMER.md) for the full disclaimer.
-> </details>
+This project is a **Vibe Coding** experiment — using AI-assisted programming to port an existing codebase. The core focus is exploring and validating the Vibe Coding workflow itself, not producing a production-grade software port. This is **not** production software. No guarantees are made regarding correctness, stability, or security.
 
----
+**It is strictly prohibited for any illegal use**, including but not limited to circumventing censorship, illegal data transmission, network attacks, etc. Any illegal activities by users are not related to this project or its author. Users bear all legal responsibilities.
+
+See [DISCLAIMER.md](DISCLAIMER.md) for the full disclaimer.
+</details>
 
 ## 📑 Contents
 
-- [🔥 Performance at a Glance](#-performance-at-a-glance)
-- [📖 What is kcptun-rs?](#-what-is-kcptun-rs)
-- [✨ Features](#-features)
-- [🔐 Cipher authentication](#-cipher-authentication)
-- [🚀 Quick Start](#-quick-start)
-- [📊 Performance Deep Dive](#-performance-deep-dive)
-- [🔗 Go Compatibility](#-go-compatibility)
-- [🏗️ Architecture](#-architecture)
-- [🔧 Build & Run](#-build--run)
-- [🎛️ Latency Tuning Guide (Linux)](#-latency-tuning-guide-linux)
-- [🔬 Optimization Journey](#-optimization-journey)
-- [🧪 Testing Rigor](#-testing-rigor)
-- [📋 CLI Options](#-cli-options)
-- [💡 Why Rust?](#-why-rust)
-- [📝 License](#-license)
-
----
+<p align="center">
+  🔥 <a href="#-performance-at-a-glance">Performance at a Glance</a> ·
+  📖 <a href="#-what-is-kcptun-rs">What is kcptun-rs?</a> ·
+  ✨ <a href="#-features">Features</a> ·
+  🔐 <a href="#-cipher-authentication">Cipher authentication</a> ·
+  🚀 <a href="#-quick-start">Quick Start</a> ·
+  📊 <a href="#-performance-deep-dive">Performance Deep Dive</a> ·
+  🔗 <a href="#-go-compatibility">Go Compatibility</a> ·
+  🏗️ <a href="#-architecture">Architecture</a> ·
+  🔧 <a href="#-build--run">Build &amp; Run</a> ·
+  🎛️ <a href="#-latency-tuning-guide-linux">Latency Tuning Guide (Linux)</a> ·
+  🔬 <a href="#-optimization-journey">Optimization Journey</a> ·
+  🧪 <a href="#-testing-rigor">Testing Rigor</a> ·
+  📋 <a href="#-cli-options">CLI Options</a> ·
+  💡 <a href="#-why-rust">Why Rust?</a> ·
+  📝 <a href="#-license">License</a>
+</p>
 
 ## 🔥 Performance at a Glance
 
@@ -66,8 +72,6 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 
 *macOS M1: 10 conn × 1 MB. Linux VPS: 1 vCPU AMD EPYC-Rome, 4 conn × 1 MB. Full matrix below.*
 
----
-
 ## 📖 What is kcptun-rs?
 
 **kcptun** is a stable & secure TCP-over-UDP tunnel that uses [KCP](https://github.com/skywind3000/kcp) (a fast ARQ protocol) to accelerate TCP streams over high-latency or lossy networks. It features SMUX multiplexing, Reed-Solomon FEC, Snappy compression, and optional encryption — all wrapped in a single binary.
@@ -81,14 +85,12 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 - 🎯 **Production-ready features**: FEC, SMUX v1/v2, QPP obfuscation, SNMP stats, rate limiting, pprof profiling
 - 🔄 **Cross-platform**: macOS, Linux, ARMv7 (Raspberry Pi), ARM64 (Graviton)
 
----
-
 ## ✨ Features
 
 | Category | Details |
 |----------|---------|
 | **Compatibility** | Full wire-compatible with Go kcptun (kcp-go v5) — all ciphers, modes, SMUX versions, FEC, Snappy |
-| **Encryption** | 14 backends: `null`, `none`, `xor`, `aes-128`, `aes-192`, `aes`(256), `aes-128-gcm`, `sm4`, `tea`, `xtea`, `salsa20`, `blowfish`, `twofish`, `cast5`, `3des` — see [Cipher authentication](#cipher-authentication) |
+| **Encryption** | 14 backends: `null`, `none`, `xor`, `aes-128`, `aes-192`, `aes`(256), `aes-128-gcm`, `sm4`, `tea`, `xtea`, `salsa20`, `blowfish`, `twofish`, `cast5`, `3des` — see [Cipher authentication](#-cipher-authentication) |
 | **KCP Modes** | `normal`, `fast`, `fast2`, `fast3` |
 | **SMUX** | v1 & v2 multiplexing — multiple TCP streams over a single KCP connection |
 | **FEC** | Reed-Solomon forward error correction (Go-compatible 10/3 default) |
@@ -100,8 +102,6 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 | **SNMP Stats** | Go-compatible SNMP fields with zero-cost opt-in collection |
 | **Cross-Compile** | ARMv7 (Raspberry Pi), ARM64 (Graviton), Linux musl — all from macOS |
 | **Logging** | Structured log levels (RUST_LOG), optional file logging |
-
----
 
 ## 🔐 Cipher authentication
 
@@ -121,8 +121,6 @@ kcptun's wire format and cannot be changed without breaking compatibility.
 
 `--crypt` is listed as `aes` by default; prefer `--crypt aes-128-gcm` when
 both ends support it.
-
----
 
 ## 🚀 Quick Start
 
@@ -173,11 +171,9 @@ kcptun-client -c config.json
 - Server-only `"shards"` is a real field (same semantics as `--shards`).
 - Invalid values fail fast at startup: `--crypt` must be a known method, `--mtu` must be ≥ 50, `--dscp` must be 0–63, `--conn` ≤ 256, `--shards` ≤ 64.
 
----
-
 ## 📊 Performance Deep Dive
 
-<details open>
+<details>
 <summary><strong>Bulk Throughput (macOS M1, 200 MB, AES-128-CFB, no compression)</strong></summary>
 
 Path labels are **Client → Server** (bulk data leaves the client toward the server; from `bench/run_bench.sh`).
@@ -360,8 +356,6 @@ cargo run -p kcp-rs --features async --example latency_p99 -- \
 
 </details>
 
----
-
 ## 🔗 Go Compatibility
 
 kcptun-rs is **fully wire-compatible** with Go kcptun (kcp-go v5). All 68 end-to-end interop tests pass across every combination:
@@ -391,8 +385,6 @@ Compression: 8/8 cipher×compression combos passed
 FEC:         2/2 configurations passed
 Total:       68 passed, 0 failed, 0 skipped 🎉
 ```
-
----
 
 ## 🏗️ Architecture
 
@@ -446,8 +438,6 @@ The flush loop is split into **4 phases** to minimize KCP mutex hold time:
 | 4 | `kcp.send()` + `kcp.update()` + `kcp.flush()` | ✅ Held briefly |
 
 This allows the UDP recv loop to feed data into KCP while the flush loop prepares the next batch of frames — eliminating lock contention under high concurrency.
-
----
 
 ## 🔧 Build & Run
 
@@ -545,8 +535,6 @@ Runtime tuning knobs are read from the environment when the relevant component s
 
 The library default stays `0`, so production deployments remain event-driven. `KcpListener` creates one dedicated current-thread runtime per shard. The shared multi-thread Tokio runtime uses Tokio's system-derived default worker count.
 
----
-
 ## 🎛️ Latency Tuning Guide (Linux)
 
 Practical tuning findings from the P99 optimization work (2026-09). All numbers
@@ -625,8 +613,6 @@ raise the kernel ceiling so the requests are honored.
 | Lossy network | keep default; FEC (`--datashard/--parityshard`) trades bandwidth for tail latency |
 | Throughput benchmarking | restore `wakeup_granularity` to default (1 ms slightly raises fair-share switching) |
 
----
-
 ## 🔬 Optimization Journey
 
 The project evolved from **5.4 MB/s** to over **108 MB/s** through evidence-driven profiling:
@@ -647,7 +633,8 @@ The project evolved from **5.4 MB/s** to over **108 MB/s** through evidence-driv
 | + Direct-worker topologies (single-worker takeover + Linux SO_REUSEPORT group) | closed-loop throughput +4.1~6.6%, p99 −6~8% more | — |
 | → **Final (tokio)** | **85.6 MB/s** | **1.67×** |
 
-### Notable Bug Fixes Found Along the Way
+<details>
+<summary><b>Notable Bug Fixes Found Along the Way</b></summary>
 
 | Bug | Impact | Fix |
 |:----|:-------|:----|
@@ -658,7 +645,10 @@ The project evolved from **5.4 MB/s** to over **108 MB/s** through evidence-driv
 | `snd_buf` never cleaned | Window stuck at 32 packets | Front-of-buffer cleanup in flush() |
 | Twofish 256-bit key S-box | Wrong ciphertext vs Go | Added 5th sbox layer |
 
-### p99 Latency Collapse Investigation (256KB @ High Concurrency)
+</details>
+
+<details>
+<summary><b>p99 Latency Collapse Investigation (256KB @ High Concurrency)</b></summary>
 
 Symptom: the raw `kcp-rs` KcpStream (no tunnel layers) collapsed on large
 payloads under sustained load — 256KB round-trip at **RPS=300 went from ~4ms
@@ -707,7 +697,7 @@ re-attempted):
 | Drain-first recv loops (+ `yield_now`) | deadlock — the reactor wait was the implicit yield |
 | Listener-reader batch drain | 3.7× worse |
 
----
+</details>
 
 ## 🧪 Testing Rigor
 
@@ -718,8 +708,6 @@ re-attempted):
 | Stress tests | 8 | Byte-for-byte data integrity at scale |
 | Clippy | `-D warnings` | Zero warnings enforced |
 | Fmt | `cargo fmt --check` | Consistent formatting |
-
----
 
 ## 📋 CLI Options
 
@@ -761,8 +749,6 @@ re-attempted):
 | `--peripsessionrate` | `20` | Max new sessions/sec per source IP (0 = unlimited) |
 | `--maxsessionsperip` | `0` | Max concurrent sessions per source IP (0 = unlimited; leave 0 behind NAT) |
 
----
-
 ## 💡 Why Rust?
 
 - **Memory safety** — no dangling pointers, no buffer overflows, no use-after-free
@@ -773,16 +759,12 @@ re-attempted):
 - **Small binaries** — stripped release binary is ~2 MB, far smaller than Go's statically linked blobs
 - **Cross-compilation** — build ARM Linux binaries from macOS with a single `make` command
 
----
-
 ## 📝 License
 
 MIT — see [LICENSE](LICENSE) for details.
 
 This is a Rust port of [kcptun](https://github.com/xtaci/kcptun) by [xtaci](https://github.com/xtaci).  
 Source: [github.com/xsean2020/kcptun-rs](https://github.com/xsean2020/kcptun-rs)
-
----
 
 <div align="center">
 
