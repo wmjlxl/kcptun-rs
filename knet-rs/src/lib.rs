@@ -29,7 +29,8 @@ pub use net::{TcpRawConn, TcpRawListener};
 pub use sync::cancel::{race, CancellationToken, Cancelled, Race, RaceOutcome};
 pub use sync::Notify;
 pub use task::{
-    block_on, block_on_local, block_on_multi_thread, cpu_block, spawn_task, yield_now, JoinHandle,
+    block_on, block_on_local, block_on_multi_thread, configure_worker_threads, cpu_block,
+    spawn_task, yield_now, JoinHandle,
 };
 pub use time::{mono_ms, sleep, sleep_ms, timeout, Elapsed};
 

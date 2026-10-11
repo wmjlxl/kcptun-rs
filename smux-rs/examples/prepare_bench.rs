@@ -43,7 +43,9 @@ fn main() {
         buf.clear();
         let _ = session.prepare_outbound_into(&mut buf, 256 * 1024, 1);
         for s in &handles {
-            let _ = s.write(&[0xABu8; 8 * 1024]);
+            if s.pending_send() < 64 * 1024 {
+                let _ = s.write(&[0xABu8; 8 * 1024]);
+            }
         }
     }
 
@@ -56,9 +58,14 @@ fn main() {
             session.mark_fins_sent(&fins);
         }
         total_bytes += buf.len();
-        // Refill so the next iteration has work to do.
+        // Refill so the next iteration has work to do. Backpressure: skip
+        // streams whose send queue is already deep — an unconditional refill
+        // grows the queues without bound (prepare only drains max_bytes per
+        // cycle) and OOMs the bench at high stream counts.
         for s in &handles {
-            let _ = s.write(&[0xABu8; 8 * 1024]);
+            if s.pending_send() < 64 * 1024 {
+                let _ = s.write(&[0xABu8; 8 * 1024]);
+            }
         }
     }
     let elapsed = start.elapsed();

@@ -306,6 +306,27 @@ impl FrameCodec {
     pub fn clear(&mut self) {
         self.buf.clear();
     }
+
+    /// Detach the internal buffer so a transport can read straight into it
+    /// (O13 direct-read path). The codec is left empty — the holder must
+    /// `restore_buf` before the next `decode`. `pub(crate)`: this is an
+    /// internal protocol between `Session::begin/end_inbound_read` and the
+    /// session's own read task, not public API.
+    #[inline]
+    pub(crate) fn take_buf(&mut self) -> BytesMut {
+        std::mem::take(&mut self.buf)
+    }
+
+    /// Reattach a buffer obtained from [`take_buf`], preserving any partial
+    /// frame it still holds at the front.
+    #[inline]
+    pub(crate) fn restore_buf(&mut self, buf: BytesMut) {
+        debug_assert!(
+            self.buf.is_empty(),
+            "restore_buf over a non-empty codec would lose buffered frames"
+        );
+        self.buf = buf;
+    }
 }
 
 /// Errors related to SMUX frame processing.

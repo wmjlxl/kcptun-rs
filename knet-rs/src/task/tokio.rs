@@ -8,6 +8,8 @@
 //! is significantly cheaper.
 
 use super::JoinHandle;
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
 
@@ -110,27 +112,89 @@ fn blocking_pool() -> &'static BlockingPool {
 /// `tokio::task::spawn_blocking` which lazily spawns threads and incurs
 /// per-call task allocation + scheduling overhead), eliminating per-call
 /// overhead. The flush loop calls this every 10–100ms under load.
+///
+/// The per-call result channel is **pooled**: a drained `(tx, rx)` pair is
+/// reused for the next call of the same result type (see
+/// [`acquire_result_pair`]), so the steady state only allocates the job Box
+/// and the pool-queue node. Cancellation (the future dropped mid-wait, e.g.
+/// a timed-out offload) discards the pair instead of recycling it — the job's
+/// `try_send` then fails silently, exactly like the old per-call channel.
 #[inline(always)]
 pub async fn cpu_block<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let (tx, rx) = async_channel::bounded::<R>(1);
+    let (tx, rx) = acquire_result_pair::<R>();
+    // The job holds a clone so the original stays here for recycling after
+    // the message has been received.
+    let tx_job = tx.clone();
     let job: Job = Box::new(move || {
         let r = f();
         // try_send is non-blocking; bounded(1) always has room for the first
         // item, and the receiver is the only consumer.
-        let _ = tx.try_send(r);
+        let _ = tx_job.try_send(r);
     });
     // Unbounded sender: never blocks (unless OOM).
     blocking_pool()
         .sender
         .try_send(job)
         .expect("tokio-cpu blocking pool workers died");
-    rx.recv()
+    let r = rx
+        .recv()
         .await
-        .expect("tokio-cpu blocking pool worker dropped result")
+        .expect("tokio-cpu blocking pool worker dropped result");
+    // The message is consumed and both ends are live: park the pair for the
+    // next call. Not reached when this future is dropped — the pair dies with
+    // it and the next call allocates a fresh one (old behaviour).
+    recycle_result_pair::<R>((tx, rx));
+    r
+}
+
+// ─── Pooled per-result-type channels ─────────────────────────────────────────
+//
+// A generic `static` cannot name a function's type parameter, so the free
+// lists live in a TypeId-keyed, type-erased map: one Vec per monomorphized
+// `R`. Entries are only moved under the lock and never across an await —
+// `acquire` drops its guard before returning and `recycle` runs after the
+// last await point.
+
+/// One drained, reusable result channel for result type `R`.
+type ResultPair<R> = (async_channel::Sender<R>, async_channel::Receiver<R>);
+
+/// Free lists of drained pairs, keyed by the result type's `TypeId`.
+type ResultFreeLists = HashMap<TypeId, Vec<Box<dyn Any + Send>>>;
+
+static RESULT_FREE: OnceLock<std::sync::Mutex<ResultFreeLists>> = OnceLock::new();
+
+/// Pop a drained pair for `R`, or allocate a fresh `bounded(1)` channel.
+fn acquire_result_pair<R: Send + 'static>() -> ResultPair<R> {
+    if let Some(lists) = RESULT_FREE.get() {
+        let popped = lists
+            .lock()
+            .expect("cpu_block result pool poisoned")
+            .get_mut(&TypeId::of::<R>())
+            .and_then(Vec::pop);
+        if let Some(boxed) = popped {
+            // Typed by construction (key == TypeId::of::<R>()); a mismatch can
+            // only come from memory corruption — fall through to a fresh pair.
+            if let Ok(pair) = boxed.downcast::<ResultPair<R>>() {
+                return *pair;
+            }
+        }
+    }
+    async_channel::bounded(1)
+}
+
+/// Return a drained pair for reuse by the next call with the same `R`.
+fn recycle_result_pair<R: Send + 'static>(pair: ResultPair<R>) {
+    let lists = RESULT_FREE.get_or_init(Default::default);
+    lists
+        .lock()
+        .expect("cpu_block result pool poisoned")
+        .entry(TypeId::of::<R>())
+        .or_default()
+        .push(Box::new(pair));
 }
 
 // ─── block_on ──────────────────────────────────────────────────────────────────
@@ -141,12 +205,29 @@ where
 /// test suites and embedded callers that call `block_on` repeatedly.
 static GLOBAL_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+/// Worker-thread override for the global runtime (O16 / `--threads`).
+/// Unset or `0` = tokio default (CPU core count).
+static WORKER_THREADS: OnceLock<usize> = OnceLock::new();
+
+/// Set the worker-thread count of the global `block_on` runtime.
+///
+/// Must be called **before** the first `block_on` (the runtime is built
+/// lazily on first use); a later call is ignored — the runtime already
+/// exists. `0` restores the tokio default (CPU core count). The binaries'
+/// `--threads` flag wires through here; latency-sensitive deployments can
+/// pin 2–4 workers (see BOTTLENECK_ANALYSIS_SUMMARY.md).
+pub fn configure_worker_threads(n: usize) {
+    let _ = WORKER_THREADS.set(n);
+}
+
 fn global_rt() -> &'static tokio::runtime::Runtime {
     GLOBAL_RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime")
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        if let Some(&n) = WORKER_THREADS.get().filter(|&n| *n > 0) {
+            builder.worker_threads(n);
+        }
+        builder.build().expect("failed to create tokio runtime")
     })
 }
 

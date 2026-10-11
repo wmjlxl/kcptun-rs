@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use bytes::{Bytes, BytesMut};
 
 use crate::frame::{Cmd, Frame, FrameCodec};
-use crate::stream::{Stream, StreamState};
+use crate::stream::{BytesPool, Stream, StreamState};
 
 /// Highest stream id an `open_stream` may hand out.
 ///
@@ -209,6 +209,11 @@ pub struct Session {
     stream_ids_exhausted: AtomicBool,
     /// Frame codec for encoding/decoding frames.
     codec: Arc<Mutex<FrameCodec>>,
+    /// Session-wide shared send-side buffer pool (O15): every stream this
+    /// session creates swaps its private pool for this one before publish,
+    /// so N live streams share one pool's worth of 16 KiB buffers instead
+    /// of retaining N of their own.
+    send_pool: Arc<Mutex<BytesPool>>,
     /// Keepalive interval.
     keepalive_interval: Duration,
     /// Time of last keepalive.
@@ -264,6 +269,7 @@ impl Session {
                     .min(config.max_receive_buffer),
                 config.max_codec_buffered,
             ))),
+            send_pool: Arc::new(Mutex::new(BytesPool::new())),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
             last_keepalive_ms: AtomicU64::new(knet::mono_ms()),
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
@@ -452,6 +458,8 @@ impl Session {
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
         stream.set_self_ref(Arc::downgrade(&stream));
+        // O15: share the session-wide send pool before the stream is published.
+        stream.set_send_pool(self.send_pool.clone());
         stream.set_state(StreamState::Ready);
         stream.mark_opened();
         // SMUX v1 has no UPD / per-stream send window.
@@ -484,6 +492,8 @@ impl Session {
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
         stream.set_self_ref(Arc::downgrade(&stream));
+        // O15: share the session-wide send pool before the stream is published.
+        stream.set_send_pool(self.send_pool.clone());
         stream.set_state(StreamState::Ready);
         stream.mark_opened();
         // SMUX v1 has no UPD / per-stream send window.
@@ -521,7 +531,67 @@ impl Session {
             )));
         }
 
-        let mut results = Vec::new();
+        self.decode_frames(&mut codec, data.len())
+    }
+
+    /// Detach the codec's inbound buffer for a direct transport read (O13).
+    ///
+    /// Returns the buffer (possibly holding an undecoded partial frame) plus
+    /// how many more bytes it may accept before `max_buffered`. The reader
+    /// fills it via `read_buf` (one memcpy less than read-vec → `feed`) and
+    /// hands it back through [`end_inbound_read`]. Only the session's own
+    /// read task does this — `process_data` callers see an empty codec
+    /// window in between, which is fine because that same read task is the
+    /// only producer of inbound bytes.
+    pub(crate) fn begin_inbound_read(&self) -> (bytes::BytesMut, usize) {
+        let mut codec = self.codec.lock();
+        let allowance = codec.max_buffered().saturating_sub(codec.len());
+        (codec.take_buf(), allowance)
+    }
+
+    /// Reattach a buffer from [`begin_inbound_read`] and decode it.
+    ///
+    /// Cap semantics match `feed()`: if the read pushed the buffered bytes
+    /// past `max_buffered`, the session is killed with the same error.
+    pub(crate) fn end_inbound_read(
+        &self,
+        buf: bytes::BytesMut,
+    ) -> Result<Vec<(u32, bytes::Bytes)>, SessionError> {
+        if self.is_closed() {
+            return Err(SessionError::SessionClosed);
+        }
+        let mut codec = self.codec.lock();
+        codec.restore_buf(buf);
+        if codec.len() > codec.max_buffered() {
+            let cap = codec.max_buffered();
+            log::warn!("SMUX: codec buffer exceeded max_buffered ({cap}), closing session");
+            drop(codec);
+            self.close();
+            return Err(SessionError::InvalidFrame(format!(
+                "codec buffer exceeded max_buffered ({cap})"
+            )));
+        }
+        let hint = codec.len();
+        self.decode_frames(&mut codec, hint)
+    }
+
+    /// Decode every frame currently buffered in `codec` and run the frame
+    /// handlers. Shared by [`process_data`] (feed first) and the direct
+    /// transport-read path (`begin_inbound_read`/`end_inbound_read`), which
+    /// reads straight into the codec buffer and skips the feed copy.
+    fn decode_frames(
+        &self,
+        codec: &mut FrameCodec,
+        hint: usize,
+    ) -> Result<Vec<(u32, bytes::Bytes)>, SessionError> {
+        // Frame-count hint: a KCP read chunk usually carries either a couple
+        // of near-max frames or a burst of small ones. len/256 clamped to
+        // [2, 16] lands the allocation on the common cases without the
+        // 4→8→16→32 growth ladder `Vec::new()` pays for control bursts.
+        let mut results = Vec::with_capacity((hint >> 8).clamp(2, 16));
+        // O14: single-entry lookup cache for this call — consecutive frames
+        // for the same stream (bulk burst) pay one `streams` lock per burst.
+        let mut stream_cache: Option<(u32, Arc<Stream>)> = None;
 
         while let Some(frame) = codec.decode() {
             // Any received frame confirms peer is alive.
@@ -534,7 +604,6 @@ impl Session {
                     frame.ver,
                     self.config.version
                 );
-                drop(codec);
                 self.close();
                 return Err(SessionError::InvalidFrame(format!(
                     "frame version {} != session version {}",
@@ -580,7 +649,7 @@ impl Session {
                 Cmd::Fin => {
                     // Stream closed by remote (Go cmdFIN = 1) — may carry last data
                     debug!("SMUX: received FIN for stream {}", frame.stream_id);
-                    if let Some(stream) = self.streams.lock().get(&frame.stream_id) {
+                    if let Some(stream) = self.stream_cached(&mut stream_cache, frame.stream_id) {
                         if !frame.data.is_empty() {
                             self.consume_tokens(frame.data.len());
                             if let Err(e) = stream.push_data_bytes(frame.data.clone()) {
@@ -600,7 +669,7 @@ impl Session {
                 }
                 Cmd::Psh => {
                     // Data push (Go cmdPSH = 2)
-                    if let Some(stream) = self.streams.lock().get(&frame.stream_id) {
+                    if let Some(stream) = self.stream_cached(&mut stream_cache, frame.stream_id) {
                         // Use zero-copy push_data_bytes: the frame.data is a
                         // reference-counted Bytes slice from the codec buffer.
                         self.consume_tokens(frame.data.len());
@@ -646,11 +715,9 @@ impl Session {
                         let window =
                             u32::from_le_bytes(frame.data[4..8].try_into().unwrap_or([0; 4]));
                         // Apply per-stream peer window (write-side flow control).
+                        if let Some(stream) = self.stream_cached(&mut stream_cache, frame.stream_id)
                         {
-                            let streams = self.streams.lock();
-                            if let Some(stream) = streams.get(&frame.stream_id) {
-                                stream.apply_peer_update(consumed, window);
-                            }
+                            stream.apply_peer_update(consumed, window);
                         }
                         // NOTE: a UPD advertises the *peer's* receive window;
                         // it says nothing about ours. Adding it to the local
@@ -671,7 +738,6 @@ impl Session {
         // `codec.buf` without ever touching the bucket. The residual is
         // sticky across calls, so only the delta is applied.
         let residual = codec.len();
-        drop(codec);
         let prev = self
             .codec_residual_charged
             .swap(residual, Ordering::Relaxed);
@@ -726,6 +792,35 @@ impl Session {
                 );
             }
         }
+    }
+
+    /// O14: single-entry stream lookup cache scoped to one `decode_frames`
+    /// call. Consecutive frames for the same stream (the common bulk burst)
+    /// pay one `streams` lock per burst instead of one per frame.
+    ///
+    /// Only *positive* lookups are cached: a SYN earlier in this same batch
+    /// may have just created the stream, so a miss must re-query. The cache
+    /// is call-local, so removals/rebuilds between calls need no
+    /// invalidation. As a side effect the `streams` mutex is no longer held
+    /// across `push_data_bytes`/`apply_peer_update` (the old `if let Some =
+    /// lock().get()` kept the guard alive for the whole arm body) — those
+    /// actions only touch the stream itself, which the `Arc` pins.
+    #[inline]
+    fn stream_cached(
+        &self,
+        cache: &mut Option<(u32, Arc<Stream>)>,
+        id: u32,
+    ) -> Option<Arc<Stream>> {
+        if let Some((cid, s)) = cache {
+            if *cid == id {
+                return Some(s.clone());
+            }
+        }
+        let found = self.streams.lock().get(&id).cloned();
+        if let Some(s) = &found {
+            *cache = Some((id, s.clone()));
+        }
+        found
     }
 
     /// Close the session and all streams.
@@ -949,81 +1044,103 @@ impl Session {
             (max_bytes / snapshot.len()).max(1)
         };
 
-        // Pass 1: reclaim tokens (give receive window back to session).
-        // `take_return_tokens` is an atomic swap — no per-stream lock needed.
+        // O12: the old four sequential passes (reclaim → UPD → drain → FIN)
+        // walked this snapshot four times. All four are per-stream work with
+        // only two ordering rules, both preserved here per stream:
+        //   * UPD is emitted at the stream's turn, before its SYN/PSH
+        //     (previously: all UPDs before any PSH — same per-stream order).
+        //   * FIN is emitted only after that stream's own data drained
+        //     (cross-stream frame order is not semantically significant:
+        //     the peer routes frames by stream_id and only same-stream
+        //     SYN→PSH→FIN ordering matters).
+        // Budget exhaustion no longer aborts the walk ('outer break): the
+        // remaining streams still do reclaim + UPD + FIN scanning, while
+        // PSH/SYN emission for them is skipped — exactly what the old
+        // pass-4 loop did after pass-3 broke out.
+        let upd_frames = self.config.version >= 2;
         let mut reclaimed: usize = 0;
-        for (_, s) in snapshot.iter() {
+        let mut data_done = false;
+
+        for &(id, ref s) in snapshot.iter() {
+            // Pass 1 (reclaim): `take_return_tokens` is an atomic swap — no
+            // per-stream lock needed. Session-level return happens once,
+            // after the walk (nothing in between reads the session tokens).
             reclaimed += s.take_return_tokens();
+
+            // Pass 2 (UPD, v2 only): same emission as
+            // `emit_upd_frames_locked`, inlined for this walk.
+            if upd_frames {
+                if let Some((consumed, window)) = s.take_upd() {
+                    Frame::encode_header_into(buf, ver, Cmd::Upd, id, 8);
+                    buf.extend_from_slice(&consumed.to_le_bytes());
+                    buf.extend_from_slice(&window.to_le_bytes());
+                }
+            }
+
+            // Pass 3 (SYN + PSH drain), budget-limited.
+            //
+            // SYN is claimed from the same Stream object, in this same walk,
+            // *before* any PSH for that stream. A session-level SYN queue
+            // drained earlier raced with open_stream (insert+rebuild_snapshot
+            // then queue_syn) and let PSH overtake SYN — the peer drops
+            // unknown-stream data and KCP has already ACKed it.
+            if !data_done {
+                if s.syn_pending() && s.take_syn_pending() {
+                    Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
+                }
+                let mut drained_this_stream = 0usize;
+                loop {
+                    if drained_total >= max_bytes {
+                        // Keep walking for reclaim/UPD/FIN, but no more
+                        // PSH/SYN from here on (old: pass-3 'outer break).
+                        data_done = true;
+                        break;
+                    }
+                    if drained_this_stream >= share {
+                        break;
+                    }
+                    // Cap each frame by both the configured frame size and this
+                    // stream's remaining share / the cycle's remaining budget,
+                    // so a small max_bytes cannot be overshot by a full frame.
+                    let remaining_cycle = max_bytes - drained_total;
+                    let remaining_share = share - drained_this_stream;
+                    let cap = self
+                        .config
+                        .max_frame_size
+                        .min(remaining_cycle)
+                        .min(remaining_share);
+                    if cap == 0 {
+                        break;
+                    }
+                    let header_pos = buf.len();
+                    Frame::encode_header_into(buf, ver, Cmd::Psh, id, 0);
+                    let n = s.drain_send_max(buf, cap);
+                    if n == 0 {
+                        buf.truncate(header_pos);
+                        break;
+                    }
+                    Frame::patch_header_length(buf, header_pos, n as u16);
+                    drained_total += n;
+                    drained_this_stream += n;
+                }
+            }
+
+            // Pass 4 (FIN): after this stream's own data — same predicate and
+            // SYN-before-FIN rule as the old separate pass.
+            if allow_fin && s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
+                // A stream that never got its SYN out this cycle (budget ran
+                // out before reaching its drain) must not send FIN first.
+                if s.syn_pending() && s.take_syn_pending() {
+                    Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
+                }
+                debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
+                Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
+                fin_streams.push(id);
+            }
         }
+
         if reclaimed > 0 {
             self.return_tokens(reclaimed);
-        }
-
-        // Pass 2: emit UPD frames (v2 only, directly into buf).
-        self.emit_upd_frames_locked(&snapshot, buf, ver);
-
-        // Pass 3: drain PSH data from streams, respecting per-stream
-        // peer window and the overall max_bytes cap.
-        //
-        // SYN is claimed from the same Stream object, in this same walk,
-        // *before* any PSH for that stream. A session-level SYN queue
-        // drained earlier raced with open_stream (insert+rebuild_snapshot
-        // then queue_syn) and let PSH overtake SYN — the peer drops
-        // unknown-stream data and KCP has already ACKed it.
-        'outer: for &(id, ref s) in snapshot.iter() {
-            // Cheap relaxed peek: steady-state this is a single load.
-            if s.syn_pending() && s.take_syn_pending() {
-                Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
-            }
-            let mut drained_this_stream = 0usize;
-            loop {
-                if drained_total >= max_bytes {
-                    break 'outer;
-                }
-                if drained_this_stream >= share {
-                    break;
-                }
-                // Cap each frame by both the configured frame size and this
-                // stream's remaining share / the cycle's remaining budget,
-                // so a small max_bytes cannot be overshot by a full frame.
-                let remaining_cycle = max_bytes - drained_total;
-                let remaining_share = share - drained_this_stream;
-                let cap = self
-                    .config
-                    .max_frame_size
-                    .min(remaining_cycle)
-                    .min(remaining_share);
-                if cap == 0 {
-                    break;
-                }
-                let header_pos = buf.len();
-                Frame::encode_header_into(buf, ver, Cmd::Psh, id, 0);
-                let n = s.drain_send_max(buf, cap);
-                if n == 0 {
-                    buf.truncate(header_pos);
-                    break;
-                }
-                Frame::patch_header_length(buf, header_pos, n as u16);
-                drained_total += n;
-                drained_this_stream += n;
-            }
-        }
-
-        // Pass 4: collect FIN candidates.
-        if allow_fin {
-            for &(id, ref s) in snapshot.iter() {
-                if s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
-                    // Same ordering rule as Pass 3: a stream that never got
-                    // its SYN out this cycle (Pass 3 broke on max_bytes
-                    // before reaching it) must not send FIN first either.
-                    if s.syn_pending() && s.take_syn_pending() {
-                        Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
-                    }
-                    debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
-                    Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
-                    fin_streams.push(id);
-                }
-            }
         }
 
         fin_streams
@@ -1042,9 +1159,10 @@ impl Session {
             return;
         }
         let snapshot = self.stream_snapshot();
-        let id_set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        // fin_ids is 0–2 entries per flush cycle; a linear scan over `ids`
+        // (≤2 comparisons per stream) beats heap-allocating a HashSet.
         for &(stream_id, ref s) in snapshot.iter() {
-            if id_set.contains(&stream_id) {
+            if ids.contains(&stream_id) {
                 s.mark_fin_sent();
             }
         }

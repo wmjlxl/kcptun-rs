@@ -1030,3 +1030,36 @@ fn bug5_reap_stale_streams_fully_closed_no_fin_needed() {
     assert!(need_fin.is_empty(), "fully closed stream needs no FIN");
     assert!(!session.streams.lock().contains_key(&s.id()));
 }
+
+/// O13: begin_inbound_read/end_inbound_read must preserve a partial frame
+/// across the take/restore window — the direct-read path hands the codec
+/// buffer to the transport in two chunks here (checklist: pointer/length
+/// semantics after the buffer swap).
+#[test]
+fn inbound_direct_read_preserves_partial_frame() {
+    let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+    let stream = session.open_stream().unwrap();
+    let sid = stream.id();
+    let frame = Frame::new(Cmd::Psh, sid, bytes::Bytes::from("split-frame-payload"))
+        .with_ver(session.version());
+    let mut wire = Vec::new();
+    frame.encode(&mut wire);
+    assert!(wire.len() > 8, "frame must span multiple chunks");
+
+    // Chunk 1: header + partial payload lands in the detached buffer.
+    let (held, allowance) = session.begin_inbound_read();
+    assert!(allowance > 0, "fresh codec must have allowance");
+    let mut held = held;
+    held.extend_from_slice(&wire[..4]);
+    let out = session.end_inbound_read(held).unwrap();
+    assert!(out.is_empty(), "no complete frame after chunk 1");
+
+    // Chunk 2: the partial must survive take/restore, then decode.
+    let (mut held, _) = session.begin_inbound_read();
+    assert_eq!(held.len(), 4, "partial frame survived the take window");
+    held.extend_from_slice(&wire[4..]);
+    let out = session.end_inbound_read(held).unwrap();
+    assert_eq!(out.len(), 1, "frame decodes after restore");
+    assert_eq!(out[0].0, sid);
+    assert_eq!(&out[0].1[..], b"split-frame-payload");
+}

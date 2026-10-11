@@ -34,12 +34,12 @@ const MIN_SEND_BUFFER: usize = 262_144;
 /// Reduces `Bytes::copy_from_slice` allocations on the hot write/push_data path
 /// by reusing `BytesMut` capacity. When the pool is empty, falls back to
 /// `Bytes::copy_from_slice` (same behavior as before).
-struct BytesPool {
+pub(crate) struct BytesPool {
     buffers: Vec<BytesMut>,
 }
 
 impl BytesPool {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BytesPool {
             buffers: Vec::with_capacity(POOL_MAX_BUFFERS),
         }
@@ -117,16 +117,12 @@ struct RecvInner {
     /// than its flush; without the grace, `read` EOFs and the caller's pipe
     /// completes, dropping the tail).
     remote_closed_at: Option<Instant>,
-    /// Buffer pool for inbound data chunks (reduces Bytes::copy_from_slice alloc).
-    pool: BytesPool,
 }
 
 /// Send half + write waker (separate mutex so push/read does not block drain).
 struct SendInner {
     send: VecDeque<Bytes>,
     write_waker: Option<Waker>,
-    /// Buffer pool for outbound data chunks (reduces Bytes::copy_from_slice alloc).
-    pool: BytesPool,
 }
 
 /// A single logical stream within a SMUX session.
@@ -154,6 +150,14 @@ pub struct Stream {
     opened: AtomicBool,
     /// Whether the remote has closed.
     remote_closed: AtomicBool,
+    /// One-shot gate: only the first read inside the EOF grace arms the
+    /// expiry wakeup task. A reader polling every few ms used to spawn one
+    /// sleeper task *per read* for the whole 300ms window (task pileup).
+    grace_wakeup_spawned: AtomicBool,
+    /// Number of grace wakeups actually armed; `cfg(test)` only, asserted
+    /// `== 1` by the EOF-grace regression test.
+    #[cfg(test)]
+    grace_spawns: AtomicUsize,
     /// Whether the local has closed.
     local_closed: AtomicBool,
     /// Whether a FIN frame has been sent for this stream.
@@ -204,6 +208,12 @@ pub struct Stream {
     flush_notify: Mutex<Option<Arc<knet::Notify>>>,
     /// Weak self-reference so a grace-expiry wakeup task can re-wake a reader.
     self_ref: Mutex<Option<std::sync::Weak<Stream>>>,
+    /// Send-side [`BytesPool`], **shared session-wide** (O15): the session
+    /// installs its single pool via `set_send_pool` before publishing the
+    /// stream, so 1024 live streams hold one pool's worth of 16 KiB buffers
+    /// instead of each retaining its own (16 MiB → ~16 KiB). Standalone
+    /// streams (tests, `io.rs`) lazily create a private pool on first write.
+    send_pool: std::sync::OnceLock<Arc<Mutex<BytesPool>>>,
 }
 
 impl Stream {
@@ -217,12 +227,10 @@ impl Stream {
                 read_waker: None,
                 local_closed_at: None,
                 remote_closed_at: None,
-                pool: BytesPool::new(),
             }),
             send: Mutex::new(SendInner {
                 send: VecDeque::new(),
                 write_waker: None,
-                pool: BytesPool::new(),
             }),
             send_buf_bytes: AtomicUsize::new(0),
             recv_buf_bytes_avail: AtomicUsize::new(0),
@@ -230,6 +238,9 @@ impl Stream {
             bytes_written: AtomicU32::new(0),
             opened: AtomicBool::new(false),
             remote_closed: AtomicBool::new(false),
+            grace_wakeup_spawned: AtomicBool::new(false),
+            #[cfg(test)]
+            grace_spawns: AtomicUsize::new(0),
             local_closed: AtomicBool::new(false),
             fin_sent: AtomicBool::new(false),
             syn_pending: AtomicBool::new(false),
@@ -244,7 +255,24 @@ impl Stream {
             ch_write_wakeup: knet::Notify::new(),
             flush_notify: Mutex::new(None),
             self_ref: Mutex::new(None),
+            send_pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The send-side pool — the session-wide shared one once `set_send_pool`
+    /// ran, otherwise a lazily-created private pool (standalone streams).
+    #[inline]
+    fn send_pool(&self) -> &Arc<Mutex<BytesPool>> {
+        self.send_pool
+            .get_or_init(|| Arc::new(Mutex::new(BytesPool::new())))
+    }
+
+    /// Install the session-wide shared send pool (O15). Called by `Session`
+    /// right after construction, before the stream is published anywhere;
+    /// a late call (first write already ran) is ignored — that stream keeps
+    /// its private pool.
+    pub(crate) fn set_send_pool(&self, pool: Arc<Mutex<BytesPool>>) {
+        let _ = self.send_pool.set(pool);
     }
 
     /// Attach a weak self-reference (set by the Session after Arc creation) so a
@@ -377,25 +405,15 @@ impl Stream {
 
     /// Push incoming data into the receive buffer.
     ///
-    /// Uses the internal [`BytesPool`] to avoid `Bytes::copy_from_slice`
-    /// allocation when a pooled buffer is available. The buffer is copied
-    /// into a pooled `BytesMut`, then split and frozen; the remaining capacity
-    /// is returned to the pool for reuse.
+    /// The production path is `push_data_bytes` (zero-copy); this copy-in
+    /// helper remains for tests and simple callers. O15 removed the recv-side
+    /// [`BytesPool`]: its only caller was this method, which nothing in the
+    /// session stack uses anymore — the pool sat empty per stream.
     pub fn push_data(&self, data: &[u8]) -> Result<(), StreamError> {
         if data.is_empty() {
             return Ok(());
         }
-        let bytes = {
-            let mut inner = self.recv.lock();
-            let mut buf = inner.pool.acquire();
-            buf.extend_from_slice(data);
-            let n = buf.len();
-            let bytes = buf.split_to(n).freeze();
-            // Return the remaining BytesMut (with preserved capacity) to pool
-            inner.pool.release(buf);
-            bytes
-        };
-        self.push_data_bytes(bytes)
+        self.push_data_bytes(Bytes::copy_from_slice(data))
     }
 
     /// Push incoming data as a `Bytes` (zero-copy append).
@@ -493,13 +511,25 @@ impl Stream {
                 let closed_at = self.recv.lock().remote_closed_at;
                 if let Some(t) = closed_at {
                     if t.elapsed() < EOF_GRACE {
-                        if let Some(w) = self.self_ref.lock().clone() {
-                            knet::spawn_task(async move {
-                                knet::sleep_ms(EOF_GRACE_MS).await;
-                                if let Some(s) = w.upgrade() {
-                                    s.wakeup_reader();
-                                }
-                            });
+                        // One-shot: only the first read that can actually arm
+                        // the wakeup claims the gate; later polls within the
+                        // grace skip the spawn entirely. The gate is left
+                        // untouched when `self_ref` is not set yet, so a later
+                        // read can still arm it (matches old behaviour).
+                        let w = self.self_ref.lock().clone();
+                        let schedule =
+                            w.is_some() && !self.grace_wakeup_spawned.swap(true, Ordering::AcqRel);
+                        if schedule {
+                            #[cfg(test)]
+                            self.grace_spawns.fetch_add(1, Ordering::Relaxed);
+                            if let Some(w) = w {
+                                knet::spawn_task(async move {
+                                    knet::sleep_ms(EOF_GRACE_MS).await;
+                                    if let Some(s) = w.upgrade() {
+                                        s.wakeup_reader();
+                                    }
+                                });
+                            }
                         }
                         return Err(StreamError::WouldBlock);
                     }
@@ -621,13 +651,16 @@ impl Stream {
         // Take a pooled buffer under the lock, fill it after releasing: the
         // memcpy must not block the flush task's `drain_send_max` — the lock
         // is only needed for pool / queue bookkeeping.
-        let mut buf = self.send.lock().pool.acquire();
+        // Session-shared pool (O15): pop under its own mutex, memcpy with no
+        // lock held (the popped buffer is exclusively ours), push back, then
+        // queue — the queue lock is never held across the copy either.
+        let mut buf = self.send_pool().lock().acquire();
         buf.extend_from_slice(data);
         let n = buf.len();
         let bytes = buf.split_to(n).freeze();
+        self.send_pool().lock().release(buf);
         {
             let mut inner = self.send.lock();
-            inner.pool.release(buf);
             if self.local_closed.load(Ordering::Acquire) {
                 return Err(StreamError::Closed);
             }
@@ -1405,6 +1438,42 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 4);
             let _ = knet::timeout(std::time::Duration::from_millis(200), waiter).await;
+        });
+    }
+
+    /// O17: a reader polling throughout the EOF grace must arm the expiry
+    /// wakeup task exactly once (it used to spawn one sleeper per read).
+    #[test]
+    fn eof_grace_arms_wakeup_once_per_fin() {
+        // block_on: arming the wakeup calls `knet::spawn_task`, which needs
+        // the global tokio reactor.
+        knet::block_on(async {
+            let s = Arc::new(Stream::new(1));
+            s.set_self_ref(Arc::downgrade(&s));
+            {
+                let mut inner = s.recv.lock();
+                inner.remote_closed_at = Some(Instant::now());
+            }
+            s.remote_closed.store(true, Ordering::Release);
+
+            let mut buf = [0u8; 8];
+            for _ in 0..5 {
+                assert!(
+                    matches!(s.read(&mut buf), Err(StreamError::WouldBlock)),
+                    "reads inside the grace must stay pending"
+                );
+            }
+            assert_eq!(
+                s.grace_spawns.load(Ordering::Relaxed),
+                1,
+                "grace wakeup must be armed exactly once for 5 polls"
+            );
+
+            // After the window the same read reports the real EOF — and the
+            // one-shot gate is not re-armed on the way out.
+            knet::sleep_ms(EOF_GRACE_MS + 30).await;
+            assert!(matches!(s.read(&mut buf), Err(StreamError::Closed)));
+            assert_eq!(s.grace_spawns.load(Ordering::Relaxed), 1);
         });
     }
 }

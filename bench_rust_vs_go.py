@@ -52,7 +52,7 @@ def _pids_on_port(port):
     try:
         out = subprocess.check_output(
             ['lsof', f'-tiTCP:{port}', '-sTCP:LISTEN'],
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=subprocess.DEVNULL, universal_newlines=True)
         pids.update(int(x) for x in out.split() if x.strip().isdigit())
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
@@ -60,7 +60,7 @@ def _pids_on_port(port):
     try:
         out = subprocess.check_output(
             ['lsof', f'-tiUDP:{port}'],
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=subprocess.DEVNULL, universal_newlines=True)
         pids.update(int(x) for x in out.split() if x.strip().isdigit())
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
@@ -68,7 +68,7 @@ def _pids_on_port(port):
     try:
         out = subprocess.check_output(
             ['lsof', f'-ti:{port}'],
-            stderr=subprocess.DEVNULL, text=True)
+            stderr=subprocess.DEVNULL, universal_newlines=True)
         pids.update(int(x) for x in out.split() if x.strip().isdigit())
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
@@ -247,6 +247,11 @@ def build_args(binary_path, is_go, role, echo_port, srv_port, cli_port,
         listen_flag = '-l'
         target_flag = '-r' if role == 'client' else '-t'
         args = common if role == 'server' else client_common
+        # O16: optional worker-thread override for the Rust binaries only
+        # (Go kcptun has no --threads flag).
+        threads = os.environ.get('KCPTUN_THREADS')
+        if threads:
+            args = args + ['--threads', threads]
         if role == 'server':
             return [binary_path, listen_flag, f'0.0.0.0:{srv_port}',
                     target_flag, f'127.0.0.1:{echo_port}'] + args
@@ -467,7 +472,7 @@ def _aggregate_runs_mean(bench_fn, runs, **kwargs):
 
 
 CIPHERS = [
-    'null', 'none', 'xor', 'aes-128', 'aes-128-gcm',
+    'null', 'none', 'xor', 'aes-128', 'aes', 'aes-128-gcm',
     'salsa20', 'blowfish', 'twofish', 'cast5',
     '3des', 'tea', 'xtea', 'sm4',
 ]

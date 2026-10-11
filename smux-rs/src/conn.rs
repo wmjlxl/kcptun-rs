@@ -103,6 +103,11 @@ const REAP_LINGER: Duration = Duration::from_secs(30);
 pub struct SmuxConn {
     session: Arc<Session>,
     flush_notify: Arc<knet::Notify>,
+    /// Flush-task loop wakeups (health timer or producer notify). Relaxed
+    /// counter backing the O3-R idle-wake budget test: an idle conn must
+    /// wake ~1×/s (health timer), not the pre-O3 100 Hz poll. Shared across
+    /// `Clone` handles via `Arc`; test-facing only.
+    flush_wakeups: Arc<std::sync::atomic::AtomicUsize>,
     /// Set to true once a driver task has been started (via run/spawn or
     /// the connect/serve builders / client/server wrappers). Prevents
     /// accidentally starting a second driver on the same connection.
@@ -176,6 +181,7 @@ impl SmuxConn {
         Ok(Self {
             session,
             flush_notify,
+            flush_wakeups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             driven: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -281,7 +287,6 @@ impl SmuxConn {
     {
         use knet::{AsyncReadExt, AsyncWriteExt};
 
-        let mut read_buf = vec![0u8; 65536];
         let mut write_buf = BytesMut::with_capacity(65536);
         let mut health: u32 = 0;
 
@@ -295,15 +300,24 @@ impl SmuxConn {
             // recvLoop does: the peer then hits transport backpressure
             // instead of growing our buffers without bound.
             if self.session.has_receive_capacity() {
-                match knet::timeout(
-                    Duration::from_millis(RUN_POLL_MS),
-                    transport.read(&mut read_buf),
-                )
-                .await
-                {
+                // O13: direct read into the codec buffer (see spawn's read
+                // task). On timeout the held partial-frame buffer is restored
+                // before falling through to the flush below.
+                let (mut held, allowance) = self.session.begin_inbound_read();
+                // Scoped so `held` is free again once the read completes
+                // (clippy: drop() on the Limit adapter would be a no-op).
+                let res = {
+                    let mut lim = bytes::BufMut::limit(&mut held, allowance.max(1));
+                    knet::timeout(
+                        Duration::from_millis(RUN_POLL_MS),
+                        transport.read_buf(&mut lim),
+                    )
+                    .await
+                };
+                match res {
                     Ok(Ok(0)) => break, // EOF
-                    Ok(Ok(n)) => {
-                        if let Err(e) = self.session.process_data(&read_buf[..n]) {
+                    Ok(Ok(_n)) => {
+                        if let Err(e) = self.session.end_inbound_read(held) {
                             // Fall through to the shutdown path below so
                             // streams get their close wakeups; returning here
                             // left the session marked open and any
@@ -313,7 +327,11 @@ impl SmuxConn {
                         }
                     }
                     Ok(Err(_)) => break,
-                    Err(_) => {} // timeout — fall through to flush
+                    Err(_) => {
+                        // timeout — put the partial-frame buffer back (no new
+                        // bytes were read, so this only re-arms the codec).
+                        let _ = self.session.end_inbound_read(held);
+                    }
                 }
             } else {
                 knet::sleep_ms(RUN_POLL_MS).await;
@@ -397,15 +415,28 @@ impl SmuxConn {
         // ── Read task ──
         let session = self.session.clone();
         knet::spawn_task(async move {
-            let mut buf = vec![0u8; 65536];
             loop {
                 if session.is_closed() {
                     break;
                 }
-                match read.read(&mut buf).await {
+                // O13: read straight into the codec buffer — skips the
+                // intermediate 64 KiB vec + `feed` memcpy per chunk. The
+                // `allowance.max(1)` read keeps the old `feed` kill rule:
+                // the session dies only when a byte actually arrives past
+                // `max_buffered`, not merely for sitting at the cap.
+                let (mut held, allowance) = session.begin_inbound_read();
+                // Scoped so `held` is free again once the read completes
+                // (clippy: drop() on the Limit adapter would be a no-op).
+                let res = {
+                    let mut lim = bytes::BufMut::limit(&mut held, allowance.max(1));
+                    read.read_buf(&mut lim).await
+                };
+                match res {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let _ = session.process_data(&buf[..n]);
+                    Ok(_n) => {
+                        // Cap/version errors close the session inside; the
+                        // next loop iteration observes `is_closed`.
+                        let _ = session.end_inbound_read(held);
                     }
                 }
             }
@@ -415,6 +446,7 @@ impl SmuxConn {
         // ── Flush + keepalive + reap task ──
         let session = self.session.clone();
         let flush_notify = self.flush_notify.clone();
+        let flush_wakeups = self.flush_wakeups.clone();
         knet::spawn_task(async move {
             let mut buf = BytesMut::with_capacity(65536);
             let mut nop_buf = BytesMut::with_capacity(8);
@@ -443,6 +475,9 @@ impl SmuxConn {
                     next_health.saturating_duration_since(std::time::Instant::now())
                 };
                 let _ = knet::timeout(wait, flush_notify.notified()).await;
+                // O3-R observability: one count per loop wakeup (health
+                // deadline or producer notify) for the idle-wake budget test.
+                flush_wakeups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 buf.clear();
                 let ver = session.version();
@@ -1053,6 +1088,41 @@ mod tests {
             }
 
             assert!(conn.session().streams().lock().get(&sid).is_none());
+        }
+
+        /// O3-R: an idle conn's flush task must wake only on the 1s health
+        /// timer (plus the initial immediate pass) — ≤20 wakeups per 10s.
+        /// The pre-O3 loop polled at 100 Hz, i.e. ~1000 wakeups in this
+        /// window, so the budget is ~5× below the old behaviour and ~2×
+        /// above the expected ~11 (1 initial + 10 health ticks).
+        #[tokio::test]
+        async fn idle_flush_wakeups_stay_within_budget() {
+            let conn = SmuxConn::new(DEFAULT_CONFIG.clone(), true).unwrap();
+            let written = Arc::new(Mutex::new(BytesMut::new()));
+            let fail = Arc::new(AtomicBool::new(false));
+            conn.spawn(
+                BlockingReadHalf,
+                MockWriteHalf {
+                    written,
+                    fail_next_write: fail,
+                },
+            );
+            // Let the immediate first pass land, then measure a quiet window.
+            knet::sleep_ms(50).await;
+            let start = conn
+                .flush_wakeups
+                .load(std::sync::atomic::Ordering::Relaxed);
+            knet::sleep_ms(10_000).await;
+            let end = conn
+                .flush_wakeups
+                .load(std::sync::atomic::Ordering::Relaxed);
+            conn.close();
+            knet::sleep_ms(20).await;
+            let wakes = end - start;
+            assert!(
+                wakes <= 20,
+                "idle flush task woke {wakes} times in 10s (budget 20; pre-O3 was ~1000)"
+            );
         }
     }
 }

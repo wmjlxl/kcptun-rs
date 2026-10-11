@@ -42,3 +42,6 @@ __pycache__/
 # Bench/A-B test result files (regenerated locally, not committed)
 /bench/results_*.txt
 /bench/ab_test_results.txt
+
+# Test/bench evidence dumps (kept locally, never committed)
+/docs/evidence/

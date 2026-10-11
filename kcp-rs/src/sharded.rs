@@ -32,7 +32,8 @@
 //! full drops the lock before retrying on a bounded timer, so one session's
 //! wait cannot stall the others' syscalls.
 
-use std::collections::{HashMap, VecDeque};
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -527,8 +528,8 @@ impl KcpListenerBuilder {
         };
 
         let limits = self.limits.unwrap_or_default();
-        let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let building = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(Mutex::new(HashMap::default()));
+        let building = Arc::new(Mutex::new(HashMap::default()));
         let pending = Arc::new(Mutex::new(VecDeque::new()));
         let accept_notify = Arc::new(Notify::new());
         let closed = Arc::new(AtomicBool::new(false));
@@ -552,7 +553,7 @@ impl KcpListenerBuilder {
             config: self.config,
             transport_wrapper: self.transport_wrapper,
             limits,
-            ip_limiter: Arc::new(Mutex::new(HashMap::new())),
+            ip_limiter: Arc::new(Mutex::new(HashMap::default())),
             testing_build_delay: self.testing_build_delay,
         });
 
@@ -700,7 +701,7 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
         // queues / KCP, so only the index vectors are cleared.
         let mut burst: Vec<(SocketAddr, Vec<u8>)> = Vec::with_capacity(64);
         let mut groups: Vec<(SocketAddr, Vec<Vec<u8>>)> = Vec::new();
-        let mut group_index: HashMap<SocketAddr, usize> = HashMap::new();
+        let mut group_index: HashMap<SocketAddr, usize> = HashMap::default();
         let mut last_sweep = Instant::now();
         // recvmmsg scratch: one syscall fills up to RECV_MMSG_MAX slots.
         // Slots move into `burst` and are replaced from the buffer pool.
@@ -1256,7 +1257,7 @@ fn deliver_group(
 /// live burst resets the streak) is what separates that from a real re-dial.
 fn evict_stale(args: &RxArgs, watched: &mut Vec<(SocketAddr, u64)>) {
     let observed = std::mem::take(watched);
-    let mut seen: HashMap<SocketAddr, u64> = HashMap::new();
+    let mut seen: HashMap<SocketAddr, u64> = HashMap::default();
     for (peer, before) in observed {
         let entry = seen.entry(peer).or_insert(u64::MAX);
         *entry = (*entry).min(before);
@@ -1397,7 +1398,7 @@ mod tests {
     /// second; other IPs are unaffected.
     #[test]
     fn per_ip_session_rate_limits_one_host() {
-        let limiter = Mutex::new(HashMap::new());
+        let limiter = Mutex::new(HashMap::default());
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let other: IpAddr = "10.0.0.2".parse().unwrap();
         let rate = 5;
