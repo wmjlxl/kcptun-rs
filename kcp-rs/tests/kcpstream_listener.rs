@@ -727,3 +727,49 @@ fn per_ip_session_limit_bounds_admission_from_one_address() {
         listener.close();
     });
 }
+
+/// Dial WITHOUT pinning conv: the client takes the random-conv default (Go
+/// kcp-go `Dial` parity) and the listener must adopt it from the first
+/// datagram. This is the production path a re-dial after UDP source-address
+/// reuse now takes — see bugs/BUGREPORT_KCP_LISTENER_STALE_SESSION_ALIASING.md.
+#[test]
+fn listener_accept_echo_unpinned_conv_dial() {
+    knet::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .mode(KcpMode::Fast3)
+            .sndwnd(512)
+            .rcvwnd(512)
+            .build()
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // No .conv() — random conv per dial; listener adopts it.
+        let mut client = KcpStream::connect(addr)
+            .mode(KcpMode::Fast3)
+            .sndwnd(512)
+            .rcvwnd(512)
+            .build()
+            .await
+            .unwrap();
+
+        let payload = make_payload(64 * 1024, 23);
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+
+        let (mut server, _peer) = listener.accept().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        read_exact_timeout(&mut server, &mut got, Duration::from_secs(30)).await;
+        assert_eq!(got, payload, "server received wrong bytes");
+
+        server.write_all(&got).await.unwrap();
+        server.flush().await.unwrap();
+        let mut back = vec![0u8; payload.len()];
+        read_exact_timeout(&mut client, &mut back, Duration::from_secs(30)).await;
+        assert_eq!(back, payload, "client received wrong bytes");
+
+        drop(client);
+        drop(server);
+        listener.close();
+    });
+}

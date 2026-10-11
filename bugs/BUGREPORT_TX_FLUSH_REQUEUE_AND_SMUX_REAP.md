@@ -1,5 +1,14 @@
 # BUGREPORT：TX 超时重排重发已发前缀 + 提交 2660e262 复审（SMUX reap / token 记账）
 
+> **状态**: **Partial → 唯一残留: §6.1 token 回收时机**（2026-10-11 复核）—
+> §一 BUG-1/2/3 均已修（`TxProgress` 已交付前缀不再重发、
+> `spawn_send_remainder` 改为发送 `packets[sent..]` 未发后缀、
+> `push_data_bytes` 补上 `BufferOverflow` 失败路径与 `return_tokens` 契约）；
+> §五 BUG-4 报告内文已标"已修"（收集+存快照同锁）；§6.2 reap 已收敛到
+> `reap_stale_streams`。**仍开放仅 §6.1**: token 回收时机晚于 Go（`Stream::close`
+> 未提前回收，最长 30s linger 后才在 reap 回收）。
+
+
 > 分析日期：2026-09-20
 > 复审对象：`2660e262` fix(kcp,smux): stop session mute under proxy load
 > 方法：GitNexus CLI 重建索引后 impact/detect-changes + 静态走查 + `split_off` 语义实测 + 三 crate 测试与 clippy

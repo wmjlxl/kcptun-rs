@@ -1,5 +1,11 @@
 # BUGREPORT: `listener.close()` 杀掉 tx 后 `send_all` 可能永久挂起
 
+> **状态**: **Fixed**（2026-10-11 复核）— `PeerTransport::send_all`
+> （transport.rs:495）不再 `await socket.writable()`（边沿触发竞态正是本 bug），
+> 改为 `try_send_batch_to` + 有界 `TX_RETRY_SLEEP` 重试，注释明确记录了
+> "permanent send stall" 观测；Drop 时 `mark_closed()`。
+
+
 - 日期：2026-09
 - 分支：`feat/session-task-listener`
 - 组件：`kcp-rs` `sharded.rs`（`spawn_tx` / `KcpListener::close`）、`transport.rs`（`PeerTransport::send_all`）

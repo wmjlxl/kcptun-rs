@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::config::KcpConfig;
-use crate::conn::{kcp_config_setters, resolve_one, KcpStream};
+use crate::conn::{conv_setter, kcp_config_setters, resolve_one, KcpStream};
 use crate::transport::{PeerQueue, PeerTransport, SharedSendLock, TransportWrapper, MAX_DATAGRAM};
 use knet::Notify;
 
@@ -475,6 +475,7 @@ pub struct KcpListenerBuilder {
 
 impl KcpListenerBuilder {
     kcp_config_setters!();
+    conv_setter!();
 
     /// Wrap each accepted peer transport before constructing its `KcpStream`.
     pub fn transport_wrapper<F>(mut self, wrapper: F) -> Self

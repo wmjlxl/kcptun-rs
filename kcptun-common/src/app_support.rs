@@ -11,7 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use log::{error, info, warn};
+// `error!` is only used on the qpp-feature path below; importing it
+// unconditionally trips `unused_imports` for default-feature builds
+// (workspace clippy hides this because the binaries enable qpp).
+#[cfg(feature = "qpp")]
+use log::error;
+use log::{info, warn};
 
 /// Rewrite Go kcptun's short FEC aliases (`-ds` / `-ps`) to their long
 /// forms so `clap` sees `--datashard` / `--parityshard` (matching the Go

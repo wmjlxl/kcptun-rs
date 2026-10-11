@@ -473,6 +473,21 @@ impl Stream {
                     }
                     nbatch += 1;
                 }
+                if nbatch > 0 {
+                    // Account inside the recv lock (TX_FLUSH §6.1 hardening):
+                    // `recycle_tokens()` / `close()` swap `recv_buf_bytes_avail`
+                    // under this same lock. Decoupling the decrement from the
+                    // lock let a concurrent swap zero the counter first — the
+                    // decrement then underflowed the usize (wrapping to a
+                    // near-`usize::MAX` window) and the same bytes were
+                    // returned a second time through `tokens_to_return`.
+                    self.recv_buf_bytes_avail
+                        .fetch_sub(batch_bytes, Ordering::Relaxed);
+                    // The session's receive-window tokens for these bytes are
+                    // now free; the flush cycle reclaims them (Pass 1).
+                    self.tokens_to_return
+                        .fetch_add(batch_bytes, Ordering::Relaxed);
+                }
             }
             if nbatch == 0 {
                 break;
@@ -539,10 +554,8 @@ impl Stream {
             return Err(StreamError::WouldBlock);
         }
 
-        self.recv_buf_bytes_avail
-            .fetch_sub(offset, Ordering::Relaxed);
-        // The session's receive-window tokens for these bytes are now free.
-        self.tokens_to_return.fetch_add(offset, Ordering::Relaxed);
+        // Window accounting for the popped bytes already happened under the
+        // recv lock above; this block only maintains UPD bookkeeping.
         let was_empty = self.bytes_read.fetch_add(offset as u32, Ordering::Relaxed) == 0;
         let incr_val = self.incr.fetch_add(offset as u32, Ordering::Relaxed) + offset as u32;
         let need_upd = if incr_val >= (self.max_recv_buf as u32 / 2) || was_empty {
@@ -838,12 +851,18 @@ impl Stream {
         {
             let mut r = self.recv.lock();
             r.recv.clear();
+            // Same accounting rule as `close()`: bytes dropped from the
+            // receive buffer are returned to the session window, never
+            // silently zeroed (TX_FLUSH §6.1).
+            let dropped = self.recv_buf_bytes_avail.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                self.tokens_to_return.fetch_add(dropped, Ordering::Relaxed);
+            }
         }
         {
             let mut s = self.send.lock();
             s.send.clear();
         }
-        self.recv_buf_bytes_avail.store(0, Ordering::Relaxed);
         self.send_buf_bytes.store(0, Ordering::Relaxed);
     }
 
@@ -980,13 +999,31 @@ impl Stream {
             r.state = StreamState::Closed;
             r.recv.clear();
             read_waker = r.read_waker.take();
+            // TX_FLUSH §6.1 (Go parity: recycle at streamClosed): the window
+            // for receive-buffer bytes discarded here goes back to the session
+            // on the next flush cycle instead of staying charged until reap
+            // (up to `linger`, worst case forever before this fix). Handing it
+            // through `tokens_to_return` keeps every reclaim path correct:
+            // `reclaim_tokens()`/Pass 1 return it immediately, and a later
+            // `recycle_tokens()` at reap finds the counter already zero — no
+            // double-return in either order. Captured under this lock so it
+            // serialises with `read()`'s in-lock accounting and with
+            // `recycle_tokens()`'s in-lock swap.
+            let dropped = self.recv_buf_bytes_avail.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                self.tokens_to_return.fetch_add(dropped, Ordering::Relaxed);
+            }
         }
         {
             let mut s = self.send.lock();
             s.send.clear();
             write_waker = s.write_waker.take();
         }
-        self.recv_buf_bytes_avail.store(0, Ordering::Relaxed);
+        // No `recv_buf_bytes_avail.store(0)` here: the in-lock `swap(0)`
+        // above already reset it, and a blind zeroing after the lock would
+        // wipe a concurrent `push_data_bytes`'s `fetch_add` — those bytes
+        // were charged to the session and must stay returnable via
+        // `recycle_tokens()` at reap.
         self.send_buf_bytes.store(0, Ordering::Relaxed);
         self.ch_reader_wakeup.notify_one();
         self.ch_write_wakeup.notify_one();

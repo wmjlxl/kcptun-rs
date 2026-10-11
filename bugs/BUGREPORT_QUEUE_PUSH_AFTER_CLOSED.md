@@ -4,7 +4,10 @@
 - 分支：`feat/session-task-listener`（核对 `2f6abf6a` 后仍未修）
 - 组件：`kcp-rs/src/transport.rs` `PeerQueue::push`
 - 严重级别：P3（有界滞留；破坏 `mark_closed` 回收保证）
-- 状态：**未修复**（`mark_closed` 已 drain + `recycle_buf`，但 push 无门禁）
+- 状态：**已修复**（2026-10-11 复核；原 2026-09 判定基于 `feat/session-task-listener`
+  旧核对点，已过时）— `transport.rs::PeerQueue::push` 现先查
+  `closed.load(Acquire)`，命中即 `recycle_buf` 并返回 false；回归测试
+  `push_racing_mark_closed_leaves_queue_empty`（transport.rs:593）覆盖竞态
 
 ## 现象
 

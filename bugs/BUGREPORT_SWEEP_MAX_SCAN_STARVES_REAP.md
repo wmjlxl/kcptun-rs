@@ -4,7 +4,10 @@
 - 分支：`feat/session-task-listener`（核对后仍未修）
 - 组件：`kcp-rs/src/sharded.rs` `sweep`
 - 严重级别：P2（资源滞留窗口被拉长；放大队列内存滞留）
-- 状态：**未修复**
+- 状态：**已修复**（2026-10-11 复核；原 2026-09 判定已过时）—
+  `sweep()`（sharded.rs:1327 附近）已移除 4096 扫描上限：先 clone 全量
+  候选、锁外逐个 `is_dead()`；注释明确记录旧 MAX_SCAN 前缀饥饿与
+  HashMap 桶序复现机理
 
 ## 现象
 

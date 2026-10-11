@@ -1,5 +1,12 @@
 # P99 test step 7 (go→kcp-rs smol server) intermittent hang (open)
 
+> **状态**: **Obsolete**（2026-10-11 复核）— 该 bug 仅存在于 smol 后端
+> （`latency_p99_smol` / go→kcp-rs smol server 步骤）。仓库已切换为
+> **tokio-only** 后端（AGENTS.md "Single async backend: tokio"），smol 后端
+> 及其测试目标已整体移除，报告中的触发路径不复存在；报告中同时记录
+> tokio 路径 ~25 次从未失败。
+
+
 ## Status
 
 **Open** — reproduced **once** (initial repro), then **not reproduced in 100 subsequent full-script

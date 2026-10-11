@@ -561,6 +561,18 @@ async fn kcp_stream_with_socket_options(
     offload_profile: OffloadProfile,
     rate_limit: u32,
 ) -> io::Result<KcpStream> {
+    // Go kcptun sessions each carry a random conv (kcp-go Dial), so a session
+    // re-dial — autoexpire/scavenger replacement, reconnect after death — can
+    // never alias into a lingering server-side session that still holds the
+    // client's previous source address. Only UDP gets this: a `--tcp` session
+    // is a dedicated connection (TCP itself prevents stale-segment aliasing)
+    // and its peer may pin the configured conv. Server-side builds pass
+    // adopt_conv=true and keep the configured value (they adopt the peer's).
+    let mut config = config;
+    if !adopt_conv && config.conv == DEFAULT_CONV && matches!(*socket, knet::DatagramSocket::Udp(_))
+    {
+        config.conv = kcp_rs::random_conv();
+    }
     let mut ct = CryptoTransport::new(socket, key, crypt);
     ct.set_offload_profile(offload_profile);
     ct.set_rate_limit(rate_limit);

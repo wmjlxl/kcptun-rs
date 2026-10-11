@@ -57,7 +57,7 @@ pub(crate) mod transport;
 mod kcp_p999_optimizations_test;
 
 #[cfg(feature = "async")]
-pub use config::{KcpConfig, KcpMode, DEFAULT_CONV};
+pub use config::{random_conv, KcpConfig, KcpMode, DEFAULT_CONV};
 pub use fec::{
     fec_expand_packets, fec_kcp_from_recovered, FecDecoder, FecEncoder, FEC_HEADER_SIZE,
     FEC_TYPE_DATA, FEC_TYPE_PARITY,

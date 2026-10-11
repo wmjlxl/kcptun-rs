@@ -68,6 +68,15 @@ let conn = KcpStream::with_transport(transport, cfg).await?;
 - `connect_timeout` forces a `WASK` probe and waits for any conv-valid inbound
   (`WINS`/ACK); it proves reachability + conv match, **not** connection establishment
   (KCP has no handshake). Requires the background input loop.
+- **conv default (post-aliasing-fix)**: a plain UDP dial (`connect`/`connect_timeout`)
+  gets a **fresh random conv per dial** (Go kcp-go `Dial` parity; `kcp_rs::random_conv()`)
+  unless pinned via `.conv()` — even pinning `DEFAULT_CONV` is honoured (builder tracks
+  the explicit set). `with_transport` keeps the configured conv (callers opt in —
+  kcptun-common randomises UDP dials in `kcp_transport.rs`, TCP dials stay fixed);
+  server-side builds use `.adopt_conv(true)` and learn the peer's conv from the first
+  inbound segment. Why: a re-dial from a reused UDP source address must replace (not
+  alias into) the lingering session — see `bugs/BUGREPORT_KCP_LISTENER_STALE_SESSION_ALIASING.md`.
+  New pub API: `kcp_rs::random_conv()` (kcp-rs minor bump at next publish).
 - `PacketTransport`: datagram send/receive plus optional batch operations;
   `recv_vec` / `try_recv_vec` let queue-backed transports transfer reusable
   owned packet storage without an extra copy.
