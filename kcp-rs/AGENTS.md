@@ -20,7 +20,7 @@ Async surface (optional): `KcpStream` is a tokio-TCP-shaped `AsyncRead`/`AsyncWr
 | `src/fec.rs` | `FecEncoder` / `FecDecoder` / `fec_expand_packets` / `fec_kcp_from_recovered`; header types `0x00f1` / `0x00f2` / `0x00f3` |
 | ~~`src/crypto_buf.rs`~~ | **Removed** (B2) — moved to `kcrypt-rs::wire`; see `../kcrypt-rs/AGENTS.md` |
 | `src/conn.rs` | (feature `async`) `KcpStream` + `SharedIoState` (crate-private) + builder + background loops + poll impls + split halves; exposes monotonic `last_activity_ms` for upper-layer session expiry; **TcpStream-aligned surface** (`set_nodelay(bool)`, `set_nonblocking(bool)` honored by `read`/`write_all`, `shutdown(Shutdown)`, read/write timeouts, `split`/`into_split`, `readable`/`writable`, `peek`, `take_error`, builder `.connect_timeout`) + post-construction `set_kcp_window_size`; builder raw knobs are `.set_kcp_nodelay(n,i,r,nc)` (not `.nodelay`). Shared builder setters use one internal macro (re-exported for both listener builders). TX path uses `flush_tx_batch` (non-blocking `sendmmsg` fast path → async `send_batch` fallback on `WouldBlock`); `feed_raw_batch`/`feed_batch`/`tick` are `pub(crate)` — the listener worker path only |
-| `src/transport.rs` | (feature `async`) `PacketTransport` trait + impls (`knet::DatagramSocket`, per-peer `PeerTransport`) + `PeerQueue` (listener demux) + `TransportWrapper`; `MAX_DATAGRAM`/`MAX_RETAINED_PEER_BUFFERS` consts |
+| `src/transport.rs` | (feature `async`) `PacketTransport` trait + impls (`knet::DatagramSocket`, per-peer `PeerTransport`) + `PeerQueue` (listener demux) + `TransportWrapper`; `MAX_DATAGRAM` bounds receive storage; exchanged buffers return to the shared listener pool |
 | `src/listener.rs` | (feature `async`) `KcpTcpListener` only — a Linux raw-TCP **transport factory** (one accepted TCP conn → one `KcpStream`), NOT a demux listener. Builder shares the config setters and is `IntoFuture`. The UDP demux listener lives in `sharded.rs` |
 | `src/sharded.rs` | (feature `async`) `KcpListener` + `KcpListenerBuilder` — the UDP demux listener, three topologies (direct single worker / Linux SO_REUSEPORT group / reader pipeline). Workers build `KcpStream` with `background_input(false)` and feed inbound via `feed_raw_batch` (decrypt + KCP + encrypt on the worker thread). Public entry points `KcpListener::bind` / `from_socket` (also `bind_listener` / `from_socket_listener`) |
 | `src/config.rs` | **Always-on** `KcpConfig` / `KcpMode`; `KCP::apply` / `set_mode` (B1) |
@@ -145,3 +145,52 @@ let conn = KcpStream::with_transport(transport, cfg).await?;
 - optional `knet-rs` via feature `async`
 
 <!-- MANUAL: -->
+
+### 2026-10-11 audit repair contracts
+
+- Pure `KcpConfig`/`KcpMode` and `KCP::apply` are available without `async`.
+- `KCP::send` errors never partially append data. Message reception uses a
+  bounded head-message reassembly allowance of `max(rcv_wnd, head.frg + 1)`;
+  the head allowance is at most 256 segments and normal stream windows are
+  unchanged. Never infer a peer's maximum message size from dynamic `rmt_wnd`.
+- `set_mtu` rejects a decrease incompatible with queued/in-flight unacked
+  payloads. Async builders reject MTU outside 50..=2048 (58 minimum with FEC) and invalid enabled
+  FEC dimensions before opening sockets. External wrappers must budget their
+  own extra wire overhead inside receive capacity.
+- Trait `poll_flush`/`poll_shutdown` wait for transport drain, not peer ACKs;
+  synchronous write shutdown only requests flushing. Preserve partial-send
+  ordering and wake all blocked flushers. Discarded TX batches cannot later
+  be reported as successfully flushed. KCP still has no wire FIN.
+- Listener evictions must clean same-generation pending accepts. Removal of
+  a building peer invalidates publication. Use one consistent lifecycle lock
+  order and keep a hard accept-backlog bound even if live sessions are unlimited.
+- FEC checked helpers reject invalid SIZE/header layout without advancing
+  state. The 256-shard boundary is legal; auto-tuning needs observed history
+  and cannot retroactively recover groups discarded before dimensions were known.
+- Connection lifecycle maintains CurrEstab/MaxConn independent of optional
+  packet statistics. Track once after successful build and close once across
+  owners/clones/split halves. `SNMP::reset` preserves those gauges; do not
+  duplicate automatic stream counting with manual session callbacks.
+- Extreme RTT intermediate arithmetic is widened before the existing clamp.
+  Preserve RTT sampling for ACKs that miss snd_buf (root AGENTS L-4 constraint).
+
+### 2026-10-12 retention and admission optimization contracts
+
+- SegmentPool retains at most 8 MiB of payload capacity and at most 16 KiB
+  per payload, in addition to its object-count limit. Acquired buffers must
+  have exclusive ownership. Public release rejects unknown shared tails.
+  KCP may retain a tail only with the full capacity captured before splitting
+  an exclusive buffer; charge that capacity, not the tail view. Check ownership
+  and reclaim at acquire, replacing still-shared tails before returning them. These limits exclude active segments and allocator RSS.
+- FEC groups keep full group IDs in the bounded map and indexed payload slots
+  with a `[u64; 4]` presence bitmap. Preserve first-packet duplicate semantics,
+  completed-group tombstones, PAWS wrap and auto-tune state replacement; slot
+  modulo indices alone cannot identify a group.
+- Per-IP concurrent admission counts building and published entries exactly
+  once. Only the lifecycle entry owns a reservation, which moves at publish;
+  build tasks and cloned streams must not duplicate it. Recheck the cap while
+  registering, and release on every entry-removal path, including stale builds.
+- The IP new-session limiter retains at most 4096 IP windows and expiry records,
+  and processes at most 32 expired records per admission. A full table rejects
+  unknown IPs rather than resetting an active IP's rate window through eviction.
+  Established traffic bypasses this limiter; rate=0 disables it.

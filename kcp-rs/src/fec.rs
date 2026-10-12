@@ -4,11 +4,8 @@
 //! compatibility.
 
 use crate::snmp::{self as snmp, DEFAULT_SNMP};
-use bytes::Bytes;
 use reed_solomon_erasure::galois_8::Field;
 use reed_solomon_erasure::ReedSolomon;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::collections::{HashMap, VecDeque};
 
 /// FEC header size (seqid + type = 6 bytes).
@@ -20,6 +17,15 @@ pub const FEC_TYPE_DATA: u16 = 0x00f1;
 /// FEC type: parity packet.
 pub const FEC_TYPE_PARITY: u16 = 0x00f2;
 const MAX_SHARD_SETS: u32 = 3;
+
+/// Invalid input to the checked FEC encoding helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FecEncodeError {
+    #[error("FEC packet is too short for its reserved header")]
+    ShortPacket,
+    #[error("FEC payload exceeds the 16-bit SIZE field")]
+    PayloadTooLarge,
+}
 
 // ─── Utilities ───────────────────────────────────────────────────────────
 
@@ -56,17 +62,17 @@ impl FecEncoder {
         if data_shards == 0 || parity_shards == 0 {
             return None;
         }
-        if data_shards + parity_shards > 256 {
+        let shard_size = data_shards.checked_add(parity_shards)?;
+        if shard_size > 256 {
             return None;
         }
-        let shard_size = data_shards + parity_shards;
+        let payload_offset = offset.checked_add(FEC_HEADER_SIZE)?;
+        payload_offset.checked_add(2)?;
         let paws = 0xffffffffu32 / shard_size as u32 * shard_size as u32;
         let codec = ReedSolomon::<Field>::new(data_shards, parity_shards).ok()?;
 
-        let mut shard_cache = Vec::with_capacity(shard_size);
-        for _ in 0..shard_size {
-            shard_cache.push(vec![0u8; 1500]);
-        }
+        // Allocate packet storage only when a shard is first used.
+        let shard_cache = vec![Vec::new(); shard_size];
 
         Some(FecEncoder {
             data_shards,
@@ -77,7 +83,7 @@ impl FecEncoder {
             shard_count: 0,
             max_size: 0,
             header_offset: offset,
-            payload_offset: offset + FEC_HEADER_SIZE,
+            payload_offset,
             shard_cache,
             ts_latest_packet: 0,
             codec,
@@ -90,7 +96,34 @@ impl FecEncoder {
     /// Buffer layout (matching Go):
     /// `[header_offset zeros][seq 4][type 2][size 2][kcp payload…]`
     /// SIZE = len from size field through end (includes the 2B size field).
+    /// Invalid buffers are ignored without advancing the encoder. Use
+    /// [`Self::try_encode`] to receive the validation error.
     pub fn encode(&mut self, data: &mut [u8], rto: u32) -> Vec<Vec<u8>> {
+        self.try_encode(data, rto).unwrap_or_else(|_| {
+            snmp::add(&DEFAULT_SNMP.fec_errs, 1);
+            Vec::new()
+        })
+    }
+
+    /// Encode a correctly sized packet, rejecting invalid input before any
+    /// header, sequence number or partial shard group is changed.
+    pub fn try_encode(
+        &mut self,
+        data: &mut [u8],
+        rto: u32,
+    ) -> Result<Vec<Vec<u8>>, FecEncodeError> {
+        let size = data
+            .len()
+            .checked_sub(self.payload_offset)
+            .filter(|&n| n >= 2)
+            .ok_or(FecEncodeError::ShortPacket)?;
+        if size > u16::MAX as usize {
+            return Err(FecEncodeError::PayloadTooLarge);
+        }
+        Ok(self.encode_valid(data, rto))
+    }
+
+    fn encode_valid(&mut self, data: &mut [u8], rto: u32) -> Vec<Vec<u8>> {
         if self.parity_shards == 0 {
             return Vec::new();
         }
@@ -151,12 +184,34 @@ impl FecEncoder {
     /// calloc from pre-zeroed pages, so the full-frame zeroing is free. A/B
     /// micro-benchmarks (examples/fec_encode_bench, since removed) showed no
     /// win for with_capacity+resize+extend over this form; keep the calloc.
+    /// An oversized input returns an empty packet and no parity; the encoder
+    /// remains unchanged. Use [`Self::try_wrap_kcp_packet`] for an explicit error.
     pub fn wrap_kcp_packet(&mut self, kcp: &[u8], rto: u32) -> (Vec<u8>, Vec<Vec<u8>>) {
+        self.try_wrap_kcp_packet(kcp, rto).unwrap_or_else(|_| {
+            snmp::add(&DEFAULT_SNMP.fec_errs, 1);
+            (Vec::new(), Vec::new())
+        })
+    }
+
+    /// Wrap and encode a KCP packet whose length fits SIZE (at most 65533
+    /// bytes). The transport may impose a smaller datagram limit.
+    pub fn try_wrap_kcp_packet(
+        &mut self,
+        kcp: &[u8],
+        rto: u32,
+    ) -> Result<(Vec<u8>, Vec<Vec<u8>>), FecEncodeError> {
+        if kcp.len() > u16::MAX as usize - 2 {
+            return Err(FecEncodeError::PayloadTooLarge);
+        }
         let ho = self.header_offset;
-        let mut pkt = vec![0u8; ho + FEC_HEADER_SIZE_PLUS_2 + kcp.len()];
+        let len = ho
+            .checked_add(FEC_HEADER_SIZE_PLUS_2)
+            .and_then(|n| n.checked_add(kcp.len()))
+            .ok_or(FecEncodeError::PayloadTooLarge)?;
+        let mut pkt = vec![0u8; len];
         pkt[ho + FEC_HEADER_SIZE_PLUS_2..].copy_from_slice(kcp);
-        let parity = self.encode(&mut pkt, rto);
-        (pkt, parity)
+        let parity = self.try_encode(&mut pkt, rto)?;
+        Ok((pkt, parity))
     }
 
     fn do_encode(&mut self) -> Vec<Vec<u8>> {
@@ -235,66 +290,46 @@ impl FecEncoder {
 
 // ─── FEC Decoder ─────────────────────────────────────────────────────────
 
-/// Min-heap wrapper for FEC packets (matching Go's shardHeap).
-struct ShardEntry {
-    seqid: u32,
-    data: bytes::Bytes,
+/// Indexed payload storage for one complete sequence-ID group. The outer map
+/// retains the full group ID; modulo indices are used only inside that group.
+/// Four bitmap words cover the legal maximum of 256 shards without a hash
+/// lookup or packet sorting, including the final slot at index 255.
+struct ShardGroup {
+    slots: Vec<Option<Box<[u8]>>>,
+    presence: [u64; 4],
+    present_count: usize,
+    data_count: usize,
+    max_payload_len: usize,
 }
 
-impl PartialEq for ShardEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.seqid == other.seqid
+impl ShardGroup {
+    fn new(shard_size: usize) -> Self {
+        Self {
+            slots: (0..shard_size).map(|_| None).collect(),
+            presence: [0; 4],
+            present_count: 0,
+            data_count: 0,
+            max_payload_len: 0,
+        }
     }
-}
-impl Eq for ShardEntry {}
-impl PartialOrd for ShardEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for ShardEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Min-heap: lower seqid first
-        other.seqid.cmp(&self.seqid)
-    }
-}
 
-struct ShardHeap {
-    elements: BinaryHeap<Reverse<ShardEntry>>,
-    marks: HashMap<u32, ()>,
-}
+    #[inline]
+    fn has(&self, index: usize) -> bool {
+        self.presence[index / 64] & (1u64 << (index % 64)) != 0
+    }
 
-impl ShardHeap {
-    fn new() -> Self {
-        ShardHeap {
-            elements: BinaryHeap::new(),
-            marks: HashMap::new(),
+    /// Retain the first packet for each index, matching the former duplicate
+    /// policy. Only the RS payload is needed once the header has been checked.
+    fn insert(&mut self, index: usize, payload: &[u8], data_shards: usize) -> bool {
+        if self.has(index) {
+            return false;
         }
-    }
-    fn has(&self, seqid: u32) -> bool {
-        self.marks.contains_key(&seqid)
-    }
-    fn has_all_data(&self, base_seqid: u32, data_shards: usize) -> bool {
-        (0..data_shards).all(|idx| self.has(base_seqid + idx as u32))
-    }
-    fn push(&mut self, pkt: Bytes) {
-        if pkt.len() < 4 {
-            return;
-        }
-        let seqid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
-        self.marks.insert(seqid, ());
-        self.elements.push(Reverse(ShardEntry { seqid, data: pkt }));
-    }
-    fn len(&self) -> usize {
-        self.elements.len()
-    }
-    fn pop_all(&mut self) -> Vec<Bytes> {
-        let mut result = Vec::new();
-        while let Some(Reverse(entry)) = self.elements.pop() {
-            self.marks.remove(&entry.seqid);
-            result.push(entry.data);
-        }
-        result
+        self.slots[index] = Some(payload.into());
+        self.presence[index / 64] |= 1u64 << (index % 64);
+        self.present_count += 1;
+        self.data_count += usize::from(index < data_shards);
+        self.max_payload_len = self.max_payload_len.max(payload.len());
+        true
     }
 }
 
@@ -317,6 +352,71 @@ impl AutoTune {
         if self.pulses.len() > self.max_samples {
             self.pulses.pop_front();
         }
+    }
+
+    // A missing first data shard hides the parity-to-data edge needed by
+    // find_period. Two intact data-to-parity edges still identify the group
+    // period. Accept this fallback only with at most one missing sample in
+    // that period and when every observed type agrees with the dimensions.
+    fn infer_dimensions(&self, paws: u32) -> Option<(usize, usize)> {
+        let mut samples: Vec<_> = self.pulses.iter().copied().collect();
+        samples.sort_unstable_by_key(|&(seq, _)| seq);
+        if samples
+            .windows(2)
+            .any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1)
+        {
+            return None;
+        }
+        samples.dedup_by_key(|sample| sample.0);
+        let edges: Vec<_> = samples
+            .windows(2)
+            .filter(|w| w[0].1 && !w[1].1 && w[1].0 - w[0].0 == 1)
+            .map(|w| w[1].0)
+            .collect();
+        for pair in edges.windows(2) {
+            let period = pair[1] - pair[0];
+            if !(2..=256).contains(&period) {
+                continue;
+            }
+            let data = pair[0] % period;
+            if data == 0 {
+                continue;
+            }
+            let observed = samples
+                .iter()
+                .filter(|&&(seq, _)| seq >= pair[0] && seq <= pair[1])
+                .count();
+            if observed < period as usize {
+                continue;
+            }
+            let inferred_paws = u32::MAX / period * period;
+            if samples
+                .iter()
+                .all(|&(seq, is_data)| seq < inferred_paws && (seq % period < data) == is_data)
+                && pair[1] < paws
+            {
+                // Losing a whole one-shard phase can hide an intermediate
+                // edge (e.g. 1+1 masquerading as 1+3). Every compatible real
+                // period divides the distance between these exact edges.
+                // Refuse tuning until the observed phases select one period.
+                let ambiguous = (2..period).any(|other_period| {
+                    if period % other_period != 0 {
+                        return false;
+                    }
+                    let other_data = pair[0] % other_period;
+                    let other_paws = u32::MAX / other_period * other_period;
+                    other_data > 0
+                        && samples.iter().all(|&(seq, is_data)| {
+                            seq < other_paws && (seq % other_period < other_data) == is_data
+                        })
+                });
+                if ambiguous {
+                    return None;
+                }
+                return Some((data as usize, (period - data) as usize));
+            }
+        }
+        None
     }
 
     fn find_period(&self, bit: bool, paws: u32) -> usize {
@@ -395,7 +495,7 @@ pub struct FecDecoder {
     parity_shards: usize,
     shard_size: usize,
     paws: u32,
-    shard_set: HashMap<u32, ShardHeap>,
+    shard_set: HashMap<u32, ShardGroup>,
     newest_shard_id: Option<u32>,
     completed_shards: HashMap<u32, ()>,
     decode_cache: Vec<Vec<u8>>,
@@ -411,10 +511,10 @@ impl FecDecoder {
         if data_shards == 0 || parity_shards == 0 {
             return None;
         }
-        if data_shards + parity_shards > 256 {
+        let shard_size = data_shards.checked_add(parity_shards)?;
+        if shard_size > 256 {
             return None;
         }
-        let shard_size = data_shards + parity_shards;
         let paws = 0xffffffffu32 / shard_size as u32 * shard_size as u32;
         let codec = ReedSolomon::<Field>::new(data_shards, parity_shards).ok()?;
         Some(FecDecoder {
@@ -482,15 +582,21 @@ impl FecDecoder {
 
         // Auto-tune if needed
         if self.should_tune {
-            let auto_ds = self.auto_tune.find_period(true, self.paws);
-            let auto_ps = self.auto_tune.find_period(false, self.paws);
+            let mut auto_ds = self.auto_tune.find_period(true, self.paws);
+            let mut auto_ps = self.auto_tune.find_period(false, self.paws);
+            if auto_ds == 0 || auto_ps == 0 {
+                if let Some((data, parity)) = self.auto_tune.infer_dimensions(self.paws) {
+                    auto_ds = data;
+                    auto_ps = parity;
+                }
+            }
             log::debug!(
                 "FEC tune probe: auto_ds={auto_ds} auto_ps={auto_ps} current={}/{} samples={}",
                 self.data_shards,
                 self.parity_shards,
                 self.auto_tune.pulses.len()
             );
-            if auto_ds > 0 && auto_ps > 0 && auto_ds + auto_ps < 256 {
+            if auto_ds > 0 && auto_ps > 0 && auto_ds + auto_ps <= 256 {
                 if auto_ds != self.data_shards || auto_ps != self.parity_shards {
                     // Build all replacement state before swapping dimensions. If
                     // Reed-Solomon rejects the inferred dimensions, retain the
@@ -535,42 +641,42 @@ impl FecDecoder {
             return Vec::new();
         }
 
-        // Get shard heap
+        // The full group ID isolates equal modulo slots from different groups.
         let ready = {
             let shard = self
                 .shard_set
                 .entry(shard_id)
-                .or_insert_with(ShardHeap::new);
+                .or_insert_with(|| ShardGroup::new(self.shard_size));
 
-            // Ignore duplicates
-            if shard.has(seqid) {
+            // The &[u8] API requires owned storage because input buffers are
+            // reused. Save just the payload, at its exact RS shard index.
+            if !shard.insert(
+                idx_in_shard as usize,
+                &pkt[FEC_HEADER_SIZE..],
+                self.data_shards,
+            ) {
                 return Vec::new();
             }
 
-            // Push packet. The `&[u8]` API forces one owned copy here — the
-            // burst-slot datagram buffers above are reused by the input loop
-            // and cannot be handed to the decoder. (Not zero-copy despite the
-            // buffer-reuse elsewhere.)
-            shard.push(Bytes::copy_from_slice(pkt));
-
             // Try to recover when we have enough shards
-            if shard.len() >= self.data_shards {
+            if shard.present_count >= self.data_shards {
                 snmp::add(&DEFAULT_SNMP.fec_full_shards, 1);
-                let base_seqid =
-                    ((shard_id as u64 * self.shard_size as u64) % self.paws as u64) as u32;
-                let all_data_present = shard.has_all_data(base_seqid, self.data_shards);
-                Some((shard.pop_all(), all_data_present))
+                Some(shard.data_count == self.data_shards)
             } else {
                 None
             }
         };
 
-        if let Some((pkts, all_data_present)) = ready {
+        if let Some(all_data_present) = ready {
             if all_data_present {
                 self.complete_group(shard_id);
                 return Vec::new();
             }
-            return self.recover(pkts, shard_id);
+            // Remove ownership before borrowing the decoder's reusable RS
+            // scratch space. No pop-all vector, header reparsing or sort.
+            if let Some(shard) = self.shard_set.remove(&shard_id) {
+                return self.recover(shard, shard_id);
+            }
         }
 
         self.discard_old();
@@ -581,66 +687,28 @@ impl FecDecoder {
         Vec::new()
     }
 
-    fn recover(&mut self, mut pkts: Vec<Bytes>, shard_id: u32) -> Vec<Vec<u8>> {
-        if pkts.is_empty() {
-            return self.cleanup(shard_id, Vec::new());
-        }
-
-        // Sort by seqid
-        pkts.sort_by_key(|e| u32::from_le_bytes(e[..4].try_into().unwrap_or([0; 4])));
-
-        let mut max_plen = 0;
-        for e in &pkts {
-            let plen = if e.len() > 6 { e[6..].len() } else { 0 };
-            if plen > max_plen {
-                max_plen = plen;
-            }
-        }
-
-        // Prepare shards and flags
+    fn recover(&mut self, shard: ShardGroup, shard_id: u32) -> Vec<Vec<u8>> {
+        // Fixed slot order is already RS order. Keep the original presence
+        // flags separate from the reconstruction API's mutable shard flags.
         for k in 0..self.shard_size {
+            self.flag_cache[k] = shard.has(k);
             self.decode_cache[k].clear();
-            self.flag_cache[k] = false;
         }
-
-        let mut present = vec![false; self.shard_size];
-        for e in &pkts {
-            let sid = u32::from_le_bytes(e[..4].try_into().unwrap_or([0; 4]));
-            let idx = (sid % self.shard_size as u32) as usize;
-            if idx < self.shard_size {
-                present[idx] = true;
-            }
-        }
-
-        // Check if all data shards are already present
-        let all_data_present = (0..self.data_shards).all(|i| present[i]);
-        if all_data_present || pkts.len() < self.data_shards {
-            return self.cleanup(shard_id, Vec::new());
-        }
-
-        // Fill decode cache from packets — reuse buffers to avoid allocation
-        for e in &pkts {
-            let sid = u32::from_le_bytes(e[..4].try_into().unwrap_or([0; 4]));
-            let idx = (sid % self.shard_size as u32) as usize;
-            if idx < self.shard_size {
-                let payload = if e.len() > 6 { &e[6..] } else { &[] };
-                // Reuse existing buffer: clear, extend from payload, then resize
-                let slot = &mut self.decode_cache[idx];
-                slot.clear();
-                slot.extend_from_slice(payload);
-                if slot.len() < max_plen {
-                    slot.resize(max_plen, 0u8);
+        // Fill received buffers first, preserving the previous scratch
+        // allocation order. Missing buffers are prepared in a second pass.
+        for k in 0..self.shard_size {
+            if self.flag_cache[k] {
+                let slot = &mut self.decode_cache[k];
+                // Presence and ownership are set together by insert().
+                if let Some(payload) = &shard.slots[k] {
+                    slot.extend_from_slice(payload);
                 }
-                self.flag_cache[idx] = true;
+                slot.resize(shard.max_payload_len, 0u8);
             }
         }
-
-        // Fill missing shards with empty buffers — reuse via clear+resize
         for k in 0..self.shard_size {
             if !self.flag_cache[k] {
-                let slot = &mut self.decode_cache[k];
-                slot.clear();
-                slot.resize(max_plen, 0u8);
+                self.decode_cache[k].resize(shard.max_payload_len, 0u8);
             }
         }
 
@@ -648,11 +716,11 @@ impl FecDecoder {
         // (reed-solomon-erasure: len() is None when bool is false).
         let mut shards: Vec<(&mut [u8], bool)> = Vec::with_capacity(self.shard_size);
         for (i, s) in self.decode_cache.iter_mut().enumerate() {
-            shards.push((s.as_mut_slice(), present[i]));
+            shards.push((s.as_mut_slice(), self.flag_cache[i]));
         }
         let recovered = if self.codec.reconstruct_data(&mut shards).is_ok() {
             let rec: Vec<Vec<u8>> = (0..self.data_shards)
-                .filter(|&i| !present[i])
+                .filter(|&i| !self.flag_cache[i])
                 .map(|i| self.decode_cache[i].clone())
                 .collect();
             if !rec.is_empty() {
@@ -768,6 +836,9 @@ pub fn fec_expand_packets(
     let mut out = Vec::with_capacity(packets.len() + packets.len() / 2 + 4);
     for kcp in packets {
         let (data, parity) = encoder.wrap_kcp_packet(kcp, rto_ms);
+        if data.is_empty() {
+            continue;
+        }
         out.push(bytes::Bytes::from(data));
         for p in parity {
             out.push(bytes::Bytes::from(p));
@@ -1085,9 +1156,9 @@ mod tests {
         let groups = dec.group_count();
         let last = groups - 1;
         dec.newest_shard_id = Some(last);
-        dec.shard_set.insert(last, ShardHeap::new());
+        dec.shard_set.insert(last, ShardGroup::new(dec.shard_size));
         dec.shard_set
-            .insert(last - MAX_SHARD_SETS - 1, ShardHeap::new());
+            .insert(last - MAX_SHARD_SETS - 1, ShardGroup::new(dec.shard_size));
         dec.completed_shards.insert(last - 1, ());
         dec.completed_shards.insert(last - MAX_SHARD_SETS - 1, ());
 
@@ -1095,7 +1166,7 @@ mod tests {
         // the newest marker across the seam and keeps the prior final group
         // as age one.
         assert!(dec.observe_shard(0));
-        dec.shard_set.insert(0, ShardHeap::new());
+        dec.shard_set.insert(0, ShardGroup::new(dec.shard_size));
         assert!(dec.shard_set.contains_key(&last));
         assert!(dec.shard_set.contains_key(&0));
         assert!(!dec.shard_set.contains_key(&(last - MAX_SHARD_SETS - 1)));
@@ -1171,3 +1242,9 @@ mod tests {
         assert!(dec.completed_shards.contains_key(&1));
     }
 }
+
+#[cfg(test)]
+mod audit_tests;
+
+#[cfg(test)]
+mod slot_tests;

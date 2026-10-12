@@ -45,3 +45,21 @@ __pycache__/
 
 # Test/bench evidence dumps (kept locally, never committed)
 /docs/evidence/
+
+# Raw local test/build logs stay out of audit report commits.
+/bugs/kcp-rs-fixes-20261011/**/*.log
+/bugs/kcp-rs-optimizations-20261012/**/*.log
+/bugs/kcp-rs-fixes-20261011/evidence/
+/bugs/kcp-rs-fixes-20261011/interop/evidence/
+/bugs/kcp-rs-optimizations-20261012/evidence/
+/bugs/**/evidence/
+/bugs/kcp-rs-fixes-20261011/
+/bugs/kcp-rs-optimizations-20261012/
+
+# Local stability test output logs are not versioned.
+/stability_1h/**/logs/
+/stability_1h/**/*.log
+
+# Local audit and stability-test runs are not versioned.
+/stability_1h/
+/bugs/kcp-rs-review-20261011/

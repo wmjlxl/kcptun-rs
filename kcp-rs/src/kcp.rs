@@ -289,11 +289,23 @@ impl KCP {
         }
     }
 
+    /// The configured queue window, extended only to finish its head message.
+    ///
+    /// A message cannot be consumed until all `frg + 1` segments arrive. The
+    /// one-byte fragment field bounds this temporary reassembly allowance to
+    /// 256 slots, without raising the normal stream/queue window.
+    fn receive_queue_limit(&self) -> u32 {
+        self.rcv_queue
+            .front()
+            .map_or(self.rcv_wnd, |seg| self.rcv_wnd.max(u32::from(seg.frg) + 1))
+    }
+
     /// Compute the unused window (wnd_unused in Go).
     fn wnd_unused(&self) -> u16 {
         let queued = self.rcv_queue.len() as u32;
-        if queued < self.rcv_wnd {
-            (self.rcv_wnd - queued) as u16
+        let limit = self.receive_queue_limit();
+        if queued < limit {
+            (limit - queued) as u16
         } else {
             0
         }
@@ -309,13 +321,24 @@ impl KCP {
     }
 
     /// Set the MTU (Maximum Transmission Unit).
-    /// Returns true if successful.
+    /// Returns false for an invalid size or when queued/in-flight payloads
+    /// cannot fit the new MTU. Rejected changes leave the configuration intact.
     pub fn set_mtu(&mut self, mtu: u32) -> bool {
         if mtu < 50 || mtu < KCP_OVERHEAD as u32 {
             return false;
         }
+        let mss = mtu - KCP_OVERHEAD as u32;
+        if mtu < self.mtu
+            && self
+                .snd_queue
+                .iter()
+                .chain(self.snd_buf.iter())
+                .any(|seg| !seg.acked && seg.len > mss)
+        {
+            return false;
+        }
         self.mtu = mtu;
-        self.mss = mtu - KCP_OVERHEAD as u32;
+        self.mss = mss;
         self.buffer = BytesMut::with_capacity(self.mtu as usize);
         true
     }
@@ -402,6 +425,10 @@ impl KCP {
     ///
     /// This queues the data for transmission. SN is assigned during flush()
     /// when the segment is moved to snd_buf, matching Go behavior.
+    /// At most 255 new segments may be queued by one call. Message-mode peers
+    /// must provide enough reassembly storage for the full message; this
+    /// implementation reserves a bounded allowance for its head message.
+    /// An error never appends a partial prefix to an existing queued segment.
     pub fn send(&mut self, data: &[u8]) -> Result<(), KcpError> {
         // P2 / L-3: refuse absurd payloads instead of silently truncating
         // `len` to u32. A >4 GiB send is a caller bug.
@@ -417,40 +444,26 @@ impl KCP {
 
         let original_len = data.len() as u64;
 
-        // Stream mode: append to previous segment in snd_queue if possible
-        let data = if self.stream != 0 {
-            if let Some(last) = self.snd_queue.back_mut() {
-                if (last.data.len() as u32) < self.mss {
-                    let capacity = self.mss as usize - last.data.len();
-                    let extend = cmp::min(data.len(), capacity);
-                    last.data.extend_from_slice(&data[..extend]);
-                    last.len = last.data.len() as u32;
-                    if extend >= data.len() {
-                        snmp::add(&DEFAULT_SNMP.bytes_sent, original_len);
-                        return Ok(());
-                    }
-                    // Advance past appended bytes (matching Go: buffer = buffer[extend:])
-                    &data[extend..]
-                } else {
-                    data
-                }
-            } else {
-                data
-            }
+        // Validate the whole send before modifying a stream-mode tail. A
+        // TooManyFragments error must not silently accept a prefix.
+        let extend = if self.stream != 0 {
+            self.snd_queue.back().map_or(0, |last| {
+                data.len()
+                    .min((self.mss as usize).saturating_sub(last.data.len()))
+            })
         } else {
-            data
+            0
         };
-
-        // Calculate fragment count
-        let count = if data.len() as u32 <= self.mss {
-            1
-        } else {
-            (data.len() as u32).div_ceil(self.mss)
-        };
-
+        let count = ((data.len() - extend) as u32).div_ceil(self.mss);
         if count > KCP_MAX_FRAG {
             return Err(KcpError::TooManyFragments);
         }
+        if extend != 0 {
+            let last = self.snd_queue.back_mut().expect("validated stream tail");
+            last.data.extend_from_slice(&data[..extend]);
+            last.len = last.data.len() as u32;
+        }
+        let data = &data[extend..];
 
         let mut offset = 0usize;
         for i in 0..count {
@@ -465,10 +478,8 @@ impl KCP {
             }
             seg.data.extend_from_slice(&data[offset..offset + size]);
             seg.len = size as u32;
-            // Note: payload freezing is deferred to flush() — see the freeze
-            // step before encode() in the snd_buf transmit loop.  Freezing
-            // here would empty `data` and break stream-mode append on the
-            // next send() call (capacity check uses data.len()).
+            // encode() copies into the output buffer; this segment retains
+            // its whole, exclusively owned payload for append and pool reuse.
             self.snd_queue.push_back(seg);
             offset += size;
         }
@@ -484,19 +495,20 @@ impl KCP {
     pub fn recv(&mut self) -> Result<BytesMut, KcpError> {
         let peeksize = self.peeksize().ok_or(KcpError::NoData)?;
 
-        let fast_recover = self.rcv_queue.len() as u32 >= self.rcv_wnd;
+        let fast_recover = self.wnd_unused() == 0;
 
         // Merge fragments
         let mut data = BytesMut::with_capacity(peeksize);
         loop {
             match self.rcv_queue.pop_front() {
                 Some(seg) => {
+                    let last_fragment = seg.frg == 0;
                     let size = cmp::min(seg.len as usize, seg.data.len());
                     if size > 0 {
                         data.extend_from_slice(&seg.data[..size]);
                     }
-                    self.pool.release(seg);
-                    if data.len() >= peeksize {
+                    self.pool.release_unique(seg);
+                    if last_fragment {
                         break;
                     }
                 }
@@ -508,7 +520,7 @@ impl KCP {
         self.move_receive_buffer();
 
         // Fast recover
-        if (self.rcv_queue.len() as u32) < self.rcv_wnd && fast_recover {
+        if self.wnd_unused() != 0 && fast_recover {
             self.probe |= KCP_ASK_TELL;
         }
 
@@ -529,22 +541,26 @@ impl KCP {
     pub fn recv_bytes(&mut self) -> Result<bytes::Bytes, KcpError> {
         let peeksize = self.peeksize().ok_or(KcpError::NoData)?;
 
-        let fast_recover = self.rcv_queue.len() as u32 >= self.rcv_wnd;
+        let fast_recover = self.wnd_unused() == 0;
 
         // ── Fast path: single-segment message (frg == 0) ──
         // This is the common case in stream mode. Zero-copy: just
         // freeze the segment's BytesMut data and return a slice.
-        if peeksize == self.rcv_queue.front().map(|s| s.len as usize).unwrap_or(0) {
+        if self.rcv_queue.front().is_some_and(|seg| seg.frg == 0) {
             if let Some(mut seg) = self.rcv_queue.pop_front() {
                 let size = cmp::min(seg.len as usize, seg.data.len());
+                // Pool acquire always supplies a whole, exclusively owned
+                // buffer. Account its full backing before the zero-copy split
+                // so a small (or empty) tail cannot hide retained storage.
+                let full_capacity = seg.data.capacity();
                 let data = seg.data.split_to(size).freeze();
-                self.pool.release(seg);
+                self.pool.release_after_split(seg, full_capacity);
 
                 // Move available data from rcv_buf → rcv_queue
                 self.move_receive_buffer();
 
                 // Fast recover
-                if (self.rcv_queue.len() as u32) < self.rcv_wnd && fast_recover {
+                if self.wnd_unused() != 0 && fast_recover {
                     self.probe |= KCP_ASK_TELL;
                 }
 
@@ -559,12 +575,13 @@ impl KCP {
         loop {
             match self.rcv_queue.pop_front() {
                 Some(seg) => {
+                    let last_fragment = seg.frg == 0;
                     let size = cmp::min(seg.len as usize, seg.data.len());
                     if size > 0 {
                         data.extend_from_slice(&seg.data[..size]);
                     }
-                    self.pool.release(seg);
-                    if data.len() >= peeksize {
+                    self.pool.release_unique(seg);
+                    if last_fragment {
                         break;
                     }
                 }
@@ -576,7 +593,7 @@ impl KCP {
         self.move_receive_buffer();
 
         // Fast recover
-        if (self.rcv_queue.len() as u32) < self.rcv_wnd && fast_recover {
+        if self.wnd_unused() != 0 && fast_recover {
             self.probe |= KCP_ASK_TELL;
         }
 
@@ -605,10 +622,10 @@ impl KCP {
         for seg in &self.rcv_queue {
             length = length.checked_add(seg.len as usize)?;
             if seg.frg == 0 {
-                break;
+                return Some(length);
             }
         }
-        Some(length)
+        None
     }
 
     // ── Ack processing ────────────────────────────────────────────────────
@@ -627,15 +644,14 @@ impl KCP {
         };
         if seg.sn == sn {
             seg.acked = true;
-            // The flush loop skips acked segments (`if seg.acked { continue }`),
-            // so the payload is dead weight until `parse_una` eventually pops
-            // the segment from the front of `snd_buf`. With `snd_wnd = 1024`
-            // that can be ~1.4 MB per connection of payloads already accepted
-            // by the peer but still pinned in memory.
+            // The flush loop skips ACKed segments, so clear the logical
+            // payload until parse_una removes this entry. BytesMut::clear
+            // retains capacity for segment-pool reuse; it does not release
+            // the backing allocation.
             seg.data.clear();
             seg.len = 0;
-            // Go: recycleSegment frees the data buffer but leaves the entry
-            // so we don't need to remove from snd_buf here.
+            // Go also keeps the entry after recycleSegment. Keep our deque
+            // contiguous so ACK lookup can use the wrapping SN delta.
         }
     }
 
@@ -682,7 +698,7 @@ impl KCP {
                 break;
             }
             if let Some(seg) = self.snd_buf.pop_front() {
-                self.pool.release(seg);
+                self.pool.release_unique(seg);
                 count += 1;
             }
         }
@@ -1004,7 +1020,7 @@ impl KCP {
             // The caller acquired this segment from the pool.  Recycle it on
             // every rejected path (including duplicate/out-of-window input),
             // rather than silently dropping its allocation.
-            self.pool.release(newseg);
+            self.pool.release_unique(newseg);
             return true;
         }
 
@@ -1012,7 +1028,7 @@ impl KCP {
         // search and enqueue it directly when the local receive queue has
         // room; any already-buffered successor segments are then promoted by
         // `move_receive_buffer`.
-        if sn == self.rcv_nxt && (self.rcv_queue.len() as u32) < self.rcv_wnd {
+        if sn == self.rcv_nxt && (self.rcv_queue.len() as u32) < self.receive_queue_limit() {
             self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
             self.rcv_queue.push_back(newseg);
             self.move_receive_buffer();
@@ -1041,7 +1057,7 @@ impl KCP {
         } else {
             // Duplicate segment storage is no longer needed; return it to the
             // pool while retaining the existing buffered copy.
-            self.pool.release(newseg);
+            self.pool.release_unique(newseg);
         }
 
         // Move available data from rcv_buf → rcv_queue
@@ -1052,7 +1068,7 @@ impl KCP {
     /// Move segments from the receive buffer into the receive queue when
     /// they are in-order and within the receive window.
     fn move_receive_buffer(&mut self) {
-        while (self.rcv_queue.len() as u32) < self.rcv_wnd {
+        while (self.rcv_queue.len() as u32) < self.receive_queue_limit() {
             let in_order = self
                 .rcv_buf
                 .front()
@@ -1087,8 +1103,11 @@ impl KCP {
                 self.rx_rttvar += (delta - self.rx_rttvar) >> 2;
             }
         }
-        let rto = self.rx_srtt as u32 + self.interval.max((self.rx_rttvar as u32) << 2);
-        self.rx_rto = rto.clamp(self.rx_minrto, RTO_MAX);
+        // Extreme (but representable) wire timestamp gaps must saturate the
+        // RTO instead of overflowing before the cap is applied. ACK sampling
+        // remains unchanged, including ACKs that miss snd_buf (Go parity).
+        let rto = self.rx_srtt as u64 + u64::from(self.interval).max((self.rx_rttvar as u64) * 4);
+        self.rx_rto = rto.clamp(u64::from(self.rx_minrto), u64::from(RTO_MAX)) as u32;
     }
 
     // ── Update / flush ────────────────────────────────────────────────────

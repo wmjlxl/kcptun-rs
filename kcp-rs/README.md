@@ -259,7 +259,7 @@ Errors (`kcp_rs::KcpError`): `NoData`, `TooManyFragments`, `InvalidLength`, `Con
 
 ### KcpConfig / KcpMode
 
-`kcp_rs::KcpConfig` is a plain value object (`Default`-constructible); tuning is applied with `KCP::apply` / `KCP::set_*`. `kcp_rs::KcpMode` selects a Go kcptun `--mode` curve:
+`kcp_rs::KcpConfig` is a plain value object (`Default`-constructible), available with default features; tuning is applied with `KCP::apply` / `KCP::set_*`. `kcp_rs::KcpMode` selects a Go kcptun `--mode` curve:
 
 | Mode | nodelay | interval | resend | nc | Typical use |
 |------|---------|----------|--------|----|-------------|
@@ -307,6 +307,7 @@ for r in recovered {
 
 Higher-level helpers:
 
+- `FecEncoder::try_encode` / `try_wrap_kcp_packet` — checked encoding, returning `FecEncodeError` before advancing sequence numbers or partial groups on invalid input. The SIZE field permits at most 65533 bytes of KCP input; transports impose smaller limits. Existing `encode` ignores invalid buffers, while `wrap_kcp_packet` returns an empty packet; `fec_expand_packets` omits these invalid packets.
 - `fec_expand_packets(&mut encoder, &[Bytes], rto_ms)` — expand raw KCP segments into data (+ parity) frames for batching onto the wire.
 - `fec_kcp_from_recovered(&[u8])` — strip the 2-byte SIZE field from a recovered shard (RS padding is trimmed here, matching Go's `r[2:sz]`).
 - Constants: `FEC_HEADER_SIZE` (6), `FEC_TYPE_DATA`, `FEC_TYPE_PARITY`.
@@ -323,7 +324,7 @@ snmp_enable();                  // opt-in: enable hot-path counter updates
 println!("{}", DEFAULT_SNMP);   // Display prints a kcp-go style CSV row
 ```
 
-Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don't need stats.
+Packet and event collection is **opt-in** (`snmp_enable`) so packet hot paths stay gated when stats are unused. Async connection lifecycle maintains `CurrEstab` and the lifetime high-water `MaxConn` independently, including connections opened before collection is enabled. `reset()` clears cumulative counters and preserves these gauges. Do not also call manual `session_opened` / `session_closed` for a `KcpStream`, which already tracks its own lifecycle.
 
 ### KcpStream (async)
 
@@ -334,11 +335,11 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `connect(addr)` | Dial `addr`, binding an ephemeral local UDP socket. Returns a builder. |
 | `with_transport(transport, remote)` | Build over an existing [`PacketTransport`](#packettransport) (e.g. `CryptoTransport`). |
 | `.connect_timeout(Duration)` | Require a first peer response (probe `WINS` / ACK) within the timeout; `build` fails with `TimedOut` otherwise. |
-| `.mtu(v)` / `.sndwnd(v)` / `.rcvwnd(v)` | Size knobs. |
+| `.mtu(v)` / `.sndwnd(v)` / `.rcvwnd(v)` | Size knobs; async MTU must be 50..=2048, matching the receive buffer. Reserve external transport-wrapper overhead within that limit. |
 | `.mode(KcpMode)` / `.set_kcp_nodelay(n, i, r, c)` | Latency curve / raw knobs. |
 | `.stream(bool)` / `.acknodelay(bool)` / `.conv(v)` / `.token(v)` | Protocol knobs. |
 | `.connected(bool)` | `true` when the transport socket is already `connect()`ed (uses `send_batch`); default `true` for `connect`, `false` for `with_transport`. |
-| `.fec(data, parity)` | Enable Reed-Solomon FEC (both `> 0`). |
+| `.fec(data, parity)` | Enable Reed-Solomon FEC when both are positive and their sum is at most 256; enabled FEC requires MTU at least 58. Invalid configurations return `InvalidInput`. Either zero disables FEC. |
 | `.config(KcpConfig)` | Apply a full config value. |
 | `.build().await` | Construct and start the background loops. |
 | `read` / `write_all` / `flush` | Standard async I/O (`knet::AsyncReadExt` / `AsyncWriteExt`). |
@@ -347,7 +348,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `set_nonblocking(bool)` | When `true`, `read` / `write_all` return `WouldBlock` instead of parking. `poll_read` / `poll_write` are unaffected. |
 | `set_read_timeout(Option<Duration>)` / `read_timeout()` | Read deadline (`TimedOut` after it elapses with no data). |
 | `set_write_timeout(Option<Duration>)` / `write_timeout()` | Write deadline when blocked on a full send window. |
-| `shutdown(std::net::Shutdown)` | Half-close: `Write` stops writes + flushes, `Read` surfaces EOF, `Both` = `close()`. |
+| `shutdown(std::net::Shutdown)` | Synchronous half-close: `Write` stops writes and requests flushing, `Read` surfaces EOF, `Both` = `close()`. Use the async trait shutdown to wait for flushing. |
 | `remote_addr()` / `local_addr()` | Peer / local addresses. |
 | `peek(&mut [u8])` | Non-blocking peek at buffered inbound (`WouldBlock` when empty). |
 | `take_error()` | Last background-loop I/O error, clearing it. |
@@ -574,6 +575,14 @@ Read path:   PacketTransport::recv → [FEC decode] → KCP::input → recv_byte
 
 A single `KCP::send` call cannot exceed `255` MSS-sized fragments (`KCP_MAX_FRAG`). Chunk large writes into `≤ (KCP_MAX_FRAG − 1) × MSS` bytes per call (the async `KcpStream` does this internally).
 
+Failed `KCP::send` calls leave the send queue unchanged, including a partial stream tail. In message mode the receiver temporarily allows enough queue slots to complete its head message (`max(configured receive window, head.frg + 1)`, at most 256 for that message). Once consumed, the queue returns to its configured window. The wire format is unchanged; other implementations may require a larger configured receive window for large messages. The advertised remaining remote window is not a negotiated maximum message size.
+
+Shrinking bare `KCP` MTU returns `false` if any unacknowledged queued or in-flight payload would exceed the new MSS. Compatible changes remain allowed; a rejected change preserves the old configuration.
+
+`AsyncWrite::flush` and trait shutdown wait for queued writes to reach the transport, including pending nonblocking send continuations, but do not wait for peer acknowledgments. Transport errors are propagated; a discarded transmit batch latches a flush error for that connection. Synchronous half-close only requests this work. KCP still has no wire FIN, so peer-visible stream termination belongs to the upper protocol.
+
+Listener idle/stale eviction removes matching pending accepts as well as the session, and `remove_peer` also cancels a building generation. Pending accepts and building peers share the admission budget; even with an unlimited live-session configuration, an unattended accept backlog remains bounded. Already accepted connections retain the existing listener-close behavior.
+
 ### Nothing arrives when I `recv()`
 
 KCP only releases data once it is contiguous from `rcv_nxt`. If a segment is missing, `recv()` stays empty until retransmission delivers it. Make sure your event loop calls `update()` on a timer (not just when data arrives) so RTO retransmission can fire, and pass `ack_no_delay = true` to `input()`.
@@ -589,3 +598,23 @@ The default congestion window starts small (slow-start) and `sndwnd`/`rcvwnd` ca
 ### Where is encryption?
 
 Deliberately not in this crate. Crypto lives in `kcrypt-rs`; wrap your datagrams with a `PacketTransport` (e.g. `kcptun_common::CryptoTransport`) beneath `KcpStream`. See [`kcrypt-rs/AGENTS.md`](../kcrypt-rs/AGENTS.md) for its API surface.
+
+### Memory retention and admission bounds
+
+The segment reuse pool keeps up to 8 MiB of payload capacity and 16 KiB per
+buffer, subject to its segment-count limit. It drops unknown shared tails and oversized buffers on return. The internal
+KCP receive path charges a known shared tail at its complete pre-split capacity
+and reclaims it once the returned Bytes is released; buffers still shared at
+acquire are replaced, preserving the returned payload. Active KCP
+queues and allocator-retained pages are outside this pool budget.
+
+FEC decoding uses indexed payload slots and a 256-bit presence bitmap within
+each full sequence-ID group. Completed-group filtering, bounded history,
+sequence wrap and parameter auto-tuning remain part of decoding.
+
+When `WorkerPoolLimits::max_sessions_per_ip` is enabled, admission uses a cached
+count of building and published sessions. New-session rate limiting retains at
+most 4096 IP windows, with at most 32 expired records processed per attempt.
+If all slots are occupied, unknown IPs are refused until capacity becomes
+available; active IP windows are preserved. Existing sessions keep receiving
+data, and `per_ip_session_rate = 0` disables the rate limiter.

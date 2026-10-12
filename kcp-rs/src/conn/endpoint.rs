@@ -46,6 +46,38 @@ impl TxProgress {
     }
 }
 
+/// A drained batch must survive cancellation of an inline writer's future.
+/// This guard is inside SendToken's lifetime, so it publishes its requeue or
+/// failure before the token's Release store advertises an idle sender.
+struct CancelledTxBatch<'a> {
+    shared: &'a SharedIoState,
+    packets: Option<Vec<Bytes>>,
+    progress: TxProgress,
+    used_fec: bool,
+}
+
+impl Drop for CancelledTxBatch<'_> {
+    fn drop(&mut self) {
+        let Some(mut packets) = self.packets.take() else {
+            return; // completed or explicitly handled by the timeout path
+        };
+        if self.used_fec {
+            // The wire expansion may already have advanced the FEC sequence;
+            // the raw packets cannot be expanded again as the same batch.
+            self.shared.note_tx_error(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "FEC wire batch send was cancelled before flush completed",
+            ));
+            self.shared.recycle_raw_packets(packets);
+        } else {
+            let delivered = self.progress.delivered().min(packets.len());
+            let unsent = packets.split_off(delivered);
+            self.shared.recycle_raw_packets(packets);
+            self.shared.requeue_raw_packets_front(unsent);
+        }
+    }
+}
+
 /// A session must have received at least this many in-order segments before a
 /// segment numbered 0 counts as a *new generation* rather than a duplicate of
 /// its own first segment (see the sequence-restart check in
@@ -72,6 +104,13 @@ pub(crate) struct SharedIoState {
     pub(crate) read_notify: Arc<knet::Notify>,
     pub(crate) read_waker: Mutex<Option<Waker>>,
     pub(crate) write_waker: Mutex<Option<Waker>>,
+    /// Flush callers share the sender but each task needs its own wake.
+    pub(crate) flush_waiters: Mutex<Vec<Waker>>,
+    /// A discarded TX batch cannot subsequently be reported as flushed. Keep
+    /// the first failure until the session closes; take_error is independent.
+    pub(crate) tx_failure: Mutex<Option<(io::ErrorKind, String)>>,
+    /// Only successful builds participate in connection statistics.
+    pub(crate) session_tracked: AtomicBool,
     pub(crate) wait_send: Arc<AtomicUsize>,
     pub(crate) snd_wnd: AtomicUsize,
     pub(crate) acknodelay: AtomicBool,
@@ -121,7 +160,7 @@ pub(crate) struct SharedIoState {
     pub(crate) background_input: bool,
     /// Last successful inbound or outbound user-data activity (monotonic ms).
     pub(crate) last_activity_ms: AtomicU64,
-    /// Last **inbound** datagram (never stamped by writes). Used to decide
+    /// Last conv-valid KCP input (never stamped by writes). Used to decide
     /// whether an ICMP-style socket error is real peer loss or a stray error
     /// arriving during an otherwise healthy flow.
     pub(crate) last_rx_ms: AtomicU64,
@@ -204,6 +243,14 @@ impl Drop for SendToken<'_> {
     }
 }
 
+impl Drop for SharedIoState {
+    fn drop(&mut self) {
+        if self.session_tracked.swap(false, Ordering::AcqRel) {
+            crate::snmp::DEFAULT_SNMP.track_session_closed();
+        }
+    }
+}
+
 impl SharedIoState {
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -222,15 +269,56 @@ impl SharedIoState {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            if self.session_tracked.swap(false, Ordering::AcqRel) {
+                crate::snmp::DEFAULT_SNMP.track_session_closed();
+            }
             self.cancel_token.cancel();
             self.flush_notify.notify_one();
             self.write_notify.notify_waiters();
             self.read_notify.notify_waiters();
             self.wake_writer();
+            self.wake_flushers();
             if let Some(w) = self.read_waker.lock().take() {
                 w.wake();
             }
         }
+    }
+
+    pub(crate) fn register_flusher(&self, waker: &Waker) {
+        let mut waiters = self.flush_waiters.lock();
+        if !waiters.iter().any(|old| old.will_wake(waker)) {
+            waiters.push(waker.clone());
+        }
+    }
+
+    pub(crate) fn unregister_flusher(&self, waker: &Waker) {
+        self.flush_waiters
+            .lock()
+            .retain(|old| !old.will_wake(waker));
+    }
+
+    pub(crate) fn wake_flushers(&self) {
+        let waiters = std::mem::take(&mut *self.flush_waiters.lock());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+
+    pub(crate) fn tx_error(&self) -> Option<io::Error> {
+        self.tx_failure
+            .lock()
+            .as_ref()
+            .map(|(kind, message)| io::Error::new(*kind, message.clone()))
+    }
+
+    fn note_tx_error(&self, error: io::Error) {
+        let mut failure = self.tx_failure.lock();
+        if failure.is_none() {
+            *failure = Some((error.kind(), error.to_string()));
+        }
+        drop(failure);
+        self.note_io_error(error);
+        self.wake_flushers();
     }
 
     /// Record a background-loop I/O error. Fatal UDP errors (peer down /
@@ -274,8 +362,8 @@ impl SharedIoState {
             .store(knet::mono_ms(), Ordering::Relaxed);
     }
 
-    /// Stamp the inbound clock (and the shared liveness clock) for a datagram
-    /// received from the peer.
+    /// Stamp the inbound clock and shared liveness clock only after KCP has
+    /// accepted input for this conversation (including successful recovery).
     #[inline]
     pub(crate) fn mark_inbound(&self) {
         let now = knet::mono_ms();
@@ -351,6 +439,7 @@ impl SharedIoState {
     /// those packets wait for the next 10ms KCP timer tick.
     pub(crate) fn finish_sending(&self) {
         self.is_sending.store(false, Ordering::Release);
+        self.wake_flushers();
         if !self.raw_packets.lock().is_empty() {
             self.flush_notify.notify_one();
         }
@@ -479,7 +568,7 @@ impl SharedIoState {
                 true
             }
             Err(e) => {
-                self.note_io_error(e);
+                self.note_tx_error(e);
                 self.recycle_raw_packets(packets);
                 self.finish_sending();
                 true // consumed the burst (error logged); no need to re-notify
@@ -543,7 +632,7 @@ impl SharedIoState {
             match result {
                 Ok(r) => {
                     if let Err(e) = r {
-                        shared.note_io_error(e);
+                        shared.note_tx_error(e);
                     }
                     // fec_wire is a fresh Vec from fec_expand_packets (not
                     // pool-backed); dropping it is the recycle.
@@ -554,6 +643,10 @@ impl SharedIoState {
                     // method docs. Without FEC, requeue only the suffix past
                     // the last confirmed delivery.
                     if used_fec {
+                        shared.note_tx_error(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "FEC wire batch was not fully sent before the TX deadline",
+                        ));
                         shared.recycle_raw_packets(packets);
                     } else {
                         // split_off returns [split..]; the vec keeps the prefix
@@ -789,25 +882,42 @@ impl SharedIoState {
         // async send_batch on WouldBlock, itself capped by TX_FLUSH_TIMEOUT.
         // The timeout cancels that future, so a prefix it delivered before
         // parking never comes back as a count — see `TxProgress`.
-        let progress = TxProgress::new();
-        let flush = self.flush_tx_batch_tracking(&packets, &progress);
-        match knet::timeout(TX_FLUSH_TIMEOUT, flush).await {
+        let mut batch = CancelledTxBatch {
+            shared: self,
+            packets: Some(packets),
+            progress: TxProgress::new(),
+            used_fec,
+        };
+        let flush = self.flush_tx_batch_tracking(
+            batch.packets.as_ref().expect("batch owns its packets"),
+            &batch.progress,
+        );
+        let outcome = knet::timeout(TX_FLUSH_TIMEOUT, flush).await;
+        let packets = batch
+            .packets
+            .take()
+            .expect("completed batch owns its packets");
+        match outcome {
             Ok(Ok(_)) => self.recycle_raw_packets(packets),
             Ok(Err(e)) => {
-                self.note_io_error(e);
+                self.note_tx_error(e);
                 self.recycle_raw_packets(packets);
             }
             Err(_) => {
                 // Timed out inside flush_tx_batch. Token still held by the
                 // caller's SendToken; it drops after we return.
                 if used_fec {
+                    self.note_tx_error(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "FEC wire batch was not fully sent before the TX deadline",
+                    ));
                     self.recycle_raw_packets(packets);
                 } else {
                     // Only the suffix is unsent. `delivered` counts pre-FEC
                     // slots whose datagrams were accepted by try_send or by
                     // send_batch before it parked; requeueing those replays
                     // them onto a path that is already congested.
-                    let delivered = progress.delivered().min(packets.len());
+                    let delivered = batch.progress.delivered().min(packets.len());
                     let mut sent = packets;
                     let unsent = sent.split_off(delivered);
                     self.recycle_raw_packets(sent);
@@ -907,7 +1017,7 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 }
                 knet::RaceOutcome::Second(_) => break, // close() cancelled the recv
             };
-            shared.mark_inbound();
+            shared.mark_activity();
 
             // Collect the full recv burst first, then process all datagrams
             // in one batch: FEC decode outside the KCP lock, one KCP lock for
@@ -922,13 +1032,13 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 // lock; a direct-UDP client gets recvmmsg). Bounded by
                 // MAX_INPUT_BATCH per cycle so a high-rate peer cannot starve
                 // the worker (v3 §5.4). Slots are recycled across cycles.
-                loop {
-                    while burst.len() < burst_len + INPUT_BATCH_GROW {
-                        burst.push(vec![0u8; MAX_DATAGRAM]);
-                    }
+                while burst_len < MAX_INPUT_BATCH && !shared.is_closed() {
                     let pool_end = (burst_len + INPUT_BATCH_GROW).min(MAX_INPUT_BATCH);
                     if pool_end <= burst_len {
                         break; // per-cycle budget reached
+                    }
+                    while burst.len() < pool_end {
+                        burst.push(vec![0u8; MAX_DATAGRAM]);
                     }
                     // Slots were truncated to their received length last
                     // cycle. No need to re-zero: `try_recv_batch` / recvmmsg
@@ -949,7 +1059,7 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 }
             } else {
                 // Fallback: sequential single-packet drain.
-                loop {
+                while burst_len < MAX_INPUT_BATCH && !shared.is_closed() {
                     if burst_len == burst.len() {
                         burst.push(vec![0u8; MAX_DATAGRAM]);
                     } else {
@@ -992,6 +1102,11 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 // maintenance loop. A completed inline ACK-only burst does
                 // not need a redundant task hop.
                 shared.flush_notify.notify_one();
+            }
+            if burst_len >= MAX_INPUT_BATCH {
+                // Ready custom transports do not necessarily spend the
+                // runtime's cooperative budget. Give other sessions a turn.
+                knet::yield_now().await;
             }
         }
     })
@@ -1146,6 +1261,16 @@ pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>
             kcp.needs_update(),
         )
     };
+
+    if had_input {
+        // Only input validated for this conversation confirms that its peer
+        // is alive. Malformed/stale convs and parity without a recovered KCP
+        // packet may count as general activity, but do not refresh rx_age.
+        shared.mark_inbound();
+        // A window update can release KCP's queued data even when it produced
+        // no immediate output. Flush callers may drive TX without a loop.
+        shared.wake_flushers();
+    }
 
     // First conv-valid inbound from the peer (probe WINS / ACK / data) drives
     // the connect-timeout first-packet wait. Notify only on that one-shot

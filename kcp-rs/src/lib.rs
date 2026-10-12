@@ -34,7 +34,6 @@
     clippy::if_same_then_else,
 )]
 
-#[cfg(feature = "async")]
 pub mod config;
 pub mod fec;
 pub mod kcp;
@@ -56,11 +55,10 @@ pub(crate) mod transport;
 #[cfg(test)]
 mod kcp_p999_optimizations_test;
 
-#[cfg(feature = "async")]
 pub use config::{random_conv, KcpConfig, KcpMode, DEFAULT_CONV};
 pub use fec::{
-    fec_expand_packets, fec_kcp_from_recovered, FecDecoder, FecEncoder, FEC_HEADER_SIZE,
-    FEC_TYPE_DATA, FEC_TYPE_PARITY,
+    fec_expand_packets, fec_kcp_from_recovered, FecDecoder, FecEncodeError, FecEncoder,
+    FEC_HEADER_SIZE, FEC_TYPE_DATA, FEC_TYPE_PARITY,
 };
 pub use kcp::KCP;
 pub use segment::SegmentPool;

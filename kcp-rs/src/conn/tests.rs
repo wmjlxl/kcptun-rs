@@ -146,3 +146,73 @@ async fn udp_dial_randomizes_conv_unless_pinned() {
             .conv_explicit
     );
 }
+
+#[tokio::test]
+async fn session_statistics_track_only_successful_build_and_unique_close() {
+    let conn = KcpStream::connect("127.0.0.1:9")
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .build()
+        .await
+        .unwrap();
+    assert!(conn.shared.session_tracked.load(Ordering::Acquire));
+    let observer = conn.clone();
+    let (read, write) = conn.into_split();
+    drop(read);
+    assert!(observer.shared.session_tracked.load(Ordering::Acquire));
+    drop(write);
+    assert!(!observer.shared.session_tracked.load(Ordering::Acquire));
+    observer.close();
+    assert!(!observer.shared.session_tracked.load(Ordering::Acquire));
+
+    let pending = KcpStream::connect("127.0.0.1:9")
+        .connect_timeout(Duration::from_millis(1))
+        .build()
+        .await;
+    assert!(
+        pending.is_err(),
+        "failed builds must never register a session"
+    );
+}
+
+#[tokio::test]
+async fn inbound_clock_requires_valid_current_conv_input() {
+    fn control(conv: u32, command: u8) -> Vec<u8> {
+        let mut packet = vec![0u8; 24];
+        packet[..4].copy_from_slice(&conv.to_le_bytes());
+        packet[4] = command;
+        packet[6..8].copy_from_slice(&128u16.to_le_bytes());
+        packet
+    }
+    let conn = KcpStream::connect("127.0.0.1:9")
+        .conv(42)
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .build()
+        .await
+        .unwrap();
+    let original = conn.shared.last_rx_ms.load(Ordering::Relaxed);
+    knet::sleep_ms(2).await;
+    conn.feed_raw_batch(vec![control(43, 84)]); // valid header, wrong conv
+    assert_eq!(conn.shared.last_rx_ms.load(Ordering::Relaxed), original);
+    conn.feed_raw_batch(vec![control(42, 0)]); // current conv, invalid command
+    assert_eq!(conn.shared.last_rx_ms.load(Ordering::Relaxed), original);
+    conn.feed_raw_batch(vec![control(42, 84)]); // current conv, valid WINS
+    assert!(conn.shared.last_rx_ms.load(Ordering::Relaxed) > original);
+
+    let fec = KcpStream::connect("127.0.0.1:9")
+        .conv(42)
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .fec(2, 1)
+        .build()
+        .await
+        .unwrap();
+    let original = fec.shared.last_rx_ms.load(Ordering::Relaxed);
+    knet::sleep_ms(2).await;
+    let mut parity = vec![0u8; 8];
+    parity[..4].copy_from_slice(&2u32.to_le_bytes());
+    parity[4..6].copy_from_slice(&FEC_TYPE_PARITY.to_le_bytes());
+    fec.feed_raw_batch(vec![parity]); // too few shards to recover any KCP input
+    assert_eq!(fec.shared.last_rx_ms.load(Ordering::Relaxed), original);
+}

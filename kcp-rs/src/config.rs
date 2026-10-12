@@ -1,6 +1,6 @@
 //! KCP configuration: plain data + apply via public set_* on [`KCP`].
 //!
-//! Always available (not gated on async). Async [`crate::conn::KcpStream`] reuses
+//! Always available (not gated on async). Async `KcpStream` reuses
 //! the same types.
 //!
 //! # Design
@@ -138,14 +138,14 @@ impl KCP {
     /// Apply a [`KcpConfig`] by calling public setters only.
     ///
     /// Does not change `conv`/`token` (fixed at [`KCP::new`]). FEC shard fields
-    /// are stored on async [`crate::KcpStream`] builders, not on bare `KCP`.
+    /// are stored on async `KcpStream` builders, not on bare `KCP`.
     ///
     /// Returns `Err` when a setter rejects the value (P1-4 / M-9): `--mtu 40`
     /// used to be silently ignored and the session ran with the default MTU.
     pub fn apply(&mut self, cfg: &KcpConfig) -> Result<(), crate::kcp::KcpError> {
         if !self.set_mtu(cfg.mtu) {
             return Err(crate::kcp::KcpError::InvalidConfig(format!(
-                "mtu {} rejected (must be >= 50 and >= KCP header size)",
+                "mtu {} rejected (must be >= 50 and fit all queued/in-flight payloads)",
                 cfg.mtu
             )));
         }

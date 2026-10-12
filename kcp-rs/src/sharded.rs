@@ -33,9 +33,10 @@
 //! wait cannot stall the others' syscalls.
 
 use rustc_hash::FxHashMap as HashMap;
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,6 +81,9 @@ const DEFAULT_STALE_EVICT_THRESHOLD: u32 = 3;
 const EVICT_MIN_STALE_SPAN_MS: u64 = 1000;
 /// Default per-IP new-session rate (P1-10).
 const DEFAULT_PER_IP_SESSION_RATE: u32 = 20;
+const IP_LIMITER_CAP: usize = 4096;
+const IP_LIMITER_CLEANUP_BUDGET: usize = 32;
+const IP_LIMITER_WINDOW: Duration = Duration::from_secs(1);
 
 /// Default idle-session reap threshold. A KCP session with no inbound datagram
 /// and no successful write for this long is closed and removed.
@@ -138,7 +142,8 @@ pub(crate) fn acquire_buf() -> Option<Vec<u8>> {
 /// Resource limits for [`KcpListener`].
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerPoolLimits {
-    /// Max concurrent sessions (0 = unlimited).
+    /// Max concurrent sessions, including builds and unaccepted connections
+    /// (0 = unlimited sessions, with a 4096-entry accept-backlog limit).
     pub max_sessions_per_worker: usize,
     /// Drop-tail cap on each session's inbound queue (0 = `SESSION_INBOX_CAP`).
     pub worker_channel_cap: usize,
@@ -184,6 +189,14 @@ impl Default for WorkerPoolLimits {
     }
 }
 
+fn accept_backlog_limit(limits: WorkerPoolLimits) -> usize {
+    if limits.max_sessions_per_worker == 0 {
+        DEFAULT_MAX_SESSIONS
+    } else {
+        limits.max_sessions_per_worker
+    }
+}
+
 /// Live snapshot of [`KcpListener`] resource accounting.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WorkerPoolStats {
@@ -223,15 +236,94 @@ struct PendingAccept {
     peer: SocketAddr,
 }
 
-/// `(queue, started, build generation)` for a peer whose session is under
-/// construction.
-type BuildingEntry = (Arc<PeerQueue>, Instant, u64);
+/// The caller holds `sessions` before `pending` whenever both are needed.
+/// Detach owners while locked, but close/drop them after releasing the locks.
+fn take_pending_matching(
+    pending: &mut VecDeque<PendingAccept>,
+    mut matches: impl FnMut(&PendingAccept) -> bool,
+) -> Vec<PendingAccept> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let mut kept = VecDeque::with_capacity(pending.len());
+    let mut removed = Vec::new();
+    for entry in pending.drain(..) {
+        if matches(&entry) {
+            removed.push(entry);
+        } else {
+            kept.push_back(entry);
+        }
+    }
+    *pending = kept;
+    removed
+}
+
+fn close_pending(pending: Vec<PendingAccept>) {
+    for mut entry in pending {
+        entry.conn.attach_owner();
+        entry.conn.close();
+    }
+}
+
+type WatchedSession = (SocketAddr, KcpStream, u64);
+
+type IpSessionCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+fn session_count_for_ip(counts: &IpSessionCounts, ip: IpAddr) -> usize {
+    counts.lock().get(&ip).copied().unwrap_or(0)
+}
+
+/// Only the bookkeeping entry owns a reservation. Build tasks and stream
+/// clones never own it, so a timed-out build cannot release a replacement's
+/// slot when its result arrives late.
+struct IpSessionReservation {
+    counts: IpSessionCounts,
+    ip: IpAddr,
+}
+
+impl IpSessionReservation {
+    fn try_acquire(counts: &IpSessionCounts, ip: IpAddr, limit: usize) -> Option<Self> {
+        let mut map = counts.lock();
+        let count = map.get(&ip).copied().unwrap_or(0);
+        if limit > 0 && count >= limit {
+            return None;
+        }
+        map.insert(ip, count.checked_add(1)?);
+        Some(Self {
+            counts: counts.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpSessionReservation {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock();
+        if let Some(count) = map.get_mut(&self.ip) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                map.remove(&self.ip);
+            }
+        } else {
+            debug_assert!(false, "missing per-IP session reservation");
+        }
+    }
+}
+
+struct BuildingEntry {
+    queue: Arc<PeerQueue>,
+    started: Instant,
+    generation: u64,
+    ip_reservation: Option<IpSessionReservation>,
+}
 
 /// One accepted peer. The build queue is not held here: the session's
 /// transport owns it (and drains it during the building window), so the map
 /// entry needs only the connection handle.
 struct Session {
     conn: KcpStream,
+    _ip_reservation: Option<IpSessionReservation>,
 }
 
 /// KCP listener over one shared UDP socket.
@@ -284,32 +376,30 @@ impl KcpListener {
     /// exits. A not-yet-accepted build for the same peer is dropped too, so
     /// [`accept`](Self::accept) cannot hand out a connection this call just
     /// tore down.
+    /// Returns `true` if a live session, build, or backlog entry was removed.
     pub fn remove_peer(&self, peer: SocketAddr) -> bool {
-        let stale: Vec<PendingAccept> = {
+        // Publish takes this same lock order. Removing the build generation
+        // and its published state together prevents a late build from adding
+        // a backlog entry after this call returned.
+        let (building, session, stale) = {
+            let mut building = self.building.lock();
+            let mut sessions = self.sessions.lock();
             let mut pending = self.pending.lock();
-            let mut kept = VecDeque::new();
-            let mut stale = Vec::new();
-            for p in pending.drain(..) {
-                if p.peer == peer {
-                    stale.push(p);
-                } else {
-                    kept.push_back(p);
-                }
-            }
-            *pending = kept;
-            stale
+            (
+                building.remove(&peer),
+                sessions.remove(&peer),
+                take_pending_matching(&mut pending, |p| p.peer == peer),
+            )
         };
-        for mut p in stale {
-            p.conn.attach_owner();
-            p.conn.close();
+        let removed = building.is_some() || session.is_some() || !stale.is_empty();
+        if let Some(build) = building {
+            build.queue.mark_closed();
         }
-        let removed = self.sessions.lock().remove(&peer);
-        if let Some(session) = removed {
+        if let Some(session) = session {
             session.conn.close();
-            true
-        } else {
-            false
         }
+        close_pending(stale);
+        removed
     }
 
     /// Current number of known peer sessions.
@@ -329,34 +419,12 @@ impl KcpListener {
     /// Accept the next client connection.
     pub async fn accept(&self) -> io::Result<(KcpStream, SocketAddr)> {
         loop {
-            if self.closed.load(Ordering::Acquire) {
-                self.discard_pending();
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "KcpListener closed",
-                ));
-            }
-            if let Some(mut v) = self.pending.lock().pop_front() {
-                v.conn.attach_owner();
-                return Ok((v.conn, v.peer));
-            }
-            if self.closed.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "KcpListener closed",
-                ));
+            if let Some(accepted) = self.try_accept()? {
+                return Ok(accepted);
             }
             let notified = self.accept_notify.notified();
-            if self.closed.load(Ordering::Acquire) {
-                self.discard_pending();
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "KcpListener closed",
-                ));
-            }
-            if let Some(mut v) = self.pending.lock().pop_front() {
-                v.conn.attach_owner();
-                return Ok((v.conn, v.peer));
+            if let Some(accepted) = self.try_accept()? {
+                return Ok(accepted);
             }
             notified.await;
         }
@@ -378,11 +446,37 @@ impl KcpListener {
                 "KcpListener closed",
             ));
         }
-        if let Some(mut v) = self.pending.lock().pop_front() {
-            v.conn.attach_owner();
-            return Ok(Some((v.conn, v.peer)));
+        let (accepted, stale) = {
+            let mut sessions = self.sessions.lock();
+            let mut pending = self.pending.lock();
+            let mut accepted = None;
+            let mut stale = Vec::new();
+            while !self.closed.load(Ordering::Acquire) {
+                let Some(mut entry) = pending.pop_front() else {
+                    break;
+                };
+                let same_session = sessions
+                    .get(&entry.peer)
+                    .map(|s| s.conn.same_connection(&entry.conn))
+                    .unwrap_or(false);
+                if same_session && !entry.conn.is_closed() && !entry.conn.is_dead() {
+                    entry.conn.attach_owner();
+                    accepted = Some((entry.conn, entry.peer));
+                    break;
+                }
+                if same_session {
+                    sessions.remove(&entry.peer);
+                }
+                stale.push(entry);
+            }
+            (accepted, stale)
+        };
+        close_pending(stale);
+        if accepted.is_some() {
+            return Ok(accepted);
         }
         if self.closed.load(Ordering::Acquire) {
+            self.discard_pending();
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "KcpListener closed",
@@ -419,27 +513,27 @@ impl KcpListener {
     /// Close every connection waiting to be accepted. Called once `closed` is
     /// set, so a build that finished in the meantime is not handed out.
     fn discard_pending(&self) {
-        // The lock is released before the session map is touched. The build
-        // path takes the map first and this queue second, so holding both here
-        // would deadlock against it.
-        let queued: Vec<PendingAccept> = self.pending.lock().drain(..).collect();
-        for mut pending in queued {
-            // The backlog holds the owner clone; closing it tears the session
-            // down instead of leaving the flush loop running.
-            pending.conn.attach_owner();
-            pending.conn.close();
-            // Drop the map entry only when it is *this* connection. A stale
-            // backlog row for a re-dialed peer must not evict the live
-            // replacement that already took its place.
+        let (queued, builds) = {
+            let mut building = self.building.lock();
             let mut sessions = self.sessions.lock();
-            if sessions
-                .get(&pending.peer)
-                .map(|s| s.conn.is_closed())
-                .unwrap_or(false)
-            {
-                sessions.remove(&pending.peer);
+            let mut pending = self.pending.lock();
+            let queued: Vec<PendingAccept> = pending.drain(..).collect();
+            for entry in &queued {
+                if sessions
+                    .get(&entry.peer)
+                    .map(|s| s.conn.same_connection(&entry.conn))
+                    .unwrap_or(false)
+                {
+                    sessions.remove(&entry.peer);
+                }
             }
+            let builds: Vec<BuildingEntry> = building.drain().map(|(_, entry)| entry).collect();
+            (queued, builds)
+        };
+        for build in builds {
+            build.queue.mark_closed();
         }
+        close_pending(queued);
     }
 
     /// Live resource-accounting snapshot.
@@ -511,6 +605,7 @@ impl KcpListenerBuilder {
     /// The receive task and every accepted session's tasks run on the caller's
     /// runtime. The listener creates none of its own.
     pub async fn build(self) -> io::Result<KcpListener> {
+        crate::conn::validate_async_config(&self.config)?;
         if let Some(e) = self.resolve_err {
             return Err(e);
         }
@@ -554,7 +649,8 @@ impl KcpListenerBuilder {
             config: self.config,
             transport_wrapper: self.transport_wrapper,
             limits,
-            ip_limiter: Arc::new(Mutex::new(HashMap::default())),
+            ip_limiter: Arc::new(Mutex::new(IpRateLimiter::default())),
+            ip_counts: Arc::new(Mutex::new(HashMap::default())),
             testing_build_delay: self.testing_build_delay,
         });
 
@@ -627,7 +723,7 @@ struct RxArgs {
     sessions: Arc<Mutex<HashMap<SocketAddr, Session>>>,
     /// Peers whose session is being built. Datagrams that arrive in that window
     /// go to the queue the build owns, instead of opening a second session.
-    /// The `u64` is the build's generation: a build that outlives its
+    /// Each entry records its generation: a build that outlives its
     /// `building_timeout` is forgotten, and only the build that still owns the
     /// slot may publish the session (so a slow build cannot overwrite a
     /// replacement that already took its place).
@@ -645,7 +741,9 @@ struct RxArgs {
     transport_wrapper: Option<TransportWrapper>,
     limits: WorkerPoolLimits,
     /// Per-IP new-session rate limiter (P1-10).
-    ip_limiter: Arc<Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>>,
+    ip_limiter: Arc<Mutex<IpRateLimiter>>,
+    /// Reserved building + published slots. Disabled caps do not add entries.
+    ip_counts: IpSessionCounts,
     /// Test hook: hold a finished build before publishing. See
     /// [`KcpListenerBuilder::testing_build_delay`].
     testing_build_delay: Duration,
@@ -654,31 +752,69 @@ struct RxArgs {
 /// P1-10: admit at most `rate` new sessions per second from one IP.
 /// Returns `false` when the peer is over budget. Only *new* sessions are
 /// limited — established ones keep full throughput.
-fn allow_new_session(
-    limiter: &Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>,
-    ip: std::net::IpAddr,
-    rate: u32,
-) -> bool {
+fn allow_new_session(limiter: &Mutex<IpRateLimiter>, ip: IpAddr, rate: u32) -> bool {
     if rate == 0 {
         return true;
     }
-    let mut map = limiter.lock();
-    // Opportunistic sweep so a spoofed-source flood cannot grow the map
-    // without bound.
-    if map.len() > 4096 {
-        let now = Instant::now();
-        map.retain(|_, (win, _)| now.duration_since(*win) < Duration::from_secs(1));
+    limiter.lock().allow(ip, rate, Instant::now())
+}
+
+#[derive(Default)]
+struct IpRateLimiter {
+    entries: HashMap<IpAddr, (Instant, u32)>,
+    /// One deadline record per admitted window; refreshed entries may leave
+    /// an older record until budgeted cleanup reaches it.
+    expiry: BinaryHeap<Reverse<(Instant, IpAddr)>>,
+}
+
+impl IpRateLimiter {
+    /// At most `budget` heap records, never a retain scan over fresh entries.
+    fn expire(&mut self, now: Instant, budget: usize) -> usize {
+        let mut removed = 0;
+        while removed < budget {
+            let Some(&Reverse((window, ip))) = self.expiry.peek() else {
+                break;
+            };
+            if now.saturating_duration_since(window) < IP_LIMITER_WINDOW {
+                break;
+            }
+            self.expiry.pop();
+            if self.entries.get(&ip).map(|entry| entry.0) == Some(window) {
+                self.entries.remove(&ip);
+            }
+            removed += 1;
+        }
+        removed
     }
-    let now = Instant::now();
-    let entry = map.entry(ip).or_insert((now, 0));
-    if now.duration_since(entry.0) >= Duration::from_secs(1) {
-        *entry = (now, 0);
+
+    fn allow(&mut self, ip: IpAddr, rate: u32, now: Instant) -> bool {
+        if rate == 0 {
+            return true;
+        }
+        self.expire(now, IP_LIMITER_CLEANUP_BUDGET);
+        if let Some(entry) = self.entries.get_mut(&ip) {
+            if now.saturating_duration_since(entry.0) >= IP_LIMITER_WINDOW {
+                *entry = (now, 0);
+                self.expiry.push(Reverse((now, ip)));
+            }
+            if entry.1 >= rate {
+                return false;
+            }
+            entry.1 += 1;
+        } else {
+            // Do not evict an active IP to admit another: that would reset
+            // its rate budget under a high-cardinality source flood.
+            if self.entries.len() >= IP_LIMITER_CAP {
+                return false;
+            }
+            self.entries.insert(ip, (now, 1));
+            self.expiry.push(Reverse((now, ip)));
+        }
+        // An expired refresh always pops at least one due heap record first,
+        // so the expiry index is bounded as well as the live table.
+        debug_assert!(self.expiry.len() <= IP_LIMITER_CAP);
+        true
     }
-    if entry.1 >= rate {
-        return false;
-    }
-    entry.1 += 1;
-    true
 }
 
 fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
@@ -697,7 +833,7 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
         // BufPool after `take` hands the buffer to `burst` — a fresh
         // `vec![0; MAX_DATAGRAM]` would malloc 2KB on every quiet wakeup.
         let mut slot = acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
-        let mut watched: Vec<(SocketAddr, u64)> = Vec::new();
+        let mut watched: Vec<WatchedSession> = Vec::new();
         // Reused across bursts: the datagram buffers themselves move into
         // queues / KCP, so only the index vectors are cleared.
         let mut burst: Vec<(SocketAddr, Vec<u8>)> = Vec::with_capacity(64);
@@ -881,7 +1017,7 @@ fn process_burst(
     groups: &mut Vec<(SocketAddr, Vec<Vec<u8>>)>,
     group_index: &mut HashMap<SocketAddr, usize>,
     inbox_cap: usize,
-    watched: &mut Vec<(SocketAddr, u64)>,
+    watched: &mut Vec<WatchedSession>,
 ) {
     for (peer, buf) in burst.drain(..) {
         match group_index.get(&peer) {
@@ -918,7 +1054,7 @@ fn push_to_building(
     // None => the burst was consumed by an in-flight build's queue;
     // Some => no build owns this peer, continue with the established lookup.
     let queue = match args.building.lock().get(&peer) {
-        Some((q, _, _)) => q.clone(),
+        Some(build) => build.queue.clone(),
         None => return Some(datagrams),
     };
     for buf in datagrams {
@@ -933,12 +1069,23 @@ fn push_to_building(
 /// outside the guard: holding the map across it stalls every other peer's
 /// deliver.
 fn lookup_established(args: &RxArgs, peer: SocketAddr) -> Established {
-    let mut sessions = args.sessions.lock();
-    match sessions.get(&peer) {
-        Some(s) if !s.conn.is_closed() && !s.conn.is_dead() => Established::Live(s.conn.clone()),
-        Some(_) => Established::Reaped(sessions.remove(&peer).unwrap().conn),
-        None => Established::None,
-    }
+    let (removed, stale) = {
+        let mut sessions = args.sessions.lock();
+        match sessions.get(&peer) {
+            Some(s) if !s.conn.is_closed() && !s.conn.is_dead() => {
+                return Established::Live(s.conn.clone());
+            }
+            None => return Established::None,
+            Some(_) => {}
+        }
+        let removed = sessions.remove(&peer).unwrap().conn;
+        let stale = take_pending_matching(&mut args.pending.lock(), |p| {
+            p.peer == peer && p.conn.same_connection(&removed)
+        });
+        (removed, stale)
+    };
+    close_pending(stale);
+    Established::Reaped(removed)
 }
 
 /// Phase 3: admission is decided before any state is allocated. In-flight
@@ -953,9 +1100,12 @@ fn admit_new_session(args: &RxArgs, peer: SocketAddr) -> bool {
     {
         let building = args.building.lock();
         let sessions = args.sessions.lock();
-        if args.limits.max_sessions_per_worker > 0
-            && sessions.len() + building.len() >= args.limits.max_sessions_per_worker
+        let pending = args.pending.lock();
+        if (args.limits.max_sessions_per_worker > 0
+            && sessions.len() + building.len() >= args.limits.max_sessions_per_worker)
+            || pending.len() + building.len() >= accept_backlog_limit(args.limits)
         {
+            drop(pending);
             drop(sessions);
             drop(building);
             args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
@@ -974,27 +1124,15 @@ fn admit_new_session(args: &RxArgs, peer: SocketAddr) -> bool {
     // Opt-in per-IP cap on pinned session state. The rate limit above does
     // not bound how many sessions one address can *hold*, so a slow-and-steady
     // client can still pin the whole `max_sessions_per_worker` budget by
-    // varying source ports. Counted at admission only.
+    // varying source ports. The register phase reserves the slot atomically;
+    // this inexpensive first check avoids doing integrity work for a full IP.
     if args.limits.max_sessions_per_ip > 0 {
-        let building_for_ip = args
-            .building
-            .lock()
-            .iter()
-            .filter(|(k, _)| k.ip() == peer.ip())
-            .count();
-        let sessions_for_ip = args
-            .sessions
-            .lock()
-            .iter()
-            .filter(|(k, _)| k.ip() == peer.ip())
-            .count();
-        if building_for_ip + sessions_for_ip >= args.limits.max_sessions_per_ip {
+        let count = session_count_for_ip(&args.ip_counts, peer.ip());
+        if count >= args.limits.max_sessions_per_ip {
             args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
             log::debug!(
-                "listener: per-IP concurrent session cap hit for {} ({}+{})",
+                "listener: per-IP concurrent session cap hit for {} ({count})",
                 peer.ip(),
-                building_for_ip,
-                sessions_for_ip
             );
             return false;
         }
@@ -1059,16 +1197,56 @@ fn register_and_spawn_build(
         // across the whole admission path, not just at its entry.
         let mut b = args.building.lock();
         let sessions = args.sessions.lock();
-        if args.limits.max_sessions_per_worker > 0
-            && sessions.len() + b.len() >= args.limits.max_sessions_per_worker
+        let pending = args.pending.lock();
+        if args.closed.load(Ordering::Acquire) {
+            drop(pending);
+            drop(sessions);
+            drop(b);
+            recycle_all(datagrams);
+            return;
+        }
+        if (args.limits.max_sessions_per_worker > 0
+            && sessions.len() + b.len() >= args.limits.max_sessions_per_worker)
+            || pending.len() + b.len() >= accept_backlog_limit(args.limits)
         {
+            drop(pending);
             drop(sessions);
             drop(b);
             args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
             recycle_all(datagrams);
             return;
         }
-        b.insert(peer, (queue.clone(), Instant::now(), gen));
+        // The integrity gate may have taken time. Recheck + reserve while
+        // holding lifecycle locks; no publish/remove can change this budget
+        // between the reservation and insertion.
+        let ip_reservation = if args.limits.max_sessions_per_ip > 0 {
+            match IpSessionReservation::try_acquire(
+                &args.ip_counts,
+                peer.ip(),
+                args.limits.max_sessions_per_ip,
+            ) {
+                Some(reservation) => Some(reservation),
+                None => {
+                    drop(pending);
+                    drop(sessions);
+                    drop(b);
+                    args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
+                    recycle_all(datagrams);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        b.insert(
+            peer,
+            BuildingEntry {
+                queue: queue.clone(),
+                started: Instant::now(),
+                generation: gen,
+                ip_reservation,
+            },
+        );
     }
     for buf in datagrams {
         if !queue.push(buf, inbox_cap) {
@@ -1096,6 +1274,10 @@ fn spawn_build_task(
     let config = args.config.clone();
     let testing_build_delay = args.testing_build_delay;
     let max_sessions = args.limits.max_sessions_per_worker;
+    // Even callers opting out of the live-session cap cannot retain an
+    // unlimited accept backlog. With a live cap, every waiting connection is
+    // also represented in `sessions`, and consumes that same admission slot.
+    let max_pending = accept_backlog_limit(args.limits);
     let queue = queue.clone();
     knet::spawn_task(async move {
         let conn = match KcpStream::with_transport(transport, peer)
@@ -1116,7 +1298,7 @@ fn spawn_build_task(
             Err(_) => {
                 stats.build_failures.fetch_add(1, Ordering::Relaxed);
                 let mut b = building.lock();
-                if matches!(b.get(&peer), Some((_, _, g)) if *g == gen) {
+                if matches!(b.get(&peer), Some(build) if build.generation == gen) {
                     b.remove(&peer);
                 }
                 return;
@@ -1132,21 +1314,31 @@ fn spawn_build_task(
         // this session.
         {
             let mut b = building.lock();
-            if !matches!(b.get(&peer), Some((_, _, g)) if *g == gen) {
+            if !matches!(b.get(&peer), Some(build) if build.generation == gen) {
                 drop(b);
                 conn.close();
                 return;
             }
-            b.remove(&peer);
+            let entry = b.remove(&peer).unwrap();
             // Final cap check before publish. Several builds that passed
             // admission together can all finish at once; without this the
             // published map would overshoot `max_sessions_per_worker`.
             let mut live = sessions.lock();
-            if max_sessions > 0 && live.len() >= max_sessions {
+            let mut waiting = pending.lock();
+            if closed.load(Ordering::Acquire) || conn.is_closed() || conn.is_dead() {
+                drop(waiting);
+                drop(live);
+                drop(b);
+                conn.close();
+                queue.mark_closed();
+                return;
+            }
+            if (max_sessions > 0 && live.len() >= max_sessions) || waiting.len() >= max_pending {
+                drop(waiting);
                 drop(live);
                 drop(b);
                 log::warn!(
-                    "kcp-rs: dropping built session for {peer}: max_sessions_per_worker ({max_sessions}) reached before publish"
+                    "kcp-rs: dropping built session for {peer}: session or accept-backlog limit reached before publish"
                 );
                 conn.close();
                 // The build's queue still holds the handshake datagrams and
@@ -1156,22 +1348,16 @@ fn spawn_build_task(
                 stats.session_drops.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            live.insert(peer, Session { conn: conn.clone() });
-            drop(live);
-            // close() drains `pending` and then sets nothing else, so a publish
-            // that loses the race removes the session it just inserted. The
-            // accept queue is taken after `sessions`: `discard_pending` drops
-            // `pending` before touching the map, so the two locks are never
-            // held together in opposite orders.
-            let mut waiting = pending.lock();
-            if closed.load(Ordering::Acquire) {
-                drop(waiting);
-                drop(b);
-                if let Some(session) = sessions.lock().remove(&peer) {
-                    session.conn.close();
-                }
-                return;
-            }
+            // All lifecycle mutations use building → sessions → pending.
+            // remove_peer cannot slip between insertion and publication, and
+            // close discards this exact connection if its flag changes here.
+            live.insert(
+                peer,
+                Session {
+                    conn: conn.clone(),
+                    _ip_reservation: entry.ip_reservation,
+                },
+            );
             waiting.push_back(PendingAccept { conn, peer });
         }
         accept_notify.notify_one();
@@ -1189,7 +1375,7 @@ fn deliver_group(
     peer: SocketAddr,
     datagrams: Vec<Vec<u8>>,
     inbox_cap: usize,
-    watched: &mut Vec<(SocketAddr, u64)>,
+    watched: &mut Vec<WatchedSession>,
 ) {
     let Some(datagrams) = push_to_building(args, peer, datagrams, inbox_cap) else {
         return;
@@ -1208,7 +1394,7 @@ fn deliver_group(
             // previous generation only when every datagram in it mismatched.
             let before = conn.stale_burst_count();
             conn.feed_raw_batch(datagrams);
-            watched.push((peer, before));
+            watched.push((peer, conn, before));
             return;
         }
         Established::Reaped(conn) => {
@@ -1256,21 +1442,18 @@ fn deliver_group(
 /// with `una=0`, and if that retransmit is the only unacked datagram the
 /// whole burst looks stale. Requiring N consecutive all-stale bursts (any
 /// live burst resets the streak) is what separates that from a real re-dial.
-fn evict_stale(args: &RxArgs, watched: &mut Vec<(SocketAddr, u64)>) {
+fn evict_stale(args: &RxArgs, watched: &mut Vec<WatchedSession>) {
     let observed = std::mem::take(watched);
-    let mut seen: HashMap<SocketAddr, u64> = HashMap::default();
-    for (peer, before) in observed {
-        let entry = seen.entry(peer).or_insert(u64::MAX);
-        *entry = (*entry).min(before);
-    }
     let threshold = args.limits.stale_evict_threshold.max(1);
-    for (peer, before) in seen {
-        let removed = {
+    for (peer, observed_conn, before) in observed {
+        let (removed, stale) = {
             let mut sessions = args.sessions.lock();
             let Some(session) = sessions.get(&peer) else {
                 continue;
             };
-            if session.conn.stale_burst_count() <= before {
+            if !session.conn.same_connection(&observed_conn)
+                || session.conn.stale_burst_count() <= before
+            {
                 continue;
             }
             // A single all-stale burst can be an ACK-blackhole RTO of sn=0.
@@ -1286,14 +1469,17 @@ fn evict_stale(args: &RxArgs, watched: &mut Vec<(SocketAddr, u64)>) {
             {
                 continue;
             }
-            sessions.remove(&peer)
+            let removed = sessions.remove(&peer).unwrap();
+            let stale = take_pending_matching(&mut args.pending.lock(), |p| {
+                p.peer == peer && p.conn.same_connection(&removed.conn)
+            });
+            (removed, stale)
         };
-        if let Some(session) = removed {
-            log::warn!(
-                "listener: evicting stale session for {peer}: the peer re-dialed on the same address"
-            );
-            session.conn.close();
-        }
+        log::warn!(
+            "listener: evicting stale session for {peer}: the peer re-dialed on the same address"
+        );
+        removed.conn.close();
+        close_pending(stale);
     }
 }
 
@@ -1328,6 +1514,11 @@ fn decrypt_batch_in_place(
 /// the map holds a non-owning clone, so a bare `remove` leaves the flush loop
 /// running.
 fn sweep(args: &RxArgs) {
+    // On a silent listener the existing sweep timer also bounds stale limiter
+    // storage lifetime: at most ceil(4096 / 32) sweep intervals after expiry.
+    args.ip_limiter
+        .lock()
+        .expire(Instant::now(), IP_LIMITER_CLEANUP_BUDGET);
     // Scan the whole map. The lock is only held to clone the session handles;
     // `is_dead()` runs after it is dropped. Capping the scan (the old 4096)
     // starved anything past that prefix: `HashMap` iteration order is bucket
@@ -1344,12 +1535,12 @@ fn sweep(args: &RxArgs) {
             let mut building = args.building.lock();
             let expired: Vec<SocketAddr> = building
                 .iter()
-                .filter(|(_, (_, started, _))| started.elapsed() >= args.limits.building_timeout)
+                .filter(|(_, build)| build.started.elapsed() >= args.limits.building_timeout)
                 .map(|(peer, _)| *peer)
                 .collect();
             expired
                 .iter()
-                .filter_map(|peer| building.remove(peer).map(|(queue, _, _)| queue))
+                .filter_map(|peer| building.remove(peer).map(|build| build.queue))
                 .collect()
         };
         for queue in abandoned {
@@ -1361,26 +1552,43 @@ fn sweep(args: &RxArgs) {
     }
     let now = knet::mono_ms();
     let idle_ms = args.limits.idle_timeout.as_millis() as u64;
-    let mut dead: Vec<SocketAddr> = Vec::new();
-    let mut idle = 0u64;
+    let mut dead: Vec<(SocketAddr, KcpStream, bool)> = Vec::new();
     for (peer, conn) in candidates {
         if conn.is_dead() || conn.is_closed() {
-            dead.push(peer);
+            dead.push((peer, conn, false));
         } else if idle_ms > 0 && now.saturating_sub(conn.last_activity_ms()) >= idle_ms {
-            dead.push(peer);
-            idle += 1;
+            dead.push((peer, conn, true));
         }
     }
     if dead.is_empty() {
         return;
     }
-    let evicted: Vec<Session> = {
+    let (evicted, stale, idle) = {
         let mut sessions = args.sessions.lock();
-        dead.iter().filter_map(|p| sessions.remove(p)).collect()
+        let mut evicted = HashMap::default();
+        let mut idle = 0u64;
+        for (peer, observed_conn, was_idle) in dead {
+            if sessions
+                .get(&peer)
+                .map(|s| s.conn.same_connection(&observed_conn))
+                .unwrap_or(false)
+            {
+                evicted.insert(peer, sessions.remove(&peer).unwrap());
+                idle += u64::from(was_idle);
+            }
+        }
+        let stale = take_pending_matching(&mut args.pending.lock(), |p| {
+            evicted
+                .get(&p.peer)
+                .map(|s| s.conn.same_connection(&p.conn))
+                .unwrap_or(false)
+        });
+        (evicted, stale, idle)
     };
-    for session in evicted {
+    for (_, session) in evicted {
         session.conn.close();
     }
+    close_pending(stale);
     if idle > 0 {
         args.stats.idle_reaps.fetch_add(idle, Ordering::Relaxed);
     }
@@ -1399,7 +1607,7 @@ mod tests {
     /// second; other IPs are unaffected.
     #[test]
     fn per_ip_session_rate_limits_one_host() {
-        let limiter = Mutex::new(HashMap::default());
+        let limiter = Mutex::new(IpRateLimiter::default());
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let other: IpAddr = "10.0.0.2".parse().unwrap();
         let rate = 5;
@@ -1420,3 +1628,7 @@ mod tests {
         assert!(allow_new_session(&limiter, ip, 0));
     }
 }
+
+#[cfg(test)]
+#[path = "sharded/optimization_tests.rs"]
+mod optimization_tests;

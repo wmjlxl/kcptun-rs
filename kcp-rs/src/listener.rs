@@ -124,6 +124,7 @@ impl KcpTcpListenerBuilder {
 
     /// Bind the raw-TCP listener and return it.
     pub fn build(self) -> io::Result<KcpTcpListener> {
+        crate::conn::validate_async_config(&self.config)?;
         if let Some(e) = self.resolve_err {
             return Err(e);
         }

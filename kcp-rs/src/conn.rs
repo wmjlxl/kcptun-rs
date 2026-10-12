@@ -47,6 +47,37 @@ use crate::segment::KCP_MAX_FRAG;
 use crate::transport::{PacketTransport, MAX_DATAGRAM};
 use knet::CancellationToken;
 
+/// The built-in receive paths use fixed-size datagram buffers. Validate the
+/// session's plaintext packet budget before opening a transport or spawning
+/// tasks. Transport wrappers must also reserve their own outer wire overhead.
+pub(crate) fn validate_async_config(config: &KcpConfig) -> io::Result<()> {
+    if !(50..=MAX_DATAGRAM as u32).contains(&config.mtu) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("KcpStream mtu must be between 50 and {MAX_DATAGRAM}"),
+        ));
+    }
+    if config.datashard > 0 && config.parityshard > 0 {
+        if config
+            .datashard
+            .checked_add(config.parityshard)
+            .is_none_or(|total| total > 256)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FEC data + parity shards must not exceed 256",
+            ));
+        }
+        if config.mtu < 50 + FEC_HEADER_SIZE_PLUS_2 as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FEC mtu must leave at least 50 bytes for KCP after its 8-byte header",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// FEC header + SIZE field (`fecHeaderSizePlus2` in Go).
 const FEC_HDR: usize = FEC_HEADER_SIZE_PLUS_2;
 
@@ -622,6 +653,10 @@ impl KcpStream {
         self.shared.is_closed()
     }
 
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     /// Mark this `KcpStream` as the connection owner: its `Drop` will call
     /// `close()` when it is dropped. Used by `ShardedKcpListener::accept` to
     /// ensure the caller-owned stream tears down the session on drop, rather
@@ -1165,6 +1200,7 @@ impl KcpStreamBuilder {
 
     /// Construct the connection and start background input/flush loops.
     pub async fn build(self) -> io::Result<KcpStream> {
+        validate_async_config(&self.config)?;
         if let Some(e) = self.resolve_err {
             return Err(e);
         }
@@ -1272,6 +1308,9 @@ impl KcpStreamBuilder {
             read_notify: Arc::new(knet::Notify::new()),
             read_waker: Mutex::new(None),
             write_waker: Mutex::new(None),
+            flush_waiters: Mutex::new(Vec::new()),
+            tx_failure: Mutex::new(None),
+            session_tracked: AtomicBool::new(false),
             wait_send: Arc::new(AtomicUsize::new(0)),
             snd_wnd: AtomicUsize::new(effective_snd_wnd),
             acknodelay: AtomicBool::new(config.acknodelay),
@@ -1382,6 +1421,14 @@ impl KcpStreamBuilder {
             }
         }
 
+        crate::snmp::DEFAULT_SNMP.track_session_opened(!self.adopt_conv);
+        shared.session_tracked.store(true, Ordering::Release);
+        // A background task may have closed while build was completing. The
+        // flag and this second check pair with close's swap without counting a
+        // failed build or decrementing a cloned/split handle twice.
+        if shared.is_closed() && shared.session_tracked.swap(false, Ordering::AcqRel) {
+            crate::snmp::DEFAULT_SNMP.track_session_closed();
+        }
         Ok(conn)
     }
 }

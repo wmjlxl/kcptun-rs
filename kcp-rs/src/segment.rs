@@ -229,9 +229,25 @@ impl fmt::Debug for Segment {
 
 // ─── Segment Pool ─────────────────────────────────────────────────────────────
 
+// Preserve all 4096 default-MTU buffers in KCP's pool (about 5.5 MiB), while
+// limiting the idle cost of a large-window / jumbo-MTU burst. These bounds
+// cover full backing capacity, including known KCP receive tails whose Bytes
+// payload may still be live. Unknown shared views use the conservative public
+// release path so a small view cannot hide a much larger allocation.
+const POOL_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const POOL_MAX_BUFFER_CAPACITY: usize = 16 * 1024;
+
+struct PooledEntry {
+    segment: Segment,
+    charged_capacity: usize,
+    // Only recv_bytes can create this entry, recording the exclusively owned
+    // buffer's capacity before splitting off the returned Bytes payload.
+    pending_tail: bool,
+}
+
 /// A pool of [`Segment`] instances.
 ///
-/// Backed by a simple `Vec<Segment>` stack.  KCP is always behind a
+/// Backed by a simple stack. KCP is always behind a
 /// `Mutex<KCP>`, so pool access is serialized — no need for lock-free
 /// atomics (the previous `crossbeam::SegQueue` used CAS per acquire/release,
 /// adding ~10-20ns of atomic overhead per segment on the hot path).
@@ -239,9 +255,18 @@ impl fmt::Debug for Segment {
 /// When the pool is empty, new segments are allocated directly — the
 /// amortized cost is near-zero under steady-state traffic because segments
 /// are recycled as soon as they are acknowledged.
+///
+/// Retention is bounded by the constructor's segment count, 8 MiB of payload
+/// capacity, and 16 KiB per payload buffer. Larger buffers are dropped when
+/// returned. Public `release` rejects unknown shared views and reclaims unique
+/// views before accounting. KCP can retain a receive tail with a known full
+/// capacity; acquire checks ownership and restores the full buffer before
+/// reuse. Active segments and their wire format are unchanged.
+/// Allocator metadata / the segment index are outside the payload budget.
 pub struct SegmentPool {
-    inner: Vec<Segment>,
+    inner: Vec<PooledEntry>,
     max_capacity: usize,
+    retained_bytes: usize,
     created: u32,
 }
 
@@ -256,6 +281,7 @@ impl SegmentPool {
             // any payload allocation (the pool starts logically empty).
             inner: Vec::new(),
             max_capacity,
+            retained_bytes: 0,
             created: 0,
         }
     }
@@ -263,23 +289,139 @@ impl SegmentPool {
     /// Acquire a segment from the pool, or allocate a fresh one.
     #[inline]
     pub fn acquire(&mut self) -> Segment {
-        self.inner.pop().unwrap_or_else(|| {
-            self.created += 1;
-            Segment::with_capacity(MTU)
-        })
+        match self.inner.pop() {
+            Some(mut entry) => {
+                self.retained_bytes -= entry.charged_capacity;
+                if !entry.pending_tail {
+                    return entry.segment;
+                }
+                // A nonempty split leaves an empty tail with less than the
+                // charged full capacity. Asking to reclaim that full capacity
+                // exceeds the tail's spare room, so try_reclaim must check
+                // unique ownership rather than take its capacity-only shortcut.
+                // It never allocates and restores the whole buffer on success.
+                if entry.segment.data.is_empty()
+                    && entry.segment.data.capacity() < entry.charged_capacity
+                {
+                    if entry.segment.data.try_reclaim(entry.charged_capacity)
+                        && entry.segment.data.capacity() == entry.charged_capacity
+                    {
+                        return entry.segment;
+                    }
+                    drop(entry);
+                    return self.fresh_segment();
+                }
+                // split_to has already promoted this buffer, including an
+                // empty zero-capacity tail, to BytesMut's shared storage.
+                // A zero-length split leaves the full-capacity view: it needs
+                // an explicit unique check because try_reclaim(full_capacity)
+                // would otherwise succeed without checking ownership.
+                let data = std::mem::take(&mut entry.segment.data).freeze();
+                if let Ok(mut data) = data.try_into_mut() {
+                    let _ = data.try_reclaim(data.capacity() + 1);
+                    if data.capacity() == entry.charged_capacity {
+                        entry.segment.data = data;
+                        return entry.segment;
+                    }
+                }
+                // A caller still owns the payload (or the trusted capacity
+                // invariant was broken). Drop our old handle and return a
+                // new whole buffer, never a shared/sliced view to KCP.
+                self.fresh_segment()
+            }
+            None => self.fresh_segment(),
+        }
+    }
+
+    #[inline]
+    fn fresh_segment(&mut self) -> Segment {
+        // This diagnostic must not panic after repeated cache misses.
+        self.created = self.created.saturating_add(1);
+        Segment::with_capacity(MTU)
+    }
+
+    #[inline]
+    fn can_retain(&self, capacity: usize) -> bool {
+        self.inner.len() < self.max_capacity
+            && capacity != 0
+            && capacity <= POOL_MAX_BUFFER_CAPACITY
+            && capacity <= POOL_MAX_RETAINED_BYTES - self.retained_bytes
+    }
+
+    #[inline]
+    fn push(&mut self, segment: Segment, charged_capacity: usize, pending_tail: bool) {
+        self.retained_bytes += charged_capacity;
+        self.inner.push(PooledEntry {
+            segment,
+            charged_capacity,
+            pending_tail,
+        });
+    }
+
+    /// KCP-only return of a whole, exclusively owned buffer acquired here.
+    /// send/input only fill or clear that buffer; recv_bytes is the sole split
+    /// path and must instead call release_after_split with its pre-split size.
+    #[inline]
+    pub(crate) fn release_unique(&mut self, mut seg: Segment) {
+        let capacity = seg.data.capacity();
+        if self.can_retain(capacity) {
+            seg.reset();
+            self.push(seg, capacity, false);
+        }
+    }
+
+    /// KCP-only return after splitting a formerly whole, exclusively owned
+    /// buffer. Charge its full pre-split capacity, including a zero-size tail,
+    /// and defer ownership/reclamation until acquire.
+    #[inline]
+    pub(crate) fn release_after_split(&mut self, mut seg: Segment, full_capacity: usize) {
+        if self.can_retain(full_capacity) {
+            seg.reset();
+            self.push(seg, full_capacity, true);
+        }
     }
 
     /// Return a segment to the pool for reuse.
     #[inline]
     pub fn release(&mut self, mut seg: Segment) {
-        seg.reset();
-        // Avoid unbounded growth by dropping when at capacity.
-        if self.inner.len() < self.max_capacity {
-            self.inner.push(seg);
+        let capacity = seg.data.capacity();
+        if self.inner.len() >= self.max_capacity
+            || capacity == 0
+            || capacity > POOL_MAX_BUFFER_CAPACITY
+        {
+            return;
         }
+        seg.reset();
+        // Promote Vec-backed buffers once to BytesMut's shared representation.
+        // Freezing an empty Vec directly can lose its spare capacity, or incur
+        // a metadata allocation on every return. The zero-length split makes
+        // the conversion preserve storage without zeroing/copying the payload.
+        // Its temporary handle is dropped before checking exclusive ownership.
+        drop(seg.data.split_to(0));
+        let data = std::mem::take(&mut seg.data).freeze();
+        let Ok(mut data) = data.try_into_mut() else {
+            // recv_bytes may still own the other half of this allocation.
+            // Drop this handle rather than pinning that backing after the
+            // caller eventually drops the returned payload.
+            return;
+        };
+        let capacity = data.capacity();
+        if capacity > POOL_MAX_BUFFER_CAPACITY {
+            return;
+        }
+        // Asking for one byte beyond the current view cannot allocate. A
+        // unique tail can reclaim the prefix; its full capacity is then visible
+        // to the bounds below. Full buffers simply return false unchanged.
+        let _ = data.try_reclaim(capacity + 1);
+        let capacity = data.capacity();
+        if !self.can_retain(capacity) {
+            return;
+        }
+        seg.data = data;
+        self.push(seg, capacity, false);
     }
 
-    /// Total number of segments created (useful for diagnostics).
+    /// Total number of segments created, saturating at `u32::MAX`.
     #[inline]
     pub fn created(&self) -> u32 {
         self.created
@@ -297,6 +439,10 @@ impl SegmentPool {
         self.inner.is_empty()
     }
 }
+
+#[cfg(test)]
+#[path = "segment/pool_tests.rs"]
+mod pool_tests;
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 

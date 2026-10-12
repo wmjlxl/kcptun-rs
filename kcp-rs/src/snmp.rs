@@ -10,7 +10,8 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// When false (default), all counter updates are no-ops for zero hot-path cost.
+/// When false (default), packet and event counters are no-ops. Connection
+/// lifecycle gauges are maintained independently so late enabling is safe.
 /// Enabled only when `--snmplog` is configured with a positive period.
 static SNMP_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -282,14 +283,13 @@ impl SNMP {
         ]
     }
 
-    /// Reset all counters to zero (including Rust-only fields).
+    /// Reset cumulative counters (including Rust-only fields). Live session
+    /// gauges CurrEstab and MaxConn are preserved across a statistics reset.
     pub fn reset(&self) {
         self.bytes_sent.store(0, Ordering::Release);
         self.bytes_received.store(0, Ordering::Release);
-        self.max_conn.store(0, Ordering::Release);
         self.active_opens.store(0, Ordering::Release);
         self.passive_opens.store(0, Ordering::Release);
-        self.curr_estab.store(0, Ordering::Release);
         self.in_errs.store(0, Ordering::Release);
         self.in_csum_errors.store(0, Ordering::Release);
         self.kcp_in_errors.store(0, Ordering::Release);
@@ -323,10 +323,16 @@ impl SNMP {
         if !is_enabled() {
             return;
         }
+        self.track_session_opened(active);
+    }
+
+    /// Connection lifecycle tracking must keep its gauge even when packet
+    /// statistics are disabled, so enabling statistics later stays correct.
+    pub(crate) fn track_session_opened(&self, active: bool) {
         if active {
-            self.active_opens.fetch_add(1, Ordering::Relaxed);
+            add(&self.active_opens, 1);
         } else {
-            self.passive_opens.fetch_add(1, Ordering::Relaxed);
+            add(&self.passive_opens, 1);
         }
         let cur = self.curr_estab.fetch_add(1, Ordering::Relaxed) + 1;
         // CAS loop for max_conn (matching Go CompareAndSwap).
@@ -347,8 +353,28 @@ impl SNMP {
         if !is_enabled() {
             return;
         }
-        // wrap is fine if mismatched open/close (same as Go ^uint64(0) add).
-        self.curr_estab.fetch_sub(1, Ordering::Relaxed);
+        self.track_session_closed();
+    }
+
+    pub(crate) fn track_session_closed(&self) {
+        let mut current = self.curr_estab.load(Ordering::Relaxed);
+        while current > 0 {
+            match self.curr_estab.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl fmt::Display for SNMP {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_slice().join(","))
     }
 }
 

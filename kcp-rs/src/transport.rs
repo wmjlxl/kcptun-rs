@@ -27,8 +27,6 @@ use parking_lot::Mutex;
 
 /// Max UDP datagram size for the input-loop recv buffers and peer queues.
 pub(crate) const MAX_DATAGRAM: usize = 2048;
-/// Bound retained per-peer receive storage after a transient queue burst.
-pub(crate) const MAX_RETAINED_PEER_BUFFERS: usize = 64;
 
 // ─── PacketTransport ──────────────────────────────────────────────────────────
 
@@ -222,20 +220,15 @@ pub(crate) struct PeerQueue {
 
 struct PeerBuffers {
     packets: VecDeque<Vec<u8>>,
-    spare: Vec<Vec<u8>>,
 }
 
 impl PeerQueue {
     pub(crate) fn new() -> Self {
-        // Keep only a tiny spare-vector index up front. Packet-sized buffers
-        // are allocated lazily as traffic arrives, avoiding 128KiB of eager
-        // storage for every idle peer; the recycle cap still bounds retained
-        // memory after bursts.
-        let spare = Vec::with_capacity(2);
+        // Receive storage is lazy. Consumed buffers return to the listener's
+        // shared pool instead of accumulating in an unused per-peer cache.
         Self {
             buffers: Mutex::new(PeerBuffers {
                 packets: VecDeque::new(),
-                spare,
             }),
             notify: knet::Notify::new(),
             closed: AtomicBool::new(false),
@@ -275,15 +268,13 @@ impl PeerQueue {
         let mut pkt = buffers.packets.pop_front()?;
         std::mem::swap(buf, &mut pkt);
         let n = buf.len();
-        if buffers.spare.len() < MAX_RETAINED_PEER_BUFFERS {
-            pkt.resize(MAX_DATAGRAM, 0);
-            buffers.spare.push(pkt);
-        }
+        drop(buffers);
+        crate::sharded::recycle_buf(pkt);
         Some(n)
     }
 
     /// Pop up to `pool.len()` queued datagrams under **one lock**, swapping each
-    /// consumer buffer into the queue's spare pool (recycles capacity). Returns
+    /// consumer buffer into the shared listener pool (recycles capacity). Returns
     /// the number popped; `WouldBlock` when the queue is empty. Keeps queued
     /// order, so a peer's input loop drains a whole burst and batches its ACKs.
     fn pop_batch(&self, pool: &mut [Vec<u8>]) -> io::Result<usize> {
@@ -295,10 +286,7 @@ impl PeerQueue {
                 None => break,
             };
             std::mem::swap(&mut pool[n], &mut pkt);
-            if buffers.spare.len() < MAX_RETAINED_PEER_BUFFERS {
-                pkt.resize(MAX_DATAGRAM, 0);
-                buffers.spare.push(pkt);
-            }
+            crate::sharded::recycle_buf(pkt);
             n += 1;
         }
         if n == 0 {
@@ -539,11 +527,11 @@ mod tests {
 
     /// Idle peers must not preallocate packet buffers.
     #[test]
-    fn peer_queue_spares_are_lazy() {
+    fn peer_queue_storage_is_lazy() {
         let q = PeerQueue::new();
         let buffers = q.buffers.lock();
         assert!(
-            buffers.spare.is_empty(),
+            buffers.packets.capacity() == 0,
             "idle peers must not preallocate packet buffers"
         );
     }

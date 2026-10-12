@@ -206,9 +206,74 @@ impl KcpStream {
         Poll::Ready(Ok(sent))
     }
 
-    #[inline]
-    fn flush_notify_hint(&self) {
-        self.shared.flush_notify.notify_one();
+    fn poll_flush_accepted(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(error) = self.shared.tx_error() {
+            return Poll::Ready(Err(error));
+        }
+        if self.shared.is_closed() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "KcpStream closed before flush completed",
+            )));
+        }
+        // Register before inspecting/driving TX: a continuation can finish on
+        // another runtime thread between this poll's checks. A wake is retained
+        // even when it occurs just before this call returns Pending.
+        self.shared.register_flusher(cx.waker());
+        {
+            let mut kcp = self.shared.kcp.lock();
+            if kcp.snd_queue_len() > 0 {
+                let current = kcp.current_ms() as u32;
+                kcp.flush_data_only_with_current(current);
+            }
+        }
+        // Drive the non-blocking fast path even without a background flush
+        // loop. A partial/blocked transport retains the sender token in its
+        // continuation; its completion wakes every pending flush caller.
+        self.shared.drain_and_flush_tx();
+        if let Some(error) = self.shared.tx_error() {
+            self.shared.unregister_flusher(cx.waker());
+            return Poll::Ready(Err(error));
+        }
+        if self.shared.is_closed() {
+            self.shared.unregister_flusher(cx.waker());
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "KcpStream closed before flush completed",
+            )));
+        }
+        let queued = self.shared.kcp.lock().snd_queue_len();
+        if queued == 0
+            && self.shared.raw_packets.lock().is_empty()
+            && !self.shared.is_sending.load(Ordering::Acquire)
+        {
+            // snd_buf contains datagrams already handed to the transport;
+            // ordinary flush does not wait for their remote ACKs.
+            self.shared.unregister_flusher(cx.waker());
+            // A sender may have failed after the checks above, then published
+            // its completion with finish_sending's Release store. Recheck the
+            // terminal state after the Acquire read so a discarded batch can
+            // never turn into a successful flush merely because TX is idle.
+            if let Some(error) = self.shared.tx_error() {
+                return Poll::Ready(Err(error));
+            }
+            if self.shared.is_closed() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "KcpStream closed before flush completed",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        } else {
+            self.shared.flush_notify.notify_one();
+            Poll::Pending
+        }
+    }
+
+    fn poll_shutdown_write(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.shared.write_closed.store(true, Ordering::Release);
+        self.shared.wake_writer();
+        self.poll_flush_accepted(cx)
     }
 }
 
@@ -243,18 +308,14 @@ impl knet::AsyncWrite for KcpStream {
         self.do_poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.flush_notify_hint();
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush_accepted(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // tokio `AsyncWrite::poll_shutdown` = write-half close (no more writes,
         // pending data still flushed). Full close stays explicit via `close()`.
-        self.shared.write_closed.store(true, Ordering::Release);
-        self.shared.flush_notify.notify_one();
-        self.shared.wake_writer();
-        Poll::Ready(Ok(()))
+        self.poll_shutdown_write(cx)
     }
 }
 
@@ -394,14 +455,12 @@ macro_rules! impl_half_write {
                 self.conn().do_poll_write(cx, buf)
             }
 
-            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                self.conn().flush_notify_hint();
-                Poll::Ready(Ok(()))
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.conn().poll_flush_accepted(cx)
             }
 
-            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                let _ = self.conn().shutdown(Shutdown::Write);
-                Poll::Ready(Ok(()))
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.conn().poll_shutdown_write(cx)
             }
         }
     };
