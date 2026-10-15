@@ -2,18 +2,15 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # kcptun-rs Rust↔Rust 冒烟测试（稳定性聚焦）
 #
-# 两组：
-#   Group A: Rust(tokio)  ↔ Rust(tokio)
-#   Group B: Rust(smol)   ↔ Rust(smol)
+# tokio 后端：
+#   Rust(tokio) ↔ Rust(tokio)
 #
 # 用法:
 #   bash smoke_test_rust_rust.sh           # 全量
 #   bash smoke_test_rust_rust.sh tokio     # 仅 tokio 组
-#   bash smoke_test_rust_rust.sh smol      # 仅 smol 组
 #
 # 前置:
 #   make release           # 构建 tokio release
-#   make release-smol      # 构建 smol release
 # ═══════════════════════════════════════════════════════════════════════════
 set -eo pipefail
 cd "$(dirname "$0")"
@@ -26,8 +23,6 @@ PORT=$((30000 + $(date +%s | tail -c 4) * 7))
 # 二进制路径
 TOKIO_SERVER="./target/release/kcptun-server"
 TOKIO_CLIENT="./target/release/kcptun-client"
-SMOL_SERVER="./target/smol-release/release/kcptun-server"
-SMOL_CLIENT="./target/smol-release/release/kcptun-client"
 
 # 进程 PID（全局，cleanup 用）
 ECHO_PID=""
@@ -1725,37 +1720,16 @@ echo "${NC}"
 
 # 检查二进制
 echo "二进制检查："
-if [ "$GROUP" = "all" ] || [ "$GROUP" = "tokio" ]; then
-    if [ -x "$TOKIO_SERVER" ] && [ -x "$TOKIO_CLIENT" ]; then
-        echo "  ${GREEN}✓${NC} tokio: $TOKIO_SERVER + $TOKIO_CLIENT"
-    else
-        echo "  ${RED}✗${NC} tokio: 缺少二进制（运行: make release）"
-        [ "$GROUP" = "tokio" ] && exit 1
-        GROUP="smol"
-    fi
-fi
-if [ "$GROUP" = "all" ] || [ "$GROUP" = "smol" ]; then
-    if [ -x "$SMOL_SERVER" ] && [ -x "$SMOL_CLIENT" ]; then
-        echo "  ${GREEN}✓${NC} smol:  $SMOL_SERVER + $SMOL_CLIENT"
-    else
-        echo "  ${RED}✗${NC} smol: 缺少二进制（运行: make release-smol）"
-        [ "$GROUP" = "smol" ] && exit 1
-        if [ "$GROUP" = "all" ]; then
-            echo "  ${YELLOW}⚠ 跳过 smol 组${NC}"
-            GROUP="tokio"
-        fi
-    fi
+if [ -x "$TOKIO_SERVER" ] && [ -x "$TOKIO_CLIENT" ]; then
+    echo "  ${GREEN}✓${NC} tokio: $TOKIO_SERVER + $TOKIO_CLIENT"
+else
+    echo "  ${RED}✗${NC} tokio: 缺少二进制（运行: make release）"
+    exit 1
 fi
 echo ""
 
 # 运行测试组
-if [ "$GROUP" = "all" ] || [ "$GROUP" = "tokio" ]; then
-    run_suite "Group A: Rust(tokio) ↔ Rust(tokio)" "$TOKIO_SERVER" "$TOKIO_CLIENT"
-fi
-
-if [ "$GROUP" = "all" ] || [ "$GROUP" = "smol" ]; then
-    run_suite "Group B: Rust(smol) ↔ Rust(smol)" "$SMOL_SERVER" "$SMOL_CLIENT"
-fi
+run_suite "Group A: Rust(tokio) ↔ Rust(tokio)" "$TOKIO_SERVER" "$TOKIO_CLIENT"
 
 # ─── 结果汇总 ─────────────────────────────────────────────────────────────
 echo ""

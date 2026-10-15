@@ -5,23 +5,30 @@
 # 在 Docker 容器内构建 Rust + Go 二进制，并运行 bench_rust_vs_go.py 矩阵测试。
 #
 # 用法:
-#   bash docker-bench.sh [--quick] [--rust-only] [--go-only] [--smol-only] ...
+#   bash docker-bench.sh [--quick] [--rust-only] ...
+#   bash docker-bench.sh --rebuild-go [--quick]
 #
-# 所有参数透传给 bench_rust_vs_go.py。
+# 环境变量:
+#   KCPTUN_GO_SRC  — Go kcptun 源码目录（默认: ../kcptun）
+#
+# 所有其他参数透传给 bench_rust_vs_go.py。
 # 示例:
 #   bash docker-bench.sh --quick              # 快速测试（少量 cipher）
-#   bash docker-bench.sh --quick --go-only    # 仅测试 Go
 #   bash docker-bench.sh --rust-only          # 仅测试 Rust-tokio
 #   bash docker-bench.sh --conn 5 --size 512000  # 自定义并发和载荷
+#   KCPTUN_GO_SRC=/path/to/kcptun bash docker-bench.sh  # 指定 Go 源码路径
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-GO_SRC="/Users/yangzhiqin/Documents/Project/kcptun"
+GO_SRC="${KCPTUN_GO_SRC:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/kcptun}"
 GO_OUT_DIR="kcptun-go-linux"
 IMAGE_NAME="kcptun-bench"
 SUMMARY_FILE="bench_docker_results.json"
+
+# 项目根目录（用于 Go 交叉编译输出路径）
+PROJECT_ROOT="$(pwd)"
 
 # ── 颜色 ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -52,9 +59,9 @@ fi
 if [ ! -f "$GO_OUT_DIR/server" ] || [ ! -f "$GO_OUT_DIR/client" ]; then
     cd "$GO_SRC"
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags="-s -w" \
-        -o "/Users/yangzhiqin/Desktop/kcptun-rs/$GO_OUT_DIR/server" ./server
+        -o "$PROJECT_ROOT/$GO_OUT_DIR/server" ./server
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags="-s -w" \
-        -o "/Users/yangzhiqin/Desktop/kcptun-rs/$GO_OUT_DIR/client" ./client
+        -o "$PROJECT_ROOT/$GO_OUT_DIR/client" ./client
     cd - > /dev/null
     ok "Go Linux 二进制编译完成"
 else
@@ -64,7 +71,7 @@ fi
 ls -lh "$GO_OUT_DIR/"
 
 # ── Step 2: 构建 Docker 镜像 ────────────────────────────────────────────────
-info "Step 2/4: 构建 Docker 镜像（Rust tokio + smol + Go）..."
+info "Step 2/4: 构建 Docker 镜像（Rust tokio + Go）..."
 info "这可能需要 10-30 分钟，具体取决于网络和机器性能..."
 
 # 检查 Docker 是否在运行

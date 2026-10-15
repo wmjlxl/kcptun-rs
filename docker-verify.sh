@@ -4,8 +4,7 @@
 #
 # 在 Docker 容器内运行，验证：
 #   1. tokio 后端 release 二进制可正常启动
-#   2. smol 后端 release 二进制可正常启动
-#   3. client → server → TCP echo 端到端数据转发
+#   2. client → server → TCP echo 端到端数据转发
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -26,9 +25,8 @@ echo "════════════════════════�
 
 # ── 1. 检查二进制文件存在 ───────────────────────────────────────────────────
 echo ""
-echo "[1/5] 检查二进制文件"
-for bin in /app/kcptun-server-tokio /app/kcptun-client-tokio \
-           /app/kcptun-server-smol /app/kcptun-client-smol; do
+echo "[1/4] 检查二进制文件"
+for bin in /app/kcptun-server-tokio /app/kcptun-client-tokio; do
     if [ -x "$bin" ]; then
         sz=$(ls -lh "$bin" | awk '{print $5}')
         ok "$bin ($sz)"
@@ -39,9 +37,8 @@ done
 
 # ── 2. 检查 --help 可执行（验证动态链接无缺失） ─────────────────────────────
 echo ""
-echo "[2/5] --help 冒烟测试"
-for bin in /app/kcptun-server-tokio /app/kcptun-client-tokio \
-           /app/kcptun-server-smol  /app/kcptun-client-smol; do
+echo "[2/4] --help 冒烟测试"
+for bin in /app/kcptun-server-tokio /app/kcptun-client-tokio; do
     name=$(basename "$bin")
     if "$bin" --help >/dev/null 2>&1; then
         ok "$name --help"
@@ -58,7 +55,7 @@ done
 
 # ── 3. 检查 ldd 动态链接 ──────────────────────────────────────────────────────
 echo ""
-echo "[3/5] ldd 动态链接检查"
+echo "[3/4] ldd 动态链接检查"
 for bin in /app/kcptun-server-tokio /app/kcptun-client-tokio; do
     name=$(basename "$bin")
     if ldd "$bin" >/dev/null 2>&1; then
@@ -75,7 +72,7 @@ done
 
 # ── 4. 端到端数据转发测试 (tokio 后端) ───────────────────────────────────────
 echo ""
-echo "[4/5] 端到端数据转发 (tokio 后端)"
+echo "[4/4] 端到端数据转发 (tokio 后端)"
 
 run_e2e() {
     local server_bin="$1"
@@ -154,14 +151,6 @@ s.close()
 # 测试多种加密方式
 for crypt in null aes aes-128-gcm salsa20; do
     run_e2e /app/kcptun-server-tokio /app/kcptun-client-tokio "tokio" "$crypt"
-done
-
-# ── 5. 端到端数据转发测试 (smol 后端) ────────────────────────────────────────
-echo ""
-echo "[5/5] 端到端数据转发 (smol 后端)"
-
-for crypt in null aes; do
-    run_e2e /app/kcptun-server-smol /app/kcptun-client-smol "smol" "$crypt"
 done
 
 # ── 汇总 ──────────────────────────────────────────────────────────────────────
