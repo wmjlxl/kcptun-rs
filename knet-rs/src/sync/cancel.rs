@@ -63,10 +63,30 @@ impl Future for Cancelled<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.token.is_cancelled() {
+        let this = self.get_mut();
+        if this.token.is_cancelled() {
             return Poll::Ready(());
         }
-        Pin::new(&mut self.get_mut().notified).poll(cx)
+        if Pin::new(&mut this.notified).poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        // Re-check AFTER the waiter slot is published. `notify_waiters`
+        // stores a *single* shared backstop permit and early-returns when
+        // `waiter_count == 0`; a sibling re-poller racing this same poll
+        // (its own `is_cancelled` check landed just before the flag store)
+        // can consume that permit via the fast path, so a waiter registering
+        // a beat *after* the broadcast sees permit=0 on both checks and
+        // parks forever on an already-cancelled token — observed as
+        // `cancel_wakes_every_parked_waiter` flaking with
+        // `cancelled=true, flags=[true,false,...], notify=(0,0,N)`.
+        // The terminal flag, not the permit, is the source of truth for
+        // cancellation; re-reading it once the registration is visible
+        // closes the window regardless of who consumed the permit. The
+        // NotifyFuture deregisters itself via `Drop` on return.
+        if this.token.is_cancelled() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
     }
 }
 
@@ -127,14 +147,18 @@ mod tests {
     /// Wait (bounded) for the spawned waiter to finish, backend-agnostic: the
     /// `JoinHandle::await` output type differs between tokio (`Result`) and
     /// detached tasks, so we signal via a shared flag instead.
-    async fn wait_done(done: &AtomicBool) {
-        for _ in 0..10_000 {
+    ///
+    /// On failure the panic carries the diagnostic context passed by the
+    /// caller (cancelled state / done flags) — a bare "did not complete"
+    /// could not distinguish a lost wakeup from a starved budget.
+    async fn wait_done(done: &AtomicBool, ctx: &str) {
+        for _ in 0..100_000 {
             if done.load(Ordering::Acquire) {
                 return;
             }
             yield_now().await;
         }
-        panic!("waiter did not complete");
+        panic!("waiter did not complete — {ctx}");
     }
 
     #[test]
@@ -151,7 +175,7 @@ mod tests {
             }));
             yield_now().await; // let the waiter arm its waker
             token.cancel();
-            wait_done(&done).await;
+            wait_done(&done, "single-waiter").await;
         });
     }
 
@@ -193,8 +217,19 @@ mod tests {
                 yield_now().await;
             }
             token.cancel();
-            for flag in &done {
-                wait_done(flag).await;
+            for (i, flag) in done.iter().enumerate() {
+                wait_done(
+                    flag,
+                    &format!(
+                        "waiter {i}: cancelled={} flags={:?} notify={:?}",
+                        token.is_cancelled(),
+                        done.iter()
+                            .map(|f| f.load(Ordering::Acquire))
+                            .collect::<Vec<_>>(),
+                        token.inner.notify.debug_state()
+                    ),
+                )
+                .await;
             }
         });
     }
@@ -215,7 +250,7 @@ mod tests {
             }));
             yield_now().await;
             token.cancel();
-            wait_done(&done).await;
+            wait_done(&done, "single-waiter").await;
         });
     }
 }

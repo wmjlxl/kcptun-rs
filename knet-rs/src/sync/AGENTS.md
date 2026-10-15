@@ -24,8 +24,10 @@ None.
 
 - Prefer `knet::sync::Notify` over `tokio::sync::Notify` in shared code. `Notify` is a permit-storing primitive that supports **any number of concurrent waiters**: `notify_one()` wakes the longest-parked one, `notify_waiters()` wakes them all and leaves a permit behind. Use `notify_waiters()` for terminal transitions (`close()`, `cancel()`) — `notify_one()` there leaves the other parked tasks hung until unrelated traffic arrives.
 - `Notify`'s waiter/notifier hand-off is a Dekker pattern: the parking waiter publishes `waiter_count` then re-reads `permits`, the notifier stores `permits` then reads `waiter_count`. Those four accesses must stay `SeqCst`; downgrading them to `Acquire`/`Release` reintroduces a lost wakeup (the store-buffer interleaving where neither side sees the other).
+- Test isolation: the `inflight` counter is process-global — tests asserting absolute `active()` values must serialize (shared `INFLIGHT_TEST_LOCK` in `tests.rs`); the parallel harness otherwise races sibling tests that hold guards.
 - `Mutex` is always `async_lock`.
 - `CancellationToken`: `cancel()` sets a flag + wakes the waiting `cancelled()` future. Each recv loop holds one and races its socket recv against `cancelled()` so `close()` cancels the recv immediately instead of a 100ms poll tick.
+- **Terminal flags must be re-checked AFTER waiter registration.** The permit left by `notify_waiters()` is a *single* slot that any re-poller's fast path can consume; a waiter registering a beat after the broadcast can otherwise see permit=0 on both checks and park forever on an already-cancelled token (`Cancelled::poll` does the post-registration `is_cancelled()` re-check — `bugs/BUGREPORT_CANCEL_BROADCAST_LOST_WAKEUP.md`, regression: `cancel_wakes_every_parked_waiter`, 30/30). Plain-`Notify` callers gating on their own terminal flag must follow the same pattern.
 - `race(a, b)` polls both futures in turn; both must be `Unpin` (box-pin a non-Unpin recv at the call site). The loser is dropped — a cancelled socket recv just stops polling, the datagram stays buffered.
 
 ### Testing Requirements

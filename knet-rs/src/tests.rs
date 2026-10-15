@@ -342,10 +342,19 @@ async fn test_ctrl_c_fires_on_sigterm() {
 }
 
 // ─── inflight tracker (P1-2 / M-7) ───────────────────────────────────────────
+/// `inflight::COUNT` is process-global and the harness runs tests in
+/// parallel: `test_inflight_wait_drain_times_out` holds a guard for its
+/// whole ~50 ms body, which raced this test's absolute `active() == 0`
+/// assertions (observed 2/3 failures on 2026-10-11: left=1 right=0 at the
+/// line below). Both inflight tests take this lock for their full body —
+/// an async mutex never deadlocks when a sibling test is filtered out.
+static INFLIGHT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn test_inflight_guard_tracks_and_drains() {
     use std::time::Duration;
 
+    let _serial = INFLIGHT_TEST_LOCK.lock().await;
     assert_eq!(crate::inflight::active(), 0);
     {
         let _g = crate::inflight::guard();
@@ -365,6 +374,7 @@ async fn test_inflight_guard_tracks_and_drains() {
 
 #[tokio::test]
 async fn test_inflight_wait_drain_times_out() {
+    let _serial = INFLIGHT_TEST_LOCK.lock().await;
     use std::time::Duration;
 
     let _g = crate::inflight::guard();

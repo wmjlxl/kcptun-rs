@@ -145,12 +145,32 @@ impl Notify {
         }
     }
 
+    /// Test-only snapshot of the internal state: `(permits, waiter_count,
+    /// list_len)`. Used by the cancel tests to distinguish a missed wake
+    /// (stuck waiter still listed / count desync) from a scheduling stall
+    /// (list empty yet the task never re-polled).
+    #[cfg(test)]
+    pub(crate) fn debug_state(&self) -> (usize, usize, usize) {
+        (
+            self.state.permits.load(Ordering::SeqCst),
+            self.state.waiter_count.load(Ordering::SeqCst),
+            self.state.waiters.lock().unwrap().len(),
+        )
+    }
+
     /// Wake every task currently waiting on `notified()`, and store a permit
     /// so a task that parks afterwards also returns immediately.
     ///
     /// This is what a terminal transition (`close()`, `cancel()`) needs: with
     /// several readers/writers parked on the same `Notify`, waking only one
     /// leaves the rest hung until unrelated traffic arrives.
+    ///
+    /// Contract for **plain `Notify` users**: the stored permit is a single
+    /// slot — a task whose re-poll takes the fast path consumes it. A waiter
+    /// that registers *after* this call therefore only gets woken if nobody
+    /// else consumed the permit; callers that gate on a terminal-state flag
+    /// must re-check that flag after registering (exactly what
+    /// `cancel::Cancelled::poll` does), not rely on the permit.
     #[inline(always)]
     pub fn notify_waiters(&self) {
         self.state.permits.store(1, Ordering::SeqCst);
