@@ -1063,3 +1063,75 @@ fn inbound_direct_read_preserves_partial_frame() {
     assert_eq!(out[0].0, sid);
     assert_eq!(&out[0].1[..], b"split-frame-payload");
 }
+
+/// TX_FLUSH §6.1 (Go parity: recycle at streamClosed): a full `close()`
+/// must hand the window of receive-buffer bytes it discarded back to the
+/// session on the next reclaim — previously `close()` zeroed
+/// `recv_buf_bytes_avail` without returning it, so a stream closed with
+/// unread data leaked its share until reap (worst case forever: reap's
+/// `recycle_tokens` then found the counter already zeroed).
+#[test]
+fn close_returns_unread_receive_window_on_next_reclaim() {
+    let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+    let s = session.open_stream().unwrap();
+    let initial = session.token_bucket_value();
+
+    let frame =
+        Frame::new(Cmd::Psh, s.id(), Bytes::from_static(b"0123456789")).with_ver(session.version());
+    let mut buf = Vec::new();
+    frame.encode(&mut buf);
+    session.process_data(&buf).unwrap();
+    assert_eq!(session.token_bucket_value(), initial - 10);
+
+    // App closes WITHOUT reading the 10 buffered bytes: the window must
+    // come back on the next reclaim, not stay charged until reap.
+    s.close();
+    assert_eq!(session.reclaim_tokens(), 10);
+    assert_eq!(session.token_bucket_value(), initial);
+
+    // Idempotent: a second reclaim finds nothing (no double-return).
+    assert_eq!(session.reclaim_tokens(), 0);
+    assert_eq!(session.token_bucket_value(), initial);
+}
+
+/// close() → reap ordering must return the window exactly once: remove's
+/// `recycle_tokens` drains the pending amount if no reclaim ran yet, and
+/// finds it already zero if a reclaim ran first.
+#[test]
+fn close_then_remove_returns_window_exactly_once() {
+    // Variant A: remove_stream before any reclaim.
+    let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+    let s = session.open_stream().unwrap();
+    let initial = session.token_bucket_value();
+    let frame =
+        Frame::new(Cmd::Psh, s.id(), Bytes::from_static(b"0123456789")).with_ver(session.version());
+    let mut buf = Vec::new();
+    frame.encode(&mut buf);
+    session.process_data(&buf).unwrap();
+    s.close();
+    assert!(session.remove_stream(s.id()));
+    assert_eq!(
+        session.token_bucket_value(),
+        initial,
+        "remove must return exactly the charged window, not double it"
+    );
+    assert_eq!(session.reclaim_tokens(), 0, "nothing pending after remove");
+
+    // Variant B: reclaim runs first, then remove — no second return.
+    let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+    let s = session.open_stream().unwrap();
+    let initial = session.token_bucket_value();
+    let frame =
+        Frame::new(Cmd::Psh, s.id(), Bytes::from_static(b"0123456789")).with_ver(session.version());
+    let mut buf = Vec::new();
+    frame.encode(&mut buf);
+    session.process_data(&buf).unwrap();
+    s.close();
+    assert_eq!(session.reclaim_tokens(), 10);
+    assert!(session.remove_stream(s.id()));
+    assert_eq!(
+        session.token_bucket_value(),
+        initial,
+        "remove after reclaim must not return the same window twice"
+    );
+}
