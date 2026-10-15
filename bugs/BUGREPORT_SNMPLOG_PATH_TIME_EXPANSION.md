@@ -1,5 +1,22 @@
 # BUG: `--snmplog` time-layout expansion rewrites the whole path, including directories
 
+**Status: FIXED (2026-10-11)** — `kcptun-common/src/snmp_log.rs::expand_time_format`
+now time-formats the **final path component only** (Go parity), with regression tests
+`test_expand_never_rewrites_date_like_directories` and
+`test_expand_matches_go_basename_only_behaviour`.
+
+**Go parity evidence (empirical, against the compiled kcptun Go binaries in
+`tests/kcptun-go/server`, the same binaries e2e uses):**
+- `--snmplog` help: "aware of timeformat in golang, like: ./snmp-20060102.log"
+- T1 — dir with token substrings (`/tmp/…/run_20261011_131816/snmp.csv`, base has no
+  tokens): file created **byte-identical**, dir never rewritten → unconditional
+  whole-path expansion ruled out.
+- T2 — `run_20261011_131816/snmp-20060102.csv` → `run_20261011_131816/snmp-20261011.csv`:
+  dir kept, **basename expanded**.
+- T3 — dir *containing* `2006` (`d2006x/snmp-20060102.csv`) → dir still untouched,
+  basename expanded → not a precondition scheme: **basename-only**.
+So Rust's whole-path rewrite was a genuine divergence, not a shared footgun.
+
 **Date:** 2026-10-11
 **Found by:** 1-hour / 20-process stability test (`stability_1h/`)
 **Severity:** Low (operational footgun; no data-path impact)

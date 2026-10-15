@@ -1,5 +1,11 @@
 # BUGREPORT：真实链路重传率远高于丢包率（伪 RTO 重传风暴）
 
+> **状态**: **Fixed**（2026-10-11 复核）— kcp.rs 早期重传门改为
+> `fastack > 0 && fastack != 0xFFFFFFFF && new_segs_count == 0`
+> （kcp.rs:1424 附近），注释明确指出旧条件 `new_segs_count > 0` 时发射
+> 即是历史重传风暴根因；对齐 Go 的 pipe-idle 判据。
+
+
 > 分析日期：2026-09-15
 > 复现环境：本机 macOS (loopback + 用户态链路模拟器)、测试服务器 `root@38.145.210.53`（1 vCPU / 512MB，宿主 load 20-30）
 

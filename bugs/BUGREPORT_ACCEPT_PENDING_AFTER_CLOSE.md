@@ -4,7 +4,10 @@
 - 分支：`feat/session-task-listener`（核对后仍未修）
 - 组件：`kcp-rs/src/sharded.rs`（`deliver` 的 build task → `pending.push_back`；`accept`/`try_accept`）
 - 严重级别：P3（语义瑕疵；有界）
-- 状态：**未修复**
+- 状态：**已修复**（2026-10-11 复核；原 2026-09 判定已过时）—
+  `KcpListener::accept`/`try_accept` 在每个步骤三重检查 `closed` 并
+  `discard_pending()`（sharded.rs:330-390）；`deliver` 的无会话分支以
+  `args.closed` 拦截 in-flight build 并 `recycle_all`，close 后不可能入队/弹出
 
 ## 现象
 
