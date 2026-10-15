@@ -15,6 +15,44 @@ use crate::kcp::KCP;
 /// Default conversation ID (historical kcptun client/server).
 pub const DEFAULT_CONV: u32 = 0xDEAD_BEEF;
 
+/// Generate a fresh random conversation ID for one dialed connection.
+///
+/// Mirrors Go kcp-go's `Dial`/`DialWithOptions`, which reads a random
+/// `convid` per dial (`sess.go`). A unique conv per connection is what lets
+/// a listener tell a *re-dial* apart from the previous generation when the
+/// peer's UDP source address was reused while the old session still lingers:
+/// the listener replaces the session on conv mismatch instead of feeding the
+/// new connection's segments into the old session's state machine (which
+/// yields wrong-bytes delivery or stuck timeouts — see
+/// `bugs/BUGREPORT_KCP_LISTENER_STALE_SESSION_ALIASING.md`).
+///
+/// Uniqueness is what matters (not unpredictability): a process-wide random
+/// seed mixed with a monotonically increasing counter. Re-exported for
+/// callers that build transports themselves (e.g. `with_transport`).
+pub fn random_conv() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static SEED: OnceLock<u64> = OnceLock::new();
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let base = *SEED.get_or_init(|| {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    });
+    // splitmix64: spread the (random base + per-dial counter) over all 32
+    // conv bits so sequential dials never walk the conv space linearly.
+    let mut z = base.wrapping_add(
+        COUNT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    );
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) as u32
+}
+
 /// KCP operating mode profiles (Go kcptun `--mode` curves).
 ///
 /// Each non-[`Manual`](KcpMode::Manual) variant maps to fixed

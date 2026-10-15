@@ -68,6 +68,35 @@ let conn = KcpStream::with_transport(transport, cfg).await?;
 - `connect_timeout` forces a `WASK` probe and waits for any conv-valid inbound
   (`WINS`/ACK); it proves reachability + conv match, **not** connection establishment
   (KCP has no handshake). Requires the background input loop.
+- **conv default (post-aliasing-fix)**: a plain UDP dial (`connect`/`connect_timeout`)
+  gets a **fresh random conv per dial** (Go kcp-go `Dial` parity; `kcp_rs::random_conv()`)
+  unless pinned via `.conv()` — even pinning `DEFAULT_CONV` is honoured (builder tracks
+  the explicit set). `with_transport` keeps the configured conv (callers opt in —
+  kcptun-common randomises UDP dials in `kcp_transport.rs`, TCP dials stay fixed);
+  server-side builds use `.adopt_conv(true)` and learn the peer's conv from the first
+  inbound segment. Why: a re-dial from a reused UDP source address must replace (not
+  alias into) the lingering session — see `bugs/BUGREPORT_KCP_LISTENER_STALE_SESSION_ALIASING.md`.
+  New pub API: `kcp_rs::random_conv()` (kcp-rs minor bump at next publish).
+- **Stall diagnostics (post-RTO-analysis)** — all `KcpStream` getters, one
+  kcp-rs minor bump at next publish (with `random_conv`):
+  `tx_pkts`/`rx_pkts` (per-endpoint wire-datagram counters),
+  `rx_rto`/`rx_srtt`/`rx_rttvar` (live RTO ladder inputs; under sustained
+  loss `rx_rto` inflates toward the 60 s `RTO_MAX`, which is what
+  tail-segment stalls are — `bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`,
+  Go-identical behaviour),
+  `snd_nxt`/`snd_queue_len` (live; distinguishes queued-vs-flushed-vs-sent —
+  note `wait_send()` is the CACHED flush-loop value, not live),
+  `sending`/`raw_queue_len` (`is_sending` token + drain backlog — flat `tx`
+  with `sending=true` means a stuck token),
+  `flush_ticks`/`kcp_flush_count`/`rto_fires` (forensic triple: flat while
+  `snd_nxt-snd_una>0` = flush loop dead / continue-loop / KCP-internal
+  suppression respectively; `rf` delta == `tx` delta = healthy ladder),
+  `last_io_error` (what `note_io_error` recorded),
+  and test seams `testing_mark_dead` (`#[doc(hidden)]`).
+  Also: the sharded feed path stamps `mark_inbound()` (both liveness clocks) —
+  listener-fed sessions previously left `rx_age_ms()` frozen at build time;
+  the listener does NOT reap `is_dead()` sessions (Go never reads the state —
+  `bugs/BUGREPORT_LISTENER_DEAD_LINK_SESSION_KILL.md`).
 - `PacketTransport`: datagram send/receive plus optional batch operations;
   `recv_vec` / `try_recv_vec` let queue-backed transports transfer reusable
   owned packet storage without an extra copy.

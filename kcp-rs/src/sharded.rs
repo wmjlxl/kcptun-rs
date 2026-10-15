@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::config::KcpConfig;
-use crate::conn::{kcp_config_setters, resolve_one, KcpStream};
+use crate::conn::{conv_setter, kcp_config_setters, resolve_one, KcpStream};
 use crate::transport::{PeerQueue, PeerTransport, SharedSendLock, TransportWrapper, MAX_DATAGRAM};
 use knet::Notify;
 
@@ -444,9 +444,20 @@ impl KcpListener {
 
     /// Live resource-accounting snapshot.
     pub fn stats(&self) -> WorkerPoolStats {
+        // Each lock is taken and **released** by its own `let` statement. In
+        // the previous struct-literal form both temporaries lived until the
+        // end of the statement, so this call held `sessions` while waiting
+        // for `building` — the inverse of the publish/admit/register paths'
+        // documented `building` → `sessions` order. That ABBA inversion
+        // deadlocked `session_cap_test` under load (main parked in
+        // `stats()` at this line, a build task parked in `spawn_build_task`
+        // holding `building` and waiting for `sessions`); lldb backtraces in
+        // bugs/BUGREPORT_STATS_BUILDING_SESSIONS_ABBA_DEADLOCK.md.
+        let sessions = self.sessions.lock().len();
+        let building = self.building.lock().len();
         WorkerPoolStats {
-            sessions: self.sessions.lock().len(),
-            building: self.building.lock().len(),
+            sessions,
+            building,
             channel_drops: self.stats.channel_drops.load(Ordering::Relaxed),
             session_drops: self.stats.session_drops.load(Ordering::Relaxed),
             build_failures: self.stats.build_failures.load(Ordering::Relaxed),
@@ -475,6 +486,7 @@ pub struct KcpListenerBuilder {
 
 impl KcpListenerBuilder {
     kcp_config_setters!();
+    conv_setter!();
 
     /// Wrap each accepted peer transport before constructing its `KcpStream`.
     pub fn transport_wrapper<F>(mut self, wrapper: F) -> Self
@@ -934,7 +946,15 @@ fn push_to_building(
 fn lookup_established(args: &RxArgs, peer: SocketAddr) -> Established {
     let mut sessions = args.sessions.lock();
     match sessions.get(&peer) {
-        Some(s) if !s.conn.is_closed() && !s.conn.is_dead() => Established::Live(s.conn.clone()),
+        // `is_dead()` (dead_link, xmit ≥ 20) is INFORMATIONAL: kcp-go sets
+        // `state = -1` and nothing in Go ever reads it back — sess.go has no
+        // close-on-dead path. Treating it as removal here turned recoverable
+        // loss-storm stalls (peer alive, delivery resumed within the RTO
+        // ladder) into hard session death: observed live in the corruption
+        // hunt, `bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`. Closed
+        // sessions still leave on sight; a truly vanished peer is covered by
+        // the idle reaper (and, in the production stack, SMUX keepalive).
+        Some(s) if !s.conn.is_closed() => Established::Live(s.conn.clone()),
         Some(_) => Established::Reaped(sessions.remove(&peer).unwrap().conn),
         None => Established::None,
     }
@@ -1321,17 +1341,25 @@ fn decrypt_batch_in_place(
 
 /// Drop sessions the listener should no longer keep alive.
 ///
-/// A session is reaped when KCP declares the link dead, when it is already
-/// closed, or when `limits.idle_timeout` has passed with no inbound datagram
-/// and no successful write. Every reaped session is closed, not just dropped:
-/// the map holds a non-owning clone, so a bare `remove` leaves the flush loop
+/// A session is reaped when it is already closed, or when
+/// `limits.idle_timeout` has passed with no inbound datagram and no
+/// successful write. Every reaped session is closed, not just dropped: the
+/// map holds a non-owning clone, so a bare `remove` leaves the flush loop
 /// running.
+///
+/// `is_dead()` (dead_link) is deliberately NOT a reap trigger: kcp-go sets
+/// `state = -1` and nothing in Go reads it back, and under a loss storm
+/// dead_link fires on *recoverable* links (20 fast-ladder retransmits ≈ 11 s
+/// at `rto=100`) — killing then converts a slow-but-healing session into a
+/// hard teardown while the peer is alive. See
+/// `bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`.
 fn sweep(args: &RxArgs) {
     // Scan the whole map. The lock is only held to clone the session handles;
-    // `is_dead()` runs after it is dropped. Capping the scan (the old 4096)
-    // starved anything past that prefix: `HashMap` iteration order is bucket
-    // order, so the same entries came first on every pass until one of them
-    // was removed, and a closed session behind them was never reaped.
+    // the `is_closed()` / idle checks run after it is dropped. Capping the
+    // scan (the old 4096) starved anything past that prefix: `HashMap`
+    // iteration order is bucket order, so the same entries came first on
+    // every pass until one of them was removed, and a closed session behind
+    // them was never reaped.
     let candidates: Vec<(SocketAddr, KcpStream)> = {
         let sessions = args.sessions.lock();
         sessions.iter().map(|(p, s)| (*p, s.conn.clone())).collect()
@@ -1363,7 +1391,7 @@ fn sweep(args: &RxArgs) {
     let mut dead: Vec<SocketAddr> = Vec::new();
     let mut idle = 0u64;
     for (peer, conn) in candidates {
-        if conn.is_dead() || conn.is_closed() {
+        if conn.is_closed() {
             dead.push(peer);
         } else if idle_ms > 0 && now.saturating_sub(conn.last_activity_ms()) >= idle_ms {
             dead.push(peer);

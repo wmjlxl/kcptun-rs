@@ -54,6 +54,11 @@ impl RawPacketQueue {
         self.pending.is_empty()
     }
 
+    /// Packets accumulated and waiting for the token holder to drain them.
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Hand the accumulated batch to the sender: swap `pending` with `spare`
     /// (the recycled buffer becomes the next accumulation target, inheriting
     /// its capacity) and take the full batch. No allocation under the lock.

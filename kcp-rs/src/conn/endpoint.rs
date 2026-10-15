@@ -125,11 +125,22 @@ pub(crate) struct SharedIoState {
     /// whether an ICMP-style socket error is real peer loss or a stray error
     /// arriving during an otherwise healthy flow.
     pub(crate) last_rx_ms: AtomicU64,
+    /// Diagnostic pair for stall localisation: datagrams handed *to* the
+    /// transport (post-KCP, before any wrapper drops) and datagrams accepted
+    /// *from* it. During a wedge, `tx_pkts` growing while the peer's
+    /// `rx_pkts` is flat means loss after send; `tx_pkts` flat means the
+    /// sender never emitted.
+    pub(crate) tx_pkts: AtomicU64,
+    pub(crate) rx_pkts: AtomicU64,
     /// Send token: when `true`, either the flush loop or an inline writer is
     /// draining `raw_packets` + sending via `send_packets_with_fec().await`.
     /// Prevents wire-interleaving when both try to send concurrently.
     /// Acquired via `compare_exchange(false, true)`; released with `store(false)`.
     pub(crate) is_sending: AtomicBool,
+    /// Flush-loop executions (KCP phase reached, not skipped by the
+    /// early-continue). Stall forensics: flat `flush_ticks` with pending
+    /// unacked segments means the loop itself stopped ticking.
+    pub(crate) flush_ticks: AtomicU64,
     /// Optional FEC encoder (header_offset=0, matching client/server session layout).
     pub(crate) fec_encoder: Option<Mutex<FecEncoder>>,
     /// Optional FEC decoder.
@@ -396,7 +407,11 @@ impl SharedIoState {
         if datagrams.is_empty() {
             return;
         }
-        self.mark_activity();
+        // Inbound datagrams from the peer: stamp BOTH clocks. The old
+        // `mark_activity()` here left `last_rx_ms` frozen at build time for
+        // every listener-fed session, so `rx_age_ms()` reported "seconds
+        // since construction" instead of peer silence.
+        self.mark_inbound();
         let (data_ready, protocol_pending) = process_inbound_batch(self, &datagrams);
         if data_ready {
             self.wake_reader();
@@ -784,6 +799,8 @@ impl SharedIoState {
         if packets.is_empty() {
             return;
         }
+        self.tx_pkts
+            .fetch_add(packets.len() as u64, Ordering::Relaxed);
         let used_fec = self.fec_encoder.is_some();
         // Try non-blocking sendmmsg first (sync fast path); falls back to
         // async send_batch on WouldBlock, itself capped by TX_FLUSH_TIMEOUT.
@@ -1017,6 +1034,9 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
 ///
 /// Returns `(data_ready, protocol_pending)` for reader and maintenance wakes.
 pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>]) -> (bool, bool) {
+    shared
+        .rx_pkts
+        .fetch_add(datagrams.len() as u64, Ordering::Relaxed);
     let mismatch_before = shared.conv_mismatch.load(Ordering::Relaxed);
     let restart_before = shared.peer_restart.load(Ordering::Relaxed);
     // ── Phase 1: FEC decode all datagrams OUTSIDE the KCP lock ──
@@ -1371,6 +1391,7 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                         }
                     }
                 }
+                shared.flush_ticks.fetch_add(1, Ordering::Relaxed);
                 let mut kcp = shared.kcp.lock();
                 let current = kcp.current_ms() as u32;
                 let delay_ms = kcp.flush_with_current(current, true) as u64;

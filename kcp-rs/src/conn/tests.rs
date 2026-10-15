@@ -104,3 +104,45 @@ fn builder_fec_sets_shards() {
     assert_eq!(b.config.datashard, 10);
     assert_eq!(b.config.parityshard, 3);
 }
+
+/// A plain UDP dial must get a fresh random conv per connection (Go kcp-go
+/// `Dial` parity), while an explicit `.conv()` — even pinned to
+/// [`DEFAULT_CONV`](crate::config::DEFAULT_CONV) — is honoured verbatim.
+/// Random conv is what lets a listener replace (not alias into) a lingering
+/// session when the peer re-dials from a reused source address
+/// (bugs/BUGREPORT_KCP_LISTENER_STALE_SESSION_ALIASING.md).
+#[tokio::test]
+async fn udp_dial_randomizes_conv_unless_pinned() {
+    let a = KcpStream::connect("127.0.0.1:9").build().await.unwrap();
+    let b = KcpStream::connect("127.0.0.1:9").build().await.unwrap();
+    let ca = a.shared.kcp.lock().conv();
+    let cb = b.shared.kcp.lock().conv();
+    assert_ne!(
+        ca,
+        crate::config::DEFAULT_CONV,
+        "dial must not keep the fixed conv"
+    );
+    assert_ne!(cb, crate::config::DEFAULT_CONV);
+    assert_ne!(ca, cb, "each dial gets its own conv");
+
+    // Explicit pin wins, even for the default value.
+    let pinned = KcpStream::connect("127.0.0.1:9")
+        .conv(crate::config::DEFAULT_CONV)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.shared.kcp.lock().conv(),
+        crate::config::DEFAULT_CONV,
+        "explicit .conv() must not be randomised"
+    );
+
+    // A server-side (adopting) build never randomises: it learns the peer's
+    // conv from the first inbound segment instead.
+    assert!(!KcpStream::connect("127.0.0.1:9").conv_explicit);
+    assert!(
+        KcpStream::connect("127.0.0.1:9")
+            .conv(crate::config::DEFAULT_CONV)
+            .conv_explicit
+    );
+}

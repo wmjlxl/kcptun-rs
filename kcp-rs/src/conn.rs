@@ -141,6 +141,10 @@ impl KcpStream {
     /// # };
     /// # }
     /// ```
+    ///
+    /// Unless [`.conv()`](KcpStreamBuilder::conv) pins the conversation ID,
+    /// the dial gets a **fresh random conv** (Go kcp-go `Dial` parity) — see
+    /// [`random_conv`](crate::random_conv).
     pub fn connect(addr: impl ToSocketAddrs) -> KcpStreamBuilder {
         match resolve_one(addr) {
             Ok(remote) => KcpStreamBuilder {
@@ -151,6 +155,7 @@ impl KcpStream {
                 resolve_err: None,
                 dial: DialTransport::Udp,
                 adopt_conv: false,
+                conv_explicit: false,
                 background_input: true,
                 spawn_flush_loop: true,
                 connect_timeout: None,
@@ -163,6 +168,7 @@ impl KcpStream {
                 resolve_err: Some(e),
                 dial: DialTransport::Udp,
                 adopt_conv: false,
+                conv_explicit: false,
                 background_input: true,
                 spawn_flush_loop: true,
                 connect_timeout: None,
@@ -209,6 +215,7 @@ impl KcpStream {
             resolve_err: None,
             dial: DialTransport::Udp,
             adopt_conv: false,
+            conv_explicit: false,
             background_input: true,
             spawn_flush_loop: true,
             connect_timeout: None,
@@ -227,6 +234,7 @@ impl KcpStream {
                 resolve_err: None,
                 dial: DialTransport::TcpRaw,
                 adopt_conv: false,
+                conv_explicit: false,
                 background_input: true,
                 spawn_flush_loop: true,
                 connect_timeout: None,
@@ -239,6 +247,7 @@ impl KcpStream {
                 resolve_err: Some(e),
                 dial: DialTransport::TcpRaw,
                 adopt_conv: false,
+                conv_explicit: false,
                 background_input: true,
                 spawn_flush_loop: true,
                 connect_timeout: None,
@@ -626,14 +635,54 @@ impl KcpStream {
         self.shared.last_activity_ms.load(Ordering::Relaxed)
     }
 
+    /// Diagnostic: wire datagrams this endpoint has handed to its transport
+    /// (counts retransmissions; excludes drops made by an outer wrapper).
+    pub fn tx_pkts(&self) -> u64 {
+        self.shared.tx_pkts.load(Ordering::Relaxed)
+    }
+
+    /// Diagnostic: wire datagrams this endpoint has accepted from its
+    /// transport (post-wrapper, pre-FEC/KCP parse).
+    pub fn rx_pkts(&self) -> u64 {
+        self.shared.rx_pkts.load(Ordering::Relaxed)
+    }
+
     /// The effective KCP MTU after any FEC overhead adjustment.
     #[doc(hidden)]
     pub fn kcp_mtu(&self) -> u32 {
         self.shared.kcp.lock().mtu()
     }
 
+    /// Effective RTO (ms): when the next retransmission of a lost segment is
+    /// due. Under sustained loss this inflates toward `RTO_MAX` (60 s) —
+    /// stall diagnostics depend on seeing it live.
+    pub fn rx_rto(&self) -> u32 {
+        self.shared.kcp.lock().rx_rto()
+    }
+
+    /// Smoothed RTT (ms) feeding [`rx_rto`](Self::rx_rto).
+    pub fn rx_srtt(&self) -> i32 {
+        self.shared.kcp.lock().rx_srtt()
+    }
+
+    /// RTT variance (ms) feeding [`rx_rto`](Self::rx_rto).
+    pub fn rx_rttvar(&self) -> i32 {
+        self.shared.kcp.lock().rx_rttvar()
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         self.shared.remote_addr
+    }
+
+    /// Last transport error recorded on this session, if any (diagnostic —
+    /// `note_io_error` decides fatality; a session closed by a stray ICMP
+    /// during a loss storm shows it here).
+    pub fn last_io_error(&self) -> Option<String> {
+        self.shared
+            .last_error
+            .lock()
+            .as_ref()
+            .map(|e| e.to_string())
     }
 
     /// Datagrams dropped because they carried a different conversation ID.
@@ -663,6 +712,46 @@ impl KcpStream {
     /// `snd_nxt` with `wait_send > 0` means the sender stopped producing.
     pub fn snd_nxt(&self) -> u32 {
         self.shared.kcp.lock().snd_nxt()
+    }
+
+    /// Segments accepted by `send()` but not yet flushed into `snd_buf`
+    /// (live read — unlike `wait_send()`, which reports the last cached
+    /// flush-loop value). Stall forensics: `snd_queue_len > 0` with idle
+    /// `tx` = flush never ran; `snd_nxt - snd_una > 0` with idle `tx` =
+    /// retransmission ladder stalled.
+    pub fn snd_queue_len(&self) -> u32 {
+        self.shared.kcp.lock().snd_queue_len() as u32
+    }
+
+    /// Whether a sender currently holds the single-sender wire token
+    /// (`is_sending`). Stall forensics: `sending=true` for the whole of a TX
+    /// freeze with `raw_queue_len()>0` ⇒ the token is stuck (no drainer can
+    /// send until it releases); `sending=false` with a frozen `tx` ⇒ the
+    /// flush loop itself is not running.
+    pub fn sending(&self) -> bool {
+        self.shared.is_sending.load(Ordering::Acquire)
+    }
+
+    /// Wire packets drained from the write path and waiting for the token
+    /// holder to hand them to the transport.
+    pub fn raw_queue_len(&self) -> u32 {
+        self.shared.raw_packets.lock().len() as u32
+    }
+
+    /// Flush-loop ticks (stall forensics — flat while segments are stuck in
+    /// `snd_buf` means the loop stopped running).
+    pub fn flush_ticks(&self) -> u64 {
+        self.shared.flush_ticks.load(Ordering::Relaxed)
+    }
+
+    /// This connection's KCP `flush_with_current` call count.
+    pub fn kcp_flush_count(&self) -> u64 {
+        self.shared.kcp.lock().flush_calls()
+    }
+
+    /// This connection's RTO-branch retransmission count.
+    pub fn rto_fires(&self) -> u64 {
+        self.shared.kcp.lock().rto_fires()
     }
 
     /// Segments numbered 0 seen on a session that already received data: the
@@ -715,6 +804,14 @@ impl KcpStream {
     /// full retransmission budget.
     pub fn snd_una(&self) -> u32 {
         self.shared.kcp.lock().snd_una()
+    }
+
+    /// Test seam: put this connection's KCP state into `dead_link` so the
+    /// listener's sweep/delivery handling of dead sessions can be asserted
+    /// without engineering 20 unacked retransmits.
+    #[doc(hidden)]
+    pub fn testing_mark_dead(&self) {
+        self.shared.kcp.lock().testing_mark_dead();
     }
 
     /// Peer's most recently advertised receive window.
@@ -1016,11 +1113,6 @@ macro_rules! kcp_config_setters {
             self
         }
 
-        pub fn conv(mut self, value: u32) -> Self {
-            self.config.conv = value;
-            self
-        }
-
         pub fn token(mut self, value: u32) -> Self {
             self.config.token = value;
             self
@@ -1058,7 +1150,29 @@ macro_rules! kcp_config_setters {
     };
 }
 
+/// `.conv()` setter for builders that must remember the caller pinned it
+/// explicitly. `KcpStreamBuilder` uses the flagged arm so `build()` can tell
+/// "never touched" (randomize, Go-parity) from "pinned to any value, even
+/// [`DEFAULT_CONV`](crate::config::DEFAULT_CONV)" (honour it). `KcpListenerBuilder` has no
+/// dial side and uses the plain arm.
+macro_rules! conv_setter {
+    () => {
+        pub fn conv(mut self, value: u32) -> Self {
+            self.config.conv = value;
+            self
+        }
+    };
+    ($flag:ident) => {
+        pub fn conv(mut self, value: u32) -> Self {
+            self.config.conv = value;
+            self.$flag = true;
+            self
+        }
+    };
+}
+
 // Shared with the listener builders (KcpListenerBuilder / KcpTcpListenerBuilder).
+pub(crate) use conv_setter;
 pub(crate) use kcp_config_setters;
 
 /// Builder for [`KcpStream`]. Call [`.build().await`](Self::build) to construct.
@@ -1070,6 +1184,9 @@ pub struct KcpStreamBuilder {
     resolve_err: Option<io::Error>,
     dial: DialTransport,
     adopt_conv: bool,
+    /// Set by `.conv()` — pins the conv even when it equals
+    /// [`DEFAULT_CONV`](crate::config::DEFAULT_CONV), suppressing the random-dial default.
+    conv_explicit: bool,
     background_input: bool,
     spawn_flush_loop: bool,
     connect_timeout: Option<Duration>,
@@ -1077,11 +1194,14 @@ pub struct KcpStreamBuilder {
 
 impl KcpStreamBuilder {
     kcp_config_setters!();
+    conv_setter!(conv_explicit);
 
     /// Adopt `conv` from the first valid inbound KCP segment.
     ///
     /// Server listeners use this because Go kcptun clients choose the
-    /// conversation ID; dialed client connections keep their configured ID.
+    /// conversation ID; dialed client connections keep their configured ID —
+    /// or, when `.conv()` was never called, a fresh random one (Go-parity
+    /// default, see [`random_conv`](crate::random_conv)).
     pub fn adopt_conv(mut self, enabled: bool) -> Self {
         self.adopt_conv = enabled;
         self
@@ -1143,6 +1263,8 @@ impl KcpStreamBuilder {
             )
         })?;
 
+        // Captured before `self.transport` is moved out below.
+        let caller_supplied_transport = self.transport.is_some();
         let (transport, connected) = if let Some(t) = self.transport {
             (t, self.connected)
         } else {
@@ -1166,7 +1288,27 @@ impl KcpStreamBuilder {
             }
         };
 
-        let config = self.config;
+        let mut config = self.config;
+        // Go kcp-go's Dial picks a fresh random conv per connection (sess.go
+        // `DialWithOptions` → `binary.Read(rand.Reader, …)`), so when a peer
+        // re-dials from a reused UDP source address the listener sees a conv
+        // mismatch and *replaces* the lingering session instead of feeding the
+        // new connection into the old state machine (which yields wrong-bytes
+        // delivery or a stuck timeout — see bugs/BUGREPORT_KCP_LISTENER_
+        // STALE_SESSION_ALIASING.md). Same rule here, scoped to what that
+        // hazard actually needs: plain UDP dials (`transport.is_none()` &&
+        // `DialTransport::Udp`), never a pinned `.conv()`, never an adopting
+        // (server-side) build. `with_transport` callers own the transport
+        // identity — TCP pairs have no address-reuse aliasing — so they keep
+        // the configured conv; kcptun-common opts its UDP dial in explicitly.
+        if !caller_supplied_transport
+            && matches!(self.dial, DialTransport::Udp)
+            && !self.adopt_conv
+            && !self.conv_explicit
+            && config.conv == crate::config::DEFAULT_CONV
+        {
+            config.conv = crate::config::random_conv();
+        }
         let raw_packets = Arc::new(Mutex::new(RawPacketQueue::default()));
         let raw_packets_cb = raw_packets.clone();
 
@@ -1234,7 +1376,10 @@ impl KcpStreamBuilder {
             background_input: self.background_input,
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             last_rx_ms: AtomicU64::new(knet::mono_ms()),
+            tx_pkts: AtomicU64::new(0),
+            rx_pkts: AtomicU64::new(0),
             is_sending: AtomicBool::new(false),
+            flush_ticks: AtomicU64::new(0),
             fec_encoder,
             fec_decoder,
             read_timeout: Mutex::new(None),
