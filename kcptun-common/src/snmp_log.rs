@@ -7,14 +7,34 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{error, info};
 
-/// Expand Go time-layout tokens using local time. Percent-style tokens remain
-/// supported as a Rust extension for existing configurations.
+/// Expand time-layout tokens in the **final path component only**, using
+/// local time. Percent-style tokens remain supported as a Rust extension for
+/// existing configurations.
+///
+/// Go parity (verified empirically against the kcptun Go binaries,
+/// 2026-10-11): Go time-formats only `filepath.Base(--snmplog)` and never
+/// rewrites directory components — a dir containing layout tokens
+/// (`run_20261011`, even one with `2006` in it) stays verbatim while
+/// `snmp-20060102.csv` in it expands to today's date. Rewriting the whole
+/// path corrupted date-like directory names: the substring scan turned
+/// `run_20261011_131816` into `run_21161011_…` (a `02` day-token hit inside
+/// the year digits), so the logger opened a nonexistent directory and every
+/// `--snmplog` write failed — `bugs/BUGREPORT_SNMPLOG_PATH_TIME_EXPANSION.md`.
 fn expand_time_format(path: &str) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    expand_time_format_with_parts(path, local_time_parts(secs))
+    let parts = local_time_parts(secs);
+    match path.rfind(['/', '\\']) {
+        Some(i) => format!(
+            "{}{}{}",
+            &path[..i],
+            &path[i..i + 1],
+            expand_time_format_with_parts(&path[i + 1..], parts)
+        ),
+        None => expand_time_format_with_parts(path, parts),
+    }
 }
 
 fn expand_time_format_with_parts(
@@ -287,10 +307,60 @@ mod tests {
 
     #[test]
     fn test_expand_time_format_mixed_literals() {
+        // Directories are never rewritten (Go parity) — only the basename
+        // is time-formatted.
         let result = expand_time_format("/var/log/kcptun/%Y/%m/snmp-%d.log");
-        assert!(!result.contains('%'), "all % specifiers must be replaced");
-        assert!(result.starts_with("/var/log/kcptun/"));
-        assert!(result.ends_with(".log"));
+        assert!(
+            result.starts_with("/var/log/kcptun/%Y/%m/"),
+            "directory must stay verbatim: {result}"
+        );
+        let base = &result[result.rfind('/').unwrap() + 1..];
+        assert!(
+            !base.contains('%'),
+            "basename tokens must be replaced: {base}"
+        );
+        assert!(base.ends_with(".log"));
+    }
+
+    /// Regression: whole-path expansion rewrote date-like directory names
+    /// (substring `02` inside `2026…` hit the day token), so the logger
+    /// opened `run_21161011_…` — a directory that never existed — and every
+    /// snmp write failed. The path must come back byte-identical when the
+    /// basename carries no tokens. bugs/BUGREPORT_SNMPLOG_PATH_TIME_EXPANSION.md
+    #[test]
+    fn test_expand_never_rewrites_date_like_directories() {
+        let result = expand_time_format("/tmp/run_20261011_131816/snmp.csv");
+        assert_eq!(result, "/tmp/run_20261011_131816/snmp.csv");
+        let result = expand_time_format("run_20261011_131816/snmp.csv");
+        assert_eq!(result, "run_20261011_131816/snmp.csv");
+    }
+
+    /// Go-parity matrix (mirrors the T1/T2/T3 experiments against the Go
+    /// kcptun binaries): a directory keeps every token-shaped substring —
+    /// even `2006` — while the basename is expanded.
+    #[test]
+    fn test_expand_matches_go_basename_only_behaviour() {
+        // Eight ASCII digits between the fixed affixes = today's YYYYMMDD.
+        // (Computed at run time: a hard-coded date broke this test at
+        // midnight — 2026-10-11 → 10-12.)
+        let digits_ok = |r: &str| {
+            let base = &r[r.rfind('/').map(|i| i + 1).unwrap_or(0)..];
+            base.strip_prefix("snmp-")
+                .and_then(|b| b.strip_suffix(".csv"))
+                .is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()))
+        };
+        // T2: dir without `2006`, basename with Go layout tokens.
+        let r = expand_time_format("/tmp/run_20261011_131816/snmp-20060102.csv");
+        assert!(r.starts_with("/tmp/run_20261011_131816/"), "dir kept: {r}");
+        assert_ne!(
+            r, "/tmp/run_20261011_131816/snmp-20060102.csv",
+            "base expanded"
+        );
+        assert!(digits_ok(&r), "base = YYYYMMDD: {r}");
+        // T3: dir CONTAINING `2006` is still untouched.
+        let r = expand_time_format("/tmp/d2006x/snmp-20060102.csv");
+        assert!(r.starts_with("/tmp/d2006x/"), "dir with 2006 kept: {r}");
+        assert!(digits_ok(&r), "base expanded: {r}");
     }
 
     #[test]
