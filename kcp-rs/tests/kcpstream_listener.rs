@@ -773,3 +773,85 @@ fn listener_accept_echo_unpinned_conv_dial() {
         listener.close();
     });
 }
+
+/// `dead_link` state must not cost the session: kcp-go sets `state = -1`
+/// and nothing in Go reads it back (sess.go has zero references), so the
+/// listener must keep delivering to — and sweeping with — a dead-marked
+/// session. Regression for BUGREPORT_LISTENER_DEAD_LINK_SESSION_KILL, where
+/// `sweep()` and `lookup_established()` used to close/reap `is_dead()`
+/// sessions and turned recoverable loss stalls into hard teardowns.
+#[test]
+fn listener_serves_dead_link_sessions() {
+    knet::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .conv(CONV)
+            .mode(KcpMode::Fast3)
+            .sndwnd(512)
+            .rcvwnd(512)
+            .build()
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = KcpStream::connect(addr)
+            .conv(CONV)
+            .mode(KcpMode::Fast3)
+            .sndwnd(512)
+            .rcvwnd(512)
+            .build()
+            .await
+            .unwrap();
+
+        let payload = make_payload(64 * 1024, 7);
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+
+        let (mut server, _peer) = listener.accept().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        read_exact_timeout(&mut server, &mut got, Duration::from_secs(30)).await;
+        assert_eq!(got, payload, "first exchange wrong bytes");
+
+        // Declare dead_link on the accepted (server-side) session.
+        server.testing_mark_dead();
+        assert!(server.is_dead(), "seam must put the session in dead state");
+
+        // (a) The 1 s sweep must leave it alone: wait past several sweep
+        // intervals (the receive task sweeps on its 1 s recv timeout even
+        // with no traffic).
+        knet::sleep_ms(2500).await;
+        assert!(
+            !server.is_closed(),
+            "sweep closed a dead_link session (state-only teardown)"
+        );
+        assert_eq!(
+            listener.session_count(),
+            1,
+            "sweep reaped a dead_link session"
+        );
+
+        // (b) The delivery path must keep serving it: a fresh inbound from
+        // the peer goes through lookup_established, which previously reaped
+        // on is_dead(). Second exchange, both directions.
+        let payload2 = make_payload(64 * 1024, 9);
+        client.write_all(&payload2).await.unwrap();
+        client.flush().await.unwrap();
+        let mut got2 = vec![0u8; payload2.len()];
+        read_exact_timeout(&mut server, &mut got2, Duration::from_secs(30)).await;
+        assert_eq!(got2, payload2, "dead_link session stopped receiving");
+
+        server.write_all(&payload2).await.unwrap();
+        server.flush().await.unwrap();
+        let mut back = vec![0u8; payload2.len()];
+        read_exact_timeout(&mut client, &mut back, Duration::from_secs(30)).await;
+        assert_eq!(back, payload2, "dead_link session stopped echoing");
+        assert_eq!(
+            listener.session_count(),
+            1,
+            "inbound delivery reaped the dead_link session"
+        );
+
+        drop(client);
+        drop(server);
+        listener.close();
+    });
+}

@@ -670,14 +670,54 @@ impl KcpStream {
         self.shared.last_activity_ms.load(Ordering::Relaxed)
     }
 
+    /// Diagnostic: wire datagrams this endpoint has handed to its transport
+    /// (counts retransmissions; excludes drops made by an outer wrapper).
+    pub fn tx_pkts(&self) -> u64 {
+        self.shared.tx_pkts.load(Ordering::Relaxed)
+    }
+
+    /// Diagnostic: wire datagrams this endpoint has accepted from its
+    /// transport (post-wrapper, pre-FEC/KCP parse).
+    pub fn rx_pkts(&self) -> u64 {
+        self.shared.rx_pkts.load(Ordering::Relaxed)
+    }
+
     /// The effective KCP MTU after any FEC overhead adjustment.
     #[doc(hidden)]
     pub fn kcp_mtu(&self) -> u32 {
         self.shared.kcp.lock().mtu()
     }
 
+    /// Effective RTO (ms): when the next retransmission of a lost segment is
+    /// due. Under sustained loss this inflates toward `RTO_MAX` (60 s) —
+    /// stall diagnostics depend on seeing it live.
+    pub fn rx_rto(&self) -> u32 {
+        self.shared.kcp.lock().rx_rto()
+    }
+
+    /// Smoothed RTT (ms) feeding [`rx_rto`](Self::rx_rto).
+    pub fn rx_srtt(&self) -> i32 {
+        self.shared.kcp.lock().rx_srtt()
+    }
+
+    /// RTT variance (ms) feeding [`rx_rto`](Self::rx_rto).
+    pub fn rx_rttvar(&self) -> i32 {
+        self.shared.kcp.lock().rx_rttvar()
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         self.shared.remote_addr
+    }
+
+    /// Last transport error recorded on this session, if any (diagnostic —
+    /// `note_io_error` decides fatality; a session closed by a stray ICMP
+    /// during a loss storm shows it here).
+    pub fn last_io_error(&self) -> Option<String> {
+        self.shared
+            .last_error
+            .lock()
+            .as_ref()
+            .map(|e| e.to_string())
     }
 
     /// Datagrams dropped because they carried a different conversation ID.
@@ -707,6 +747,46 @@ impl KcpStream {
     /// `snd_nxt` with `wait_send > 0` means the sender stopped producing.
     pub fn snd_nxt(&self) -> u32 {
         self.shared.kcp.lock().snd_nxt()
+    }
+
+    /// Segments accepted by `send()` but not yet flushed into `snd_buf`
+    /// (live read — unlike `wait_send()`, which reports the last cached
+    /// flush-loop value). Stall forensics: `snd_queue_len > 0` with idle
+    /// `tx` = flush never ran; `snd_nxt - snd_una > 0` with idle `tx` =
+    /// retransmission ladder stalled.
+    pub fn snd_queue_len(&self) -> u32 {
+        self.shared.kcp.lock().snd_queue_len() as u32
+    }
+
+    /// Whether a sender currently holds the single-sender wire token
+    /// (`is_sending`). Stall forensics: `sending=true` for the whole of a TX
+    /// freeze with `raw_queue_len()>0` ⇒ the token is stuck (no drainer can
+    /// send until it releases); `sending=false` with a frozen `tx` ⇒ the
+    /// flush loop itself is not running.
+    pub fn sending(&self) -> bool {
+        self.shared.is_sending.load(Ordering::Acquire)
+    }
+
+    /// Wire packets drained from the write path and waiting for the token
+    /// holder to hand them to the transport.
+    pub fn raw_queue_len(&self) -> u32 {
+        self.shared.raw_packets.lock().len() as u32
+    }
+
+    /// Flush-loop ticks (stall forensics — flat while segments are stuck in
+    /// `snd_buf` means the loop stopped running).
+    pub fn flush_ticks(&self) -> u64 {
+        self.shared.flush_ticks.load(Ordering::Relaxed)
+    }
+
+    /// This connection's KCP `flush_with_current` call count.
+    pub fn kcp_flush_count(&self) -> u64 {
+        self.shared.kcp.lock().flush_calls()
+    }
+
+    /// This connection's RTO-branch retransmission count.
+    pub fn rto_fires(&self) -> u64 {
+        self.shared.kcp.lock().rto_fires()
     }
 
     /// Segments numbered 0 seen on a session that already received data: the
@@ -759,6 +839,14 @@ impl KcpStream {
     /// full retransmission budget.
     pub fn snd_una(&self) -> u32 {
         self.shared.kcp.lock().snd_una()
+    }
+
+    /// Test seam: put this connection's KCP state into `dead_link` so the
+    /// listener's sweep/delivery handling of dead sessions can be asserted
+    /// without engineering 20 unacked retransmits.
+    #[doc(hidden)]
+    pub fn testing_mark_dead(&self) {
+        self.shared.kcp.lock().testing_mark_dead();
     }
 
     /// Peer's most recently advertised receive window.
@@ -1327,7 +1415,10 @@ impl KcpStreamBuilder {
             background_input: self.background_input,
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             last_rx_ms: AtomicU64::new(knet::mono_ms()),
+            tx_pkts: AtomicU64::new(0),
+            rx_pkts: AtomicU64::new(0),
             is_sending: AtomicBool::new(false),
+            flush_ticks: AtomicU64::new(0),
             fec_encoder,
             fec_decoder,
             read_timeout: Mutex::new(None),

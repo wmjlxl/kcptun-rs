@@ -5,7 +5,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
-    <img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests">
+    <img src="https://img.shields.io/badge/tests-443%20passed-brightgreen" alt="Tests">
     <img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
     <img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust">
@@ -18,7 +18,7 @@
     <tr>
       <td align="center" width="25%"><b>5.38×</b><br><sub>max speedup vs Go</sub></td>
       <td align="center" width="25%"><b>68 / 68</b><br><sub>Go↔Rust e2e tests</sub></td>
-      <td align="center" width="25%"><b>334</b><br><sub>unit tests</sub></td>
+      <td align="center" width="25%"><b>443</b><br><sub>unit tests</sub></td>
       <td align="center" width="25%"><b>~2 MB</b><br><sub>stripped binary</sub></td>
     </tr>
   </table>
@@ -703,11 +703,18 @@ re-attempted):
 
 | Test Type | Count | What It Verifies |
 |:----------|:-----:|:-----------------|
-| Unit tests | 334 | Individual crate correctness |
+| Unit tests | 443 | Individual crate correctness |
 | E2E interop | 68 | Go↔Rust bidirectional compatibility |
 | Stress tests | 8 | Byte-for-byte data integrity at scale |
+| Stability run | PASS | Formal 1 h × 20-client remote run, six criteria (stall threshold 150 s since 2026-10-12) |
+| Integrity hunt | 27.08M / 0 | Instrumented exchanges byte-verified (~358 GB), zero failures as of 2026-10-15 |
 | Clippy | `-D warnings` | Zero warnings enforced |
 | Fmt | `cargo fmt --check` | Consistent formatting |
+
+Stall note: under heavy loss, KCP retransmission slots stretch up to the
+Go-identical `RTO_MAX` (60 s) cap — self-healing, not a defect
+(`bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`). The listener never
+tears a session down on `dead_link` state alone, matching Go.
 
 ## 📋 CLI Options
 

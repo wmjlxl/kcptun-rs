@@ -340,6 +340,15 @@ mod tests {
     /// even `2006` — while the basename is expanded.
     #[test]
     fn test_expand_matches_go_basename_only_behaviour() {
+        // Eight ASCII digits between the fixed affixes = today's YYYYMMDD.
+        // (Computed at run time: a hard-coded date broke this test at
+        // midnight — 2026-10-11 → 10-12.)
+        let digits_ok = |r: &str| {
+            let base = &r[r.rfind('/').map(|i| i + 1).unwrap_or(0)..];
+            base.strip_prefix("snmp-")
+                .and_then(|b| b.strip_suffix(".csv"))
+                .is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()))
+        };
         // T2: dir without `2006`, basename with Go layout tokens.
         let r = expand_time_format("/tmp/run_20261011_131816/snmp-20060102.csv");
         assert!(r.starts_with("/tmp/run_20261011_131816/"), "dir kept: {r}");
@@ -347,11 +356,11 @@ mod tests {
             r, "/tmp/run_20261011_131816/snmp-20060102.csv",
             "base expanded"
         );
-        assert!(r.ends_with("/snmp-20261011.csv"), "base = today: {r}");
+        assert!(digits_ok(&r), "base = YYYYMMDD: {r}");
         // T3: dir CONTAINING `2006` is still untouched.
         let r = expand_time_format("/tmp/d2006x/snmp-20060102.csv");
         assert!(r.starts_with("/tmp/d2006x/"), "dir with 2006 kept: {r}");
-        assert!(r.ends_with("/snmp-20261011.csv"), "base expanded: {r}");
+        assert!(digits_ok(&r), "base expanded: {r}");
     }
 
     #[test]

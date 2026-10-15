@@ -459,7 +459,10 @@ impl KcpListener {
                     .get(&entry.peer)
                     .map(|s| s.conn.same_connection(&entry.conn))
                     .unwrap_or(false);
-                if same_session && !entry.conn.is_closed() && !entry.conn.is_dead() {
+                // dead_link state is informational (see lookup_established): a
+                // pending session whose KCP hit dead_link during a loss storm is
+                // still recoverable — never discard it here.
+                if same_session && !entry.conn.is_closed() {
                     entry.conn.attach_owner();
                     accepted = Some((entry.conn, entry.peer));
                     break;
@@ -538,9 +541,20 @@ impl KcpListener {
 
     /// Live resource-accounting snapshot.
     pub fn stats(&self) -> WorkerPoolStats {
+        // Each lock is taken and **released** by its own `let` statement. In
+        // the previous struct-literal form both temporaries lived until the
+        // end of the statement, so this call held `sessions` while waiting
+        // for `building` — the inverse of the publish/admit/register paths'
+        // documented `building` → `sessions` order. That ABBA inversion
+        // deadlocked `session_cap_test` under load (main parked in
+        // `stats()` at this line, a build task parked in `spawn_build_task`
+        // holding `building` and waiting for `sessions`); lldb backtraces in
+        // bugs/BUGREPORT_STATS_BUILDING_SESSIONS_ABBA_DEADLOCK.md.
+        let sessions = self.sessions.lock().len();
+        let building = self.building.lock().len();
         WorkerPoolStats {
-            sessions: self.sessions.lock().len(),
-            building: self.building.lock().len(),
+            sessions,
+            building,
             channel_drops: self.stats.channel_drops.load(Ordering::Relaxed),
             session_drops: self.stats.session_drops.load(Ordering::Relaxed),
             build_failures: self.stats.build_failures.load(Ordering::Relaxed),
@@ -1072,7 +1086,15 @@ fn lookup_established(args: &RxArgs, peer: SocketAddr) -> Established {
     let (removed, stale) = {
         let mut sessions = args.sessions.lock();
         match sessions.get(&peer) {
-            Some(s) if !s.conn.is_closed() && !s.conn.is_dead() => {
+            // `is_dead()` (dead_link, xmit ≥ 20) is INFORMATIONAL: kcp-go sets
+            // `state = -1` and nothing in Go ever reads it back — sess.go has no
+            // close-on-dead path. Treating it as removal here turned recoverable
+            // loss-storm stalls (peer alive, delivery resumed within the RTO
+            // ladder) into hard session death: observed live in the corruption
+            // hunt, `bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`. Closed
+            // sessions still leave on sight; a truly vanished peer is covered by
+            // the idle reaper (and, in the production stack, SMUX keepalive).
+            Some(s) if !s.conn.is_closed() => {
                 return Established::Live(s.conn.clone());
             }
             None => return Established::None,
@@ -1325,7 +1347,7 @@ fn spawn_build_task(
             // published map would overshoot `max_sessions_per_worker`.
             let mut live = sessions.lock();
             let mut waiting = pending.lock();
-            if closed.load(Ordering::Acquire) || conn.is_closed() || conn.is_dead() {
+            if closed.load(Ordering::Acquire) || conn.is_closed() {
                 drop(waiting);
                 drop(live);
                 drop(b);
@@ -1508,11 +1530,18 @@ fn decrypt_batch_in_place(
 
 /// Drop sessions the listener should no longer keep alive.
 ///
-/// A session is reaped when KCP declares the link dead, when it is already
-/// closed, or when `limits.idle_timeout` has passed with no inbound datagram
-/// and no successful write. Every reaped session is closed, not just dropped:
-/// the map holds a non-owning clone, so a bare `remove` leaves the flush loop
+/// A session is reaped when it is already closed, or when
+/// `limits.idle_timeout` has passed with no inbound datagram and no
+/// successful write. Every reaped session is closed, not just dropped: the
+/// map holds a non-owning clone, so a bare `remove` leaves the flush loop
 /// running.
+///
+/// `is_dead()` (dead_link) is deliberately NOT a reap trigger: kcp-go sets
+/// `state = -1` and nothing in Go reads it back, and under a loss storm
+/// dead_link fires on *recoverable* links (20 fast-ladder retransmits ≈ 11 s
+/// at `rto=100`) — killing then converts a slow-but-healing session into a
+/// hard teardown while the peer is alive. See
+/// `bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`.
 fn sweep(args: &RxArgs) {
     // On a silent listener the existing sweep timer also bounds stale limiter
     // storage lifetime: at most ceil(4096 / 32) sweep intervals after expiry.
@@ -1520,10 +1549,11 @@ fn sweep(args: &RxArgs) {
         .lock()
         .expire(Instant::now(), IP_LIMITER_CLEANUP_BUDGET);
     // Scan the whole map. The lock is only held to clone the session handles;
-    // `is_dead()` runs after it is dropped. Capping the scan (the old 4096)
-    // starved anything past that prefix: `HashMap` iteration order is bucket
-    // order, so the same entries came first on every pass until one of them
-    // was removed, and a closed session behind them was never reaped.
+    // the `is_closed()` / idle checks run after it is dropped. Capping the
+    // scan (the old 4096) starved anything past that prefix: `HashMap`
+    // iteration order is bucket order, so the same entries came first on
+    // every pass until one of them was removed, and a closed session behind
+    // them was never reaped.
     let candidates: Vec<(SocketAddr, KcpStream)> = {
         let sessions = args.sessions.lock();
         sessions.iter().map(|(p, s)| (*p, s.conn.clone())).collect()
@@ -1554,7 +1584,7 @@ fn sweep(args: &RxArgs) {
     let idle_ms = args.limits.idle_timeout.as_millis() as u64;
     let mut dead: Vec<(SocketAddr, KcpStream, bool)> = Vec::new();
     for (peer, conn) in candidates {
-        if conn.is_dead() || conn.is_closed() {
+        if conn.is_closed() {
             dead.push((peer, conn, false));
         } else if idle_ms > 0 && now.saturating_sub(conn.last_activity_ms()) >= idle_ms {
             dead.push((peer, conn, true));

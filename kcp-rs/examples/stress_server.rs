@@ -199,10 +199,21 @@ fn main() {
     ) {
         use knet::AsyncWriteExt;
         let mut buf = vec![0u8; 65536];
+        // Running FNV-1a64 over everything this session echoed back: for a
+        // one-exchange burst session it equals fnv(sent payload) — exactly
+        // what stress_client logs on a mismatch — localising the corrupting
+        // leg (client-TX/server-RX vs server-TX/client-RX).
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut total: u64 = 0;
         loop {
             match knet::timeout(idle, stream.read(&mut buf)).await {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => {
+                    for &b in &buf[..n] {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+                    }
+                    total += n as u64;
                     if stream.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
@@ -214,6 +225,13 @@ fn main() {
                 Err(_) => break, // idle deadline: peer vanished without FIN
             }
         }
+        println!(
+            "t={} echo_stat peer={} bytes={} fnv={:016x}",
+            now_secs(),
+            peer,
+            total,
+            h
+        );
         drop(stream);
         listener.remove_peer(peer);
     }

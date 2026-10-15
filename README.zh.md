@@ -5,7 +5,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
-    <img src="https://img.shields.io/badge/tests-334%20passed-brightgreen" alt="Tests">
+    <img src="https://img.shields.io/badge/tests-443%20passed-brightgreen" alt="Tests">
     <img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
     <img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust">
@@ -18,7 +18,7 @@
     <tr>
       <td align="center" width="25%"><b>5.38×</b><br><sub>相对 Go 最高加速</sub></td>
       <td align="center" width="25%"><b>68 / 68</b><br><sub>Go↔Rust 端到端测试</sub></td>
-      <td align="center" width="25%"><b>334</b><br><sub>单元测试</sub></td>
+      <td align="center" width="25%"><b>443</b><br><sub>单元测试</sub></td>
       <td align="center" width="25%"><b>~2 MB</b><br><sub>strip 后二进制</sub></td>
     </tr>
   </table>
@@ -661,11 +661,16 @@ wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）�
 
 | 测试类型 | 数量 | 验证内容 |
 |:--------|:---:|---------|
-| 单元测试 | 334 | 各 crate 的正确性 |
+| 单元测试 | 443 | 各 crate 的正确性 |
 | E2E 互通 | 68 | Go↔Rust 双向兼容性 |
 | 压力测试 | 8 | 大规模下逐字节数据完整性 |
+| 稳定性长跑 | PASS | 远端 1 小时 × 20 客户端正式测试，六项判据全过（停摆阈值 2026-10-12 起为 150 秒） |
+| 完整性猎捕 | 2708 万 / 0 | 仪器化交换逐字节校验（约 358 GB），截至 2026-10-15 零失败 |
 | Clippy | `-D warnings` | 零警告强制 |
 | Fmt | `cargo fmt --check` | 一致的代码格式 |
+
+停摆说明：高丢包下 KCP 重传槽位会膨胀至与 Go 完全一致的 `RTO_MAX`（60 秒）上限——属可自愈的算法固有行为，不是缺陷
+（`bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`）。监听器不会仅因 `dead_link` 状态拆除会话，与 Go 行为一致。
 
 ## 💡 为什么选择 Rust？
 

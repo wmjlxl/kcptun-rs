@@ -127,9 +127,21 @@ mod imp {
         1, 64, 1400, 1349, 1350, 1351, 8191, 8192, 8193, 65536, 262144, 524288,
     ];
     const STREAM_BLOCK: usize = 65536;
-    const RECV_DEADLINE_SECS: u64 = 60;
+    // Recalibrated 2026-10-12 (user-approved) after the RTO analysis
+    // (bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md): under sustained
+    // loss, KCP's retransmission slots stretch with the inflated `rx_rto`
+    // up to the Go-identical `RTO_MAX = 60 s` cap, so a *self-healing* tail
+    // stall can legitimately run to ~63 s (one cap slot) and ~120 s if that
+    // slot's attempt is itself lost. The old 60 s thresholds counted those
+    // expected stalls as failures (formal run: stalls=4, timeouts=396 with
+    // zero verify errors and zero reconnects). 150 s sits above two cap
+    // slots + margin: algorithm-expected stalls heal below it, while a real
+    // wedge (never heals — the pre-fix failure mode) still trips both the
+    // recv deadline and the watchdog, so the `stalls == 0` criterion stays
+    // strict and only true hangs can fail it.
+    const RECV_DEADLINE_SECS: u64 = 150;
     const CONNECT_DEADLINE_SECS: u64 = 30;
-    const STALL_SECS: u64 = 60;
+    const STALL_SECS: u64 = 150;
     const MAX_ERROR_SAMPLES: usize = 50;
 
     fn now_secs() -> f64 {
@@ -278,6 +290,17 @@ mod imp {
         }))
     }
 
+    /// FNV-1a64 — correlates a dumped payload with the server's per-session
+    /// stream hash (stress_server logs it on session end).
+    fn fnv1a(data: &[u8]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h
+    }
+
     /// Read exactly `n` bytes before the deadline (1 s poll slices so the
     /// stop flag stays responsive). Returns short-read EOF as an error.
     async fn recv_exact(
@@ -357,12 +380,25 @@ mod imp {
         } else {
             let sample = format!(
                 "{{\"kind\":\"mismatch\",\"sent_len\":{},\"recv_len\":{},\"first_diff\":{},\
-                 \"seq\":{seq},\"size\":{size},\"loop\":\"{loop_tag}\"}}",
+                 \"seq\":{seq},\"size\":{size},\"loop\":\"{loop_tag}\",\
+                 \"fnv_sent\":\"{:016x}\",\"fnv_got\":\"{:016x}\"}}",
                 payload.len(),
                 got.len(),
                 first_diff(payload, got),
+                fnv1a(payload),
+                fnv1a(got),
             );
-            ctx.emit("verify_fail", &format!(",\"sample\":{sample}"));
+            // Keep both buffers: correlate fnv_sent with the server's
+            // per-session stream hash to localise the corrupting leg
+            // (client-TX/server-RX vs server-TX/client-RX).
+            // bugs/BUGREPORT_KCP_SEGMENT_CONTENT_CORRUPTION.md
+            let base = format!("{}/fail_{}_{}", ctx.args.logdir, ctx.args.id, seq);
+            let _ = std::fs::write(format!("{base}.sent.bin"), payload);
+            let _ = std::fs::write(format!("{base}.got.bin"), got);
+            ctx.emit(
+                "verify_fail",
+                &format!(",\"sample\":{sample},\"dump\":\"{base}\""),
+            );
             ctx.c.add_verify_error(sample);
             ctx.c.bytes_sent.fetch_add(size as u64, Ordering::Relaxed);
         }

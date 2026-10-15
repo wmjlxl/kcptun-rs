@@ -1,12 +1,17 @@
 # BUGREPORT：TX 超时重排重发已发前缀 + 提交 2660e262 复审（SMUX reap / token 记账）
 
-> **状态**: **Partial → 唯一残留: §6.1 token 回收时机**（2026-10-11 复核）—
+> **状态**: **全部修复**（2026-10-11 复核 + §6.1 落地）—
 > §一 BUG-1/2/3 均已修（`TxProgress` 已交付前缀不再重发、
 > `spawn_send_remainder` 改为发送 `packets[sent..]` 未发后缀、
 > `push_data_bytes` 补上 `BufferOverflow` 失败路径与 `return_tokens` 契约）；
 > §五 BUG-4 报告内文已标"已修"（收集+存快照同锁）；§6.2 reap 已收敛到
-> `reap_stale_streams`。**仍开放仅 §6.1**: token 回收时机晚于 Go（`Stream::close`
-> 未提前回收，最长 30s linger 后才在 reap 回收）。
+> `reap_stale_streams`。**§6.1 亦已修（同日落地）**: `Stream::close()`/
+> `clear_buffers()` 现在把被丢弃的接收缓冲字节经 `tokens_to_return` 交还
+> （锁内捕获 → 下一 flush 周期 Pass1/`reclaim_tokens` 归还；与 reap 的
+> `recycle_tokens` 任一顺序恰好归还一次），并把 `read()` 窗口记账移入
+> recv 锁内，消除记账与 `swap(0)` 并发的 usize 下溢 + 双还隐性竞态。
+> 回归测试: `close_returns_unread_receive_window_on_next_reclaim`、
+> `close_then_remove_returns_window_exactly_once`。
 
 
 > 分析日期：2026-09-20
@@ -185,11 +190,11 @@ fn rebuild_snapshot(&self) {
 
 ## 六、残留缺口：token 回收仍晚于 Go；reap 逻辑重复实现
 
-**状态**：部分修复。§6.2 的 reap 重复实现已收敛到 `reap_stale_streams`（含 `pending_send()==0` 守卫 + linger 分支 FIN 补发）；§6.1 的 token 回收时机仍晚于 Go（需在 `Stream::close` 时提前回收，当前仍在 reap 时回收）。
+**状态**：**已修复**（2026-10-11）。§6.2 的 reap 重复实现已收敛到 `reap_stale_streams`（含 `pending_send()==0` 守卫 + linger 分支 FIN 补发）；§6.1 的 token 回收已提前到 `Stream::close()`：close 丢弃的接收缓冲字节经 `tokens_to_return` 在下一 flush 周期归还（对齐 Go `streamClosed` 时机），详见下方"已修复"标注。
 
 **位置**：`kcptun-common/src/kcptun_session.rs:962-982`（write_loop reap）；对照 `smux-rs/src/session.rs:643-690`（`reap_stale_streams`）
 
-### 6.1 回收时机
+### 6.1 回收时机（**已修复 2026-10-11** — `close()`/`clear_buffers()` 锁内捕获丢弃字节 → `tokens_to_return` → 下个 flush 周期归还；`read()` 记账同步移入 recv 锁，消除 swap 并发下溢/双还）
 
 Go 的 smux 在 `streamClosed`（即 `Close()` 时）就 `recycleTokens`；本移植在 **reap 时**才回收：
 

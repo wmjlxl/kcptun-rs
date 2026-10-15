@@ -41,8 +41,11 @@ None (flat `src/`).
 - **Receive flow control is session-level and cooperative.** `process_data`
   charges `token_bucket` for every buffered payload byte; the flush cycle
   (`prepare_outbound_into` → `reclaim_tokens`) returns what the application
-  has read, and `remove_stream` / `reap_stale_streams` recycle what will
-  never be read. A transport read loop **must** check
+  has read, **including the unread bytes a `Stream::close()`/`clear_buffers()`
+  discarded** (moved into `tokens_to_return` under the recv lock — Go parity:
+  the window returns at close, not at reap; never `store(0)` the discard), and
+  `remove_stream` / `reap_stale_streams` recycle what will never be read —
+  every path returns each charged byte exactly once, any order. A transport read loop **must** check
   `Session::has_receive_capacity()` before pulling more data (both
   `SmuxConn::run` and `kcptun-common`'s `read_loop` do) — with `version = 1`
   there is no per-stream window at all, so this bucket is the only bound on

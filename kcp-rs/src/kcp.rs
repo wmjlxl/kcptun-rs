@@ -73,6 +73,13 @@ pub struct KCP {
     pub token: u32,
     state: u32, // 0xFFFFFFFF = dead (matching Go dead_link)
 
+    /// Stall-forensics counters: how many times this connection's state
+    /// machine was flushed, and how many RTO-branch fires it produced.
+    /// A stall snapshot with `flush_calls` advancing but `rto_fires` flat
+    /// localises suppression inside the flush itself.
+    flush_calls: u64,
+    rto_fires: u64,
+
     // ── Send side ──
     snd_queue: VecDeque<Segment>,
     snd_buf: VecDeque<Segment>,
@@ -241,6 +248,8 @@ impl KCP {
             conv,
             token,
             state: 0,
+            flush_calls: 0,
+            rto_fires: 0,
             // High-concurrency servers may hold thousands of mostly idle KCP
             // states. Allocate segment slots on first traffic instead of
             // reserving four 128-entry Segment arrays for every connection.
@@ -1178,6 +1187,7 @@ impl KCP {
     /// value (e.g., `update()` receives `current`), avoiding a redundant
     /// `SystemTime::now()` syscall inside the flush loop.
     pub fn flush_with_current(&mut self, current: u32, flush_acks: bool) -> u32 {
+        self.flush_calls = self.flush_calls.wrapping_add(1);
         let mtu = self.mtu as usize;
 
         // Reuse the pre-allocated ACK segment (avoids pool acquire/release per
@@ -1220,6 +1230,7 @@ impl KCP {
 
         // ── Flush data segments ──
         let stats = self.flush_data_segs(current, mtu, resent, new_segs_count);
+        self.rto_fires = self.rto_fires.wrapping_add(stats.lost_segs);
 
         // Update retransmission stats (matching Go)
         let retrans_sum = stats.lost_segs + stats.fast_retrans_segs + stats.early_retrans_segs;
@@ -1606,10 +1617,43 @@ impl KCP {
         self.state == DEAD_LINK_STATE
     }
 
+    /// Test seam: force `dead_link` state without 20 lost retransmissions,
+    /// so listener-level handling of a dead session is testable.
+    #[doc(hidden)]
+    pub fn testing_mark_dead(&mut self) {
+        self.state = DEAD_LINK_STATE;
+    }
+
+    /// Total [`flush_with_current`](Self::flush_with_current) calls.
+    #[inline]
+    pub fn flush_calls(&self) -> u64 {
+        self.flush_calls
+    }
+
+    /// Total segments retransmitted by the RTO branch (stall forensics).
+    #[inline]
+    pub fn rto_fires(&self) -> u64 {
+        self.rto_fires
+    }
+
     /// Get the current RTO value.
     #[inline]
     pub fn rx_rto(&self) -> u32 {
         self.rx_rto
+    }
+
+    /// Smoothed RTT (ms) feeding [`rx_rto`](Self::rx_rto). Diagnostic: a
+    /// climbing `rx_srtt` under loss explains retransmission slots that
+    /// stretch from milliseconds toward the `RTO_MAX` cap.
+    #[inline]
+    pub fn rx_srtt(&self) -> i32 {
+        self.rx_srtt
+    }
+
+    /// RTT variance (ms) feeding [`rx_rto`](Self::rx_rto).
+    #[inline]
+    pub fn rx_rttvar(&self) -> i32 {
+        self.rx_rttvar
     }
 
     /// Get the current congestion window.
