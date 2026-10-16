@@ -39,6 +39,7 @@ None.
 - **TcpRawListener must stay blocking.** `accept()` runs in `cpu_block` (OS thread). Non-blocking accept returns EAGAIN when idle → server accept loop exits → client `--tcp` dial gets Connection refused.
 - **mmsg IPv4 `s_addr`**: use `u32::from_ne_bytes(ip.octets())`, never `from_be_bytes` — LE hosts would send to `1.0.0.127` instead of `127.0.0.1` (silent blackhole / hang). Only affects Linux `sendmmsg_to` (server flush path).
 - **All hot UDP sends route through `send_batch`/`send_batch_to`** → Linux `sendmmsg` (`mmsg.rs`). Confirmed callers: `KcpStream` data + ACK/urgent path, `KcpListener` `PeerTransport`, `CryptoTransport` `send_urgent*`. The single `send`/`send_to` methods are **fallback-only** (non-Linux, `WouldBlock`). Keep new send paths on the batch API — do not regress to per-datagram `send_to`.
+- `TcpRawConn::raw_send` serializes direct callers with a per-connection mutex from sequence read through `sendto` and sequence advance. The KCP path also has its own single-sender token, but the public raw connection can be shared directly.
 - `mmsg.rs` uses a per-thread scratch (`MmsgScratch` via `thread_local!`) so `sendmmsg`/`recvmmsg` do **not** allocate per batch; `sendmmsg_*` are generic over `B: AsRef<[u8]>` so callers pass `&bufs[offset..]` directly (no `&[u8]` refs Vec).
 
 ### Testing Requirements

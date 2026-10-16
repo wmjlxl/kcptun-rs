@@ -1,6 +1,5 @@
 use std::io;
 
-const MAX_FEED_OUTPUT: usize = 1024 * 1024;
 const MAX_BLOCK: usize = 64 * 1024;
 // snap 1.1.x max_compress_len(64 KiB) == 76_490.
 const MAX_COMPRESSED_CHUNK: usize = 4 + 76_490;
@@ -8,9 +7,26 @@ const MAX_COMPRESSED_CHUNK: usize = 4 + 76_490;
 /// incomplete chunk (or a partial stream identifier) behind, and `/debug`-style
 /// per-chunk length checks bound that at one header plus the largest legal body.
 const MAX_RETAINED_INPUT: usize = 4 + MAX_COMPRESSED_CHUNK;
-/// Cap on a single `feed` slice. Callers hand us at most one transport read
-/// (64 KiB today); anything near this is a caller bug, not a legal frame.
-const MAX_FEED_INPUT: usize = 1024 * 1024;
+/// Bound the decoder's internal input buffer even when a public caller passes
+/// a larger slice. Only one incomplete data chunk is retained across slices.
+const FEED_SLICE: usize = 64 * 1024;
+
+fn masked_crc32c(data: &[u8]) -> u32 {
+    crc32c::crc32c(data)
+        .rotate_right(15)
+        .wrapping_add(0xa282_ead8)
+}
+
+fn check_checksum(chunk: &[u8], decoded: &[u8]) -> io::Result<()> {
+    let expected = u32::from_le_bytes(chunk[..4].try_into().unwrap());
+    if masked_crc32c(decoded) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Snappy chunk checksum mismatch",
+        ));
+    }
+    Ok(())
+}
 
 /// A persistent Snappy framing stream decoder that maintains state across
 /// incremental data feeds. This is required because KCP stream mode can
@@ -44,18 +60,33 @@ impl SnappyStreamDecoder {
         }
     }
     pub fn feed(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.feed_chunks(data, |chunk| out.extend_from_slice(chunk))?;
+        Ok(out)
+    }
+
+    /// Decode complete chunks into a sink so transport readers do not have to
+    /// collect a whole read's expanded output before passing it to SMUX.
+    pub(crate) fn feed_chunks(
+        &mut self,
+        data: &[u8],
+        mut emit: impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        if data.is_empty() {
+            return self.feed_slice(&[], &mut emit);
+        }
+        for slice in data.chunks(FEED_SLICE) {
+            self.feed_slice(slice, &mut emit)?;
+        }
+        Ok(())
+    }
+
+    fn feed_slice(&mut self, data: &[u8], emit: &mut impl FnMut(&[u8])) -> io::Result<()> {
         if self.pos > 65536 {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
-        if data.len() > MAX_FEED_INPUT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Snappy input feed exceeds the decoder input limit",
-            ));
-        }
         self.buf.extend_from_slice(data);
-        let mut out = Vec::new();
         loop {
             let avail = self.buf.len() - self.pos;
             if self.skip_remaining > 0 {
@@ -124,35 +155,39 @@ impl SnappyStreamDecoder {
                 0x00 => {
                     // Compressed chunk: [CRC32 4B][snappy block]
                     if chunk_data.len() < 4 {
-                        continue;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Snappy compressed chunk is missing its checksum",
+                        ));
                     }
                     let snappy_data = &chunk_data[4..];
                     let decoded_len = snap::raw::decompress_len(snappy_data)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    if decoded_len > MAX_BLOCK
-                        || decoded_len > MAX_FEED_OUTPUT.saturating_sub(out.len())
-                    {
+                    if decoded_len > MAX_BLOCK {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "Snappy decoded output exceeds its limit",
+                            "Snappy decoded block exceeds its limit",
                         ));
                     }
-                    match self.decoder.decompress_vec(snappy_data) {
-                        Ok(d) => out.extend(d),
-                        Err(_) => continue,
-                    }
+                    let decoded = self
+                        .decoder
+                        .decompress_vec(snappy_data)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    check_checksum(chunk_data, &decoded)?;
+                    emit(&decoded);
                 }
                 0x01 if chunk_data.len() >= 4 => {
                     // Uncompressed chunk: [CRC32 4B][raw data]
-                    if chunk_data.len() - 4 > MAX_FEED_OUTPUT.saturating_sub(out.len()) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Snappy decoded output exceeds its limit",
-                        ));
-                    }
-                    out.extend_from_slice(&chunk_data[4..]);
+                    let decoded = &chunk_data[4..];
+                    check_checksum(chunk_data, decoded)?;
+                    emit(decoded);
                 }
-                _ => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Snappy uncompressed chunk is missing its checksum",
+                    ));
+                }
             }
         }
         if self.buf.len() - self.pos > MAX_RETAINED_INPUT {
@@ -161,7 +196,7 @@ impl SnappyStreamDecoder {
                 "Snappy input exceeds the decoder buffer limit",
             ));
         }
-        Ok(out)
+        Ok(())
     }
 }
 

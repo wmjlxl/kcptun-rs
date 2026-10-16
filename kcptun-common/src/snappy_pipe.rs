@@ -117,19 +117,26 @@ where
             if self.compress {
                 // 1. Feed any buffered raw bytes into the decoder.
                 if self.read_off < self.read_len {
-                    let data = &self.read_buf[self.read_off..self.read_len];
-                    match self.decoder.feed(data) {
-                        Ok(dec) => {
-                            // feed() consumes the whole slice into its internal buffer.
-                            self.read_off = self.read_len;
-                            if !dec.is_empty() {
-                                self.dec_out.extend(dec);
-                            }
+                    // Keep decoded data queued by this poll bounded even when
+                    // a 64 KiB transport read contains many compressed blocks.
+                    let end = (self.read_off + 8 * 1024).min(self.read_len);
+                    let data = &self.read_buf[self.read_off..end];
+                    let dec_out = &mut self.dec_out;
+                    match self
+                        .decoder
+                        .feed_chunks(data, |chunk| dec_out.extend(chunk))
+                    {
+                        Ok(()) => {
+                            // feed_chunks() consumes the whole slice into its internal buffer.
+                            self.read_off = end;
                         }
                         Err(e) => return Poll::Ready(Err(e)),
                     }
                     if !self.dec_out.is_empty() {
                         return Poll::Ready(Ok(self.take_decoded(out)));
+                    }
+                    if self.read_off < self.read_len {
+                        continue;
                     }
                 }
             } else {
@@ -395,135 +402,4 @@ where
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "tokio"))]
-mod tests {
-    use super::*;
-    use kcp_rs::KcpConfig;
-    use knet::AsyncReadExt;
-    use knet::AsyncWriteExt;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use crate::kcp_transport::kcp_stream_with_socket;
-    use kcrypt_rs::OffloadProfile;
-
-    /// Pair of connected UDP sockets + null-crypt KcpStream.
-    async fn make_pair(cfg: KcpConfig) -> (kcp_rs::KcpStream, kcp_rs::KcpStream) {
-        let a_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let b_tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let addr_a = a_tmp.local_addr().unwrap();
-        let addr_b = b_tmp.local_addr().unwrap();
-        drop(a_tmp);
-        drop(b_tmp);
-
-        let sock_a = Arc::new(knet::DatagramSocket::Udp(
-            knet::UdpSocket::connect(addr_a, addr_b).unwrap(),
-        ));
-        let sock_b = Arc::new(knet::DatagramSocket::Udp(
-            knet::UdpSocket::connect(addr_b, addr_a).unwrap(),
-        ));
-
-        let key = b"0123456789abcdef0123456789abcdef";
-        let a = kcp_stream_with_socket(
-            sock_a,
-            addr_b,
-            key,
-            "null",
-            cfg.clone(),
-            true,
-            OffloadProfile::Tokio,
-        )
-        .await
-        .unwrap();
-        let b = kcp_stream_with_socket(
-            sock_b,
-            addr_a,
-            key,
-            "null",
-            cfg,
-            true,
-            OffloadProfile::Tokio,
-        )
-        .await
-        .unwrap();
-        (a, b)
-    }
-
-    fn test_cfg() -> KcpConfig {
-        KcpConfig {
-            conv: 0x5A11_5EED,
-            mode: kcp_rs::KcpMode::Fast3,
-            sndwnd: 512,
-            rcvwnd: 512,
-            ..KcpConfig::default()
-        }
-    }
-
-    async fn read_exact(
-        conn: &mut (impl knet::AsyncRead + Unpin),
-        buf: &mut [u8],
-        limit: Duration,
-    ) {
-        let deadline = std::time::Instant::now() + limit;
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            if std::time::Instant::now() > deadline {
-                panic!("timeout waiting for data, got {}/{}", filled, buf.len());
-            }
-            match knet::timeout(Duration::from_millis(50), conn.read(&mut buf[filled..])).await {
-                Ok(Ok(0)) => panic!("unexpected EOF at {}", filled),
-                Ok(Ok(n)) => filled += n,
-                Ok(Err(e)) => panic!("read error: {}", e),
-                Err(_) => continue,
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snappy_pipe_compressed_kcp_roundtrip() {
-        let (a, b) = make_pair(test_cfg()).await;
-        let mut a = SnappyPipe::new(a, true);
-        let mut b = SnappyPipe::new(b, true);
-
-        // Mixed payload: compressible prefix + varied tail, split across several
-        // writes to exercise the persistent stream (single sNaPpY header).
-        let mut payload = Vec::with_capacity(256 * 1024);
-        payload.extend(std::iter::repeat_n(b'a', 128 * 1024));
-        payload.extend((0u32..131072).map(|i| (i % 251) as u8));
-
-        let mut written = 0usize;
-        while written < payload.len() {
-            let end = (written + 16 * 1024).min(payload.len());
-            a.write_all(&payload[written..end]).await.unwrap();
-            a.flush().await.unwrap();
-            written = end;
-        }
-
-        let mut got = vec![0u8; payload.len()];
-        read_exact(&mut b, &mut got, Duration::from_secs(10)).await;
-        assert_eq!(got, payload);
-
-        // Reverse direction too.
-        let reply = b"snappy-pipe-reverse-reply!";
-        b.write_all(reply).await.unwrap();
-        b.flush().await.unwrap();
-        let mut got_reply = vec![0u8; reply.len()];
-        read_exact(&mut a, &mut got_reply, Duration::from_secs(10)).await;
-        assert_eq!(&got_reply[..], reply);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snappy_pipe_passthrough_kcp_roundtrip() {
-        let (a, b) = make_pair(test_cfg()).await;
-        let mut a = SnappyPipe::new(a, false);
-        let mut b = SnappyPipe::new(b, false);
-
-        let payload = (0u32..65536).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-        a.write_all(&payload).await.unwrap();
-        a.flush().await.unwrap();
-
-        let mut got = vec![0u8; payload.len()];
-        read_exact(&mut b, &mut got, Duration::from_secs(10)).await;
-        assert_eq!(got, payload);
-    }
-}
+mod tests;

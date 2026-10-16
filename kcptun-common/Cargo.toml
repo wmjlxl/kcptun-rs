@@ -18,6 +18,7 @@ smux-rs = { path = "../smux-rs", default-features = false }
 pbkdf2 = "0.12"
 sha1 = "0.10"
 snap = "1"
+crc32c = "0.6"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 libc = "0.2"

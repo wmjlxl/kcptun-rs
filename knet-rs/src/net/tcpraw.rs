@@ -366,6 +366,8 @@ pub struct TcpRawConn {
     raw_fd: Arc<OwnedFd>,
     /// TCP flow state.
     flow: Arc<TcpFlowState>,
+    /// Serialize direct callers so sequence reservation and raw send stay ordered.
+    send_lock: std::sync::Mutex<()>,
     /// Source/destination for this connection.
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
@@ -409,6 +411,7 @@ impl TcpRawConn {
             ));
         }
 
+        let _send_guard = self.send_lock.lock().unwrap();
         let seq = self.flow.seq.load(Ordering::Relaxed);
         let ack = self.flow.ack.load(Ordering::Relaxed);
         // Match Go makeOption: time.Now().UnixNano() / 1e6
@@ -868,6 +871,7 @@ impl TcpRawListener {
                 _real: stream,
                 raw_fd: self.raw_fd.clone(),
                 flow,
+                send_lock: std::sync::Mutex::new(()),
                 src_ip,
                 dst_ip,
                 src_port,
@@ -1295,6 +1299,7 @@ pub fn dial(remote_addr: &SocketAddr) -> io::Result<TcpRawConn> {
         _real: stream,
         raw_fd,
         flow,
+        send_lock: std::sync::Mutex::new(()),
         src_ip,
         dst_ip,
         src_port,

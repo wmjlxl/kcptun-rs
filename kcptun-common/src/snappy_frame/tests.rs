@@ -15,6 +15,58 @@ fn decodes_a_valid_block_split_across_feeds() {
 }
 
 #[test]
+fn accepts_highly_compressible_chunks_in_one_transport_read() {
+    let plain = vec![0u8; 17 * MAX_BLOCK];
+    let mut encoder = snap::write::FrameEncoder::new(Vec::new());
+    encoder.write_all(&plain).unwrap();
+    let wire = encoder.into_inner().unwrap();
+    assert!(wire.len() < 64 * 1024);
+
+    let mut decoder = SnappyStreamDecoder::new();
+    assert_eq!(decoder.feed(&wire).unwrap(), plain);
+
+    let mut decoder = SnappyStreamDecoder::new();
+    let mut streamed = Vec::new();
+    let mut chunks = 0;
+    decoder
+        .feed_chunks(&wire, |chunk| {
+            assert!(chunk.len() <= MAX_BLOCK);
+            streamed.extend_from_slice(chunk);
+            chunks += 1;
+        })
+        .unwrap();
+    assert_eq!(chunks, 17);
+    assert_eq!(streamed, plain);
+}
+
+#[test]
+fn rejects_corrupt_checksums_for_both_data_chunk_types() {
+    for plain in [b"audit crc sample".as_slice(), &[0u8; MAX_BLOCK][..]] {
+        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
+        encoder.write_all(plain).unwrap();
+        let wire = encoder.into_inner().unwrap();
+        assert!(matches!(wire[10], 0x00 | 0x01));
+        let mut bad_checksum = wire.clone();
+        bad_checksum[14] ^= 1;
+
+        let mut decoder = SnappyStreamDecoder::new();
+        assert_eq!(
+            decoder.feed(&bad_checksum).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        if wire[10] == 0x01 {
+            let mut bad_payload = wire;
+            *bad_payload.last_mut().unwrap() ^= 1;
+            let mut decoder = SnappyStreamDecoder::new();
+            assert_eq!(
+                decoder.feed(&bad_payload).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+}
+
+#[test]
 fn rejects_oversized_data_chunk_before_buffering_body() {
     let mut decoder = SnappyStreamDecoder::new();
     decoder.feed(b"\xff\x06\x00\x00sNaPpY").unwrap();
@@ -38,7 +90,7 @@ fn accepts_two_max_chunks_split_across_feeds() {
     const BODY: usize = MAX_BLOCK + 4;
     let chunk = |byte: u8| {
         let mut c = vec![0x01, 0x04, 0x00, 0x01]; // type + 65_540 LE
-        c.extend_from_slice(&[0; 4]); // CRC32 (not validated on this path)
+        c.extend_from_slice(&masked_crc32c(&vec![byte; MAX_BLOCK]).to_le_bytes());
         c.extend(std::iter::repeat_n(byte, MAX_BLOCK));
         c
     };
