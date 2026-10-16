@@ -34,10 +34,15 @@ impl LocalListener {
     async fn bind(addr: &str) -> Result<Self> {
         match kcptun_common::parse_multi_port(addr) {
             Ok(addrs) => {
+                let mut addrs = addrs.into_iter();
                 let listen_addr = addrs
-                    .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("invalid local address"))?;
+                if let Some(extra) = addrs.next() {
+                    anyhow::bail!(
+                        "multiple local addresses are not supported; got [{listen_addr}, {extra}, …]"
+                    );
+                }
                 Ok(Self::Tcp(knet::TcpListener::bind(listen_addr).await?))
             }
             Err(tcp_error) => {
@@ -124,6 +129,7 @@ impl ClientSetup {
         // millions of tasks + fds and wedged the start-up loop.
         validate_conn_count(conn_count)?;
         let mtu = cli.mtu.unwrap_or(1350);
+        kcptun_common::validate_encrypted_mtu(mtu, crypt)?;
         let sndwnd = cli.sndwnd.unwrap_or(128);
         let rcvwnd = cli.rcvwnd.unwrap_or(512);
         let datashard = cli.datashard.unwrap_or(10);
@@ -287,12 +293,20 @@ async fn create_pool(setup: &ClientSetup) -> Result<(client::SessionPool, client
 
 /// Start the pprof HTTP endpoint when `--pprof` is set (requires the
 /// `pprof` feature; warns otherwise).
+///
+/// Heap sampling is only readable through the pprof HTTP endpoints, so without
+/// `--pprof` it is switched off here: leaving the default 512 KiB sampling on
+/// makes every allocation in a long-running proxy pay for a profile that
+/// nothing can serve.
 fn start_pprof(cli: &Cli, stop_flag: &Arc<AtomicBool>) {
     // Start pprof if configured (requires --features pprof)
     #[cfg(feature = "pprof")]
     if cli.pprof {
         let pprof_addr = cli.pprofaddr.clone();
-        info!("starting pprof HTTP server on {pprof_addr}");
+        info!(
+            "starting pprof HTTP server on {pprof_addr} (heap sampling: 1 per {} bytes)",
+            kpprof::heap_sample_rate()
+        );
         #[cfg(feature = "pprof-deadlock")]
         kpprof::start_deadlock_detector();
         let pprof_stop = stop_flag.clone();
@@ -303,6 +317,11 @@ fn start_pprof(cli: &Cli, stop_flag: &Arc<AtomicBool>) {
                 error!("pprof server error: {}", e);
             }
         });
+    }
+    #[cfg(feature = "pprof")]
+    if !cli.pprof {
+        let previous = kpprof::set_heap_sample_rate(0);
+        info!("heap sampling disabled (was 1 sample per {previous} bytes): --pprof not enabled");
     }
     #[cfg(not(feature = "pprof"))]
     if cli.pprof {
@@ -341,48 +360,66 @@ fn spawn_scavenger(
                 if s.load(Ordering::Acquire) {
                     break;
                 }
-                scavenge_sessions.lock().retain(|conn| {
-                    if conn.is_dead() {
-                        info!("scavenger: session normally closed");
-                        return false;
-                    }
-                    if client::should_retire_session(
-                        conn,
-                        scavenge_autoexpire,
-                        scavenge_ttl,
-                        knet::mono_ms(),
-                    ) {
+                // Decide under the pool lock, act outside it. `close()` reaches
+                // into the SMUX session and KCP stream (their own locks), and the
+                // final `Drop` runs the session teardown; neither belongs on the
+                // pool mutex that the accept path also takes.
+                let mut finished: Vec<(client::SessionRef, bool, usize)> = Vec::new();
+                {
+                    let mut pool = scavenge_sessions.lock();
+                    pool.retain(|conn| {
+                        if conn.is_dead() {
+                            finished.push((conn.clone(), false, 0));
+                            return false;
+                        }
+                        if client::should_retire_session(
+                            conn,
+                            scavenge_autoexpire,
+                            scavenge_ttl,
+                            knet::mono_ms(),
+                        ) {
+                            finished.push((conn.clone(), true, conn.active_stream_count()));
+                            return false;
+                        }
+                        if client::is_session_scavenge_expired(
+                            conn,
+                            scavenge_autoexpire,
+                            scavenge_ttl,
+                        ) {
+                            // Past the TTL but still serving: keep it until its
+                            // streams finish.
+                            log::debug!(
+                                "scavenger: session past ttl, waiting for {} stream(s)",
+                                conn.active_stream_count()
+                            );
+                        }
+                        true
+                    });
+                }
+                for (conn, retired, streams) in finished {
+                    if retired {
                         info!(
                             "scavenger: session retired (ttl reached, {} stream(s) done)",
-                            conn.active_stream_count()
+                            streams
                         );
                         conn.close();
-                        return false;
+                    } else {
+                        info!("scavenger: session normally closed");
                     }
-                    if client::is_session_scavenge_expired(conn, scavenge_autoexpire, scavenge_ttl)
-                    {
-                        // Past the TTL but still serving: keep it until its
-                        // streams finish.
-                        log::debug!(
-                            "scavenger: session past ttl, waiting for {} stream(s)",
-                            conn.active_stream_count()
-                        );
-                    }
-                    true
-                });
+                    drop(conn);
+                }
             }
         });
     }
 }
 
-pub(crate) async fn async_main() -> Result<()> {
+pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     // Ignore SIGPIPE to prevent crashes when writing to closed sockets.
     knet::ignore_sigpipe();
     // Install SIGUSR1 handler for SNMP stats dump (matching Go kcptun).
     knet::install_sigusr1_handler();
     kcp_rs::snmp_enable();
 
-    let cli = Cli::parse_go_compatible();
     if cli.version_flag {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return Ok(());

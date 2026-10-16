@@ -12,6 +12,11 @@ use std::collections::{HashMap, VecDeque};
 pub const FEC_HEADER_SIZE: usize = 6;
 /// FEC header + 2B data size.
 pub(crate) const FEC_HEADER_SIZE_PLUS_2: usize = 8;
+/// Pseudo-RTO handed to the FEC encoder so parity shards are not held back
+/// waiting for a real RTT estimate. Mirrors Go kcp-go v5.6.64's
+/// `maxFECEncodeLatency = 500` (`sess.go`), a fixed constant there too —
+/// do **not** substitute a dynamic `rx_rto`.
+pub const FEC_ENCODE_LATENCY_MS: u32 = 500;
 /// FEC type: data packet.
 pub const FEC_TYPE_DATA: u16 = 0x00f1;
 /// FEC type: parity packet.
@@ -337,6 +342,14 @@ impl ShardGroup {
 struct AutoTune {
     pulses: VecDeque<(u32, bool)>, // (seqid, is_data)
     max_samples: usize,
+    /// Reusable sort buffer for the probe. A probe runs while the tuning flag
+    /// is set — one stale or injected packet is enough to set it — so it must
+    /// not allocate: the ring is 258 entries and the probe sorted a fresh copy
+    /// of it (twice) on every FEC packet.
+    sorted: Vec<(u32, bool)>,
+    /// Second reusable buffer: `infer_dimensions` dedups by seqid, which the
+    /// period search must not do (duplicates are what make it refuse).
+    dedup: Vec<(u32, bool)>,
 }
 
 impl AutoTune {
@@ -344,6 +357,8 @@ impl AutoTune {
         AutoTune {
             pulses: VecDeque::with_capacity(258),
             max_samples: 258,
+            sorted: Vec::with_capacity(258),
+            dedup: Vec::with_capacity(258),
         }
     }
 
@@ -354,139 +369,223 @@ impl AutoTune {
         }
     }
 
+    /// Snapshot the ring into the reusable sort buffer, in sequence order.
+    ///
+    /// The ring usually already arrives in sequence order (KCP delivers in
+    /// order; the samples are the peer's FEC stream), so the linear sortedness
+    /// check short-circuits the sort that would otherwise dominate the probe:
+    /// 258 comparisons instead of ~2 000.
+    fn sort_into_scratch(&mut self) {
+        let AutoTune { pulses, sorted, .. } = self;
+        sorted.clear();
+        sorted.extend(pulses.iter().copied());
+        if !sorted.is_sorted_by_key(|&(seq, _)| seq) {
+            sorted.sort_by_key(|&(seq, _)| seq);
+        }
+    }
+
+    /// One auto-tune probe: the period search for both flags, then — only when
+    /// either failed — the dimension fallback. Returns `(data, parity)` with 0
+    /// for "could not tell", exactly as the three separate calls did.
+    ///
+    /// Allocates nothing after the first call (the scratch buffers are reused),
+    /// and never mutates the sample ring.
+    fn probe(&mut self, paws: u32) -> (usize, usize) {
+        self.sort_into_scratch();
+        let AutoTune { sorted, dedup, .. } = self;
+        let mut data = find_period_in(sorted, true, paws);
+        let mut parity = find_period_in(sorted, false, paws);
+        if data == 0 || parity == 0 {
+            if let Some((d, p)) = infer_dimensions_in(sorted, dedup, paws) {
+                data = d;
+                parity = p;
+            }
+        }
+        (data, parity)
+    }
+
     // A missing first data shard hides the parity-to-data edge needed by
     // find_period. Two intact data-to-parity edges still identify the group
     // period. Accept this fallback only with at most one missing sample in
     // that period and when every observed type agrees with the dimensions.
-    fn infer_dimensions(&self, paws: u32) -> Option<(usize, usize)> {
-        let mut samples: Vec<_> = self.pulses.iter().copied().collect();
-        samples.sort_unstable_by_key(|&(seq, _)| seq);
-        if samples
-            .windows(2)
-            .any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1)
-        {
-            return None;
-        }
-        samples.dedup_by_key(|sample| sample.0);
-        let edges: Vec<_> = samples
-            .windows(2)
-            .filter(|w| w[0].1 && !w[1].1 && w[1].0 - w[0].0 == 1)
-            .map(|w| w[1].0)
-            .collect();
-        for pair in edges.windows(2) {
-            let period = pair[1] - pair[0];
-            if !(2..=256).contains(&period) {
-                continue;
-            }
-            let data = pair[0] % period;
-            if data == 0 {
-                continue;
-            }
-            let observed = samples
-                .iter()
-                .filter(|&&(seq, _)| seq >= pair[0] && seq <= pair[1])
-                .count();
-            if observed < period as usize {
-                continue;
-            }
-            let inferred_paws = u32::MAX / period * period;
-            if samples
-                .iter()
-                .all(|&(seq, is_data)| seq < inferred_paws && (seq % period < data) == is_data)
-                && pair[1] < paws
-            {
-                // Losing a whole one-shard phase can hide an intermediate
-                // edge (e.g. 1+1 masquerading as 1+3). Every compatible real
-                // period divides the distance between these exact edges.
-                // Refuse tuning until the observed phases select one period.
-                let ambiguous = (2..period).any(|other_period| {
-                    if period % other_period != 0 {
-                        return false;
-                    }
-                    let other_data = pair[0] % other_period;
-                    let other_paws = u32::MAX / other_period * other_period;
-                    other_data > 0
-                        && samples.iter().all(|&(seq, is_data)| {
-                            seq < other_paws && (seq % other_period < other_data) == is_data
-                        })
-                });
-                if ambiguous {
-                    return None;
-                }
-                return Some((data as usize, (period - data) as usize));
-            }
-        }
-        None
+    #[cfg(test)]
+    fn infer_dimensions(&mut self, paws: u32) -> Option<(usize, usize)> {
+        self.sort_into_scratch();
+        let AutoTune { sorted, dedup, .. } = self;
+        infer_dimensions_in(sorted, dedup, paws)
     }
 
-    fn find_period(&self, bit: bool, paws: u32) -> usize {
-        if self.pulses.len() < 3 {
+    /// Test/diagnostic entry point; the probe path uses [`find_period_in`] on
+    /// the shared scratch buffer instead.
+    #[cfg(test)]
+    fn find_period(&mut self, bit: bool, paws: u32) -> usize {
+        self.sort_into_scratch();
+        let AutoTune { sorted, .. } = self;
+        find_period_in(sorted, bit, paws)
+    }
+}
+
+/// `samples` must be sorted by seqid (see [`AutoTune::sort_into_scratch`]).
+/// `dedup` is a scratch buffer so the caller's slice is never modified.
+fn infer_dimensions_in(
+    sorted: &[(u32, bool)],
+    dedup: &mut Vec<(u32, bool)>,
+    paws: u32,
+) -> Option<(usize, usize)> {
+    dedup.clear();
+    dedup.extend(sorted.iter().copied());
+    let samples: &mut Vec<(u32, bool)> = dedup;
+    if sorted
+        .windows(2)
+        .any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1)
+    {
+        return None;
+    }
+    samples.dedup_by_key(|sample| sample.0);
+    let edges: Vec<_> = samples
+        .windows(2)
+        .filter(|w| w[0].1 && !w[1].1 && w[1].0 - w[0].0 == 1)
+        .map(|w| w[1].0)
+        .collect();
+    for pair in edges.windows(2) {
+        let period = pair[1] - pair[0];
+        if !(2..=256).contains(&period) {
+            continue;
+        }
+        let data = pair[0] % period;
+        if data == 0 {
+            continue;
+        }
+        let observed = samples
+            .iter()
+            .filter(|&&(seq, _)| seq >= pair[0] && seq <= pair[1])
+            .count();
+        if observed < period as usize {
+            continue;
+        }
+        let inferred_paws = u32::MAX / period * period;
+        if samples
+            .iter()
+            .all(|&(seq, is_data)| seq < inferred_paws && (seq % period < data) == is_data)
+            && pair[1] < paws
+        {
+            // Losing a whole one-shard phase can hide an intermediate
+            // edge (e.g. 1+1 masquerading as 1+3). Every compatible real
+            // period divides the distance between these exact edges.
+            // Refuse tuning until the observed phases select one period.
+            let ambiguous = (2..period).any(|other_period| {
+                if period % other_period != 0 {
+                    return false;
+                }
+                let other_data = pair[0] % other_period;
+                let other_paws = u32::MAX / other_period * other_period;
+                other_data > 0
+                    && samples.iter().all(|&(seq, is_data)| {
+                        seq < other_paws && (seq % other_period < other_data) == is_data
+                    })
+            });
+            if ambiguous {
+                return None;
+            }
+            return Some((data as usize, (period - data) as usize));
+        }
+    }
+    None
+}
+
+/// Longest run of alternating-flag samples, measured between a `!bit`→`bit`
+/// edge and the following `bit`→`!bit` edge. `samples` must be sorted by seqid.
+fn find_period_in(sorted: &[(u32, bool)], bit: bool, paws: u32) -> usize {
+    if sorted.len() < 3 {
+        return 0;
+    }
+    let len = sorted.len();
+
+    // Sequence IDs wrap at PAWS. Rotate the sorted history across the largest
+    // cyclic gap, which is the seam between the oldest and newest samples, so
+    // the window reads in linear sequence order.
+    //
+    // The interior pairs are plain subtractions (the history is sorted here);
+    // only the wrap pair needs the modular difference. A `%` per element made
+    // this loop the most expensive part of a stuck probe.
+    let mut largest_gap = 0;
+    let mut largest_gap_at = 0;
+    for i in 0..len - 1 {
+        let gap = sorted[i + 1].0 - sorted[i].0;
+        if gap > largest_gap {
+            largest_gap = gap;
+            largest_gap_at = i;
+        }
+    }
+    // Wrap pair last, exactly as the original loop examined it, so equal gaps
+    // tie-break to the same index.
+    //
+    // Wrapping arithmetic: `decode()` rejects `seqid >= paws` before sampling,
+    // so every sample is below `paws` and this equals the plain subtraction.
+    // Wrapping only keeps a malformed history from panicking a debug build.
+    if paws
+        .wrapping_sub(sorted[len - 1].0)
+        .wrapping_add(sorted[0].0)
+        > largest_gap
+    {
+        largest_gap_at = len - 1;
+    }
+    let start = (largest_gap_at + 1) % len;
+    // Linear view over the rotated window — a two-slice split instead of a
+    // rotated copy (the probe must not allocate), and no modulo per access.
+    // `split_at` yields (before, after): the rotated view is `after` followed
+    // by `before`.
+    let (before, after) = sorted.split_at(start);
+    let at = |i: usize| -> (u32, bool) {
+        if i < after.len() {
+            after[i]
+        } else {
+            before[i - after.len()]
+        }
+    };
+
+    let contiguous = |prev: u32, current: u32| -> bool {
+        // Same precondition as above: samples are below `paws`.
+        let diff = if current >= prev {
+            current - prev
+        } else {
+            paws.wrapping_sub(prev).wrapping_add(current)
+        };
+        diff == 1
+    };
+
+    // Contiguity is checked while walking towards each edge, as in Go's
+    // `autoTune.FindPeriod`: a gap only aborts the search if it is hit
+    // before the edge being looked for. Requiring the whole 258-sample
+    // window to be contiguous up front makes detection fail on any link
+    // with loss — i.e. exactly the links auto-tune exists for.
+
+    // Find left edge (transition from !bit to bit)
+    let mut left_edge = None;
+    for i in 1..len {
+        if !contiguous(at(i - 1).0, at(i).0) {
             return 0;
         }
-        let mut sorted = self.pulses.clone();
-        sorted.make_contiguous().sort_by_key(|&(seq, _)| seq);
-
-        // Sequence IDs wrap at PAWS. Rotate the sorted history across the
-        // largest cyclic gap, which is the seam between the oldest and newest
-        // samples, so the window reads in linear sequence order.
-        let mut largest_gap = 0;
-        let mut largest_gap_at = 0;
-        for i in 0..sorted.len() {
-            let a = sorted[i].0;
-            let b = sorted[(i + 1) % sorted.len()].0;
-            let gap = if b >= a { b - a } else { paws - a + b };
-            if gap > largest_gap {
-                largest_gap = gap;
-                largest_gap_at = i;
-            }
+        if at(i - 1).1 != bit && at(i).1 == bit {
+            left_edge = Some(i);
+            break;
         }
-        let start = (largest_gap_at + 1) % sorted.len();
-        let ordered: Vec<(u32, bool)> = (0..sorted.len())
-            .map(|offset| sorted[(start + offset) % sorted.len()])
-            .collect();
-
-        let contiguous = |prev: u32, current: u32| -> bool {
-            let diff = if current >= prev {
-                current - prev
-            } else {
-                paws - prev + current
-            };
-            diff == 1
-        };
-
-        // Contiguity is checked while walking towards each edge, as in Go's
-        // `autoTune.FindPeriod`: a gap only aborts the search if it is hit
-        // before the edge being looked for. Requiring the whole 258-sample
-        // window to be contiguous up front makes detection fail on any link
-        // with loss — i.e. exactly the links auto-tune exists for.
-
-        // Find left edge (transition from !bit to bit)
-        let mut left_edge = None;
-        for i in 1..ordered.len() {
-            if !contiguous(ordered[i - 1].0, ordered[i].0) {
-                return 0;
-            }
-            if ordered[i - 1].1 != bit && ordered[i].1 == bit {
-                left_edge = Some(i);
-                break;
-            }
-        }
-        let left = match left_edge {
-            Some(i) => i,
-            None => return 0,
-        };
-
-        // Find right edge (transition from bit to !bit)
-        for i in left + 1..ordered.len() {
-            if !contiguous(ordered[i - 1].0, ordered[i].0) {
-                return 0;
-            }
-            if ordered[i - 1].1 == bit && ordered[i].1 != bit {
-                return i - left;
-            }
-        }
-        0
     }
+    let left = match left_edge {
+        Some(i) => i,
+        None => return 0,
+    };
+
+    // Find right edge (transition from bit to !bit)
+    for i in left + 1..len {
+        if !contiguous(at(i - 1).0, at(i).0) {
+            return 0;
+        }
+        if at(i - 1).1 == bit && at(i).1 != bit {
+            return i - left;
+        }
+    }
+    0
 }
 
 /// Reed-Solomon FEC decoder matching Go's fecDecoder.
@@ -503,6 +602,11 @@ pub struct FecDecoder {
     codec: ReedSolomon<Field>,
     auto_tune: AutoTune,
     should_tune: bool,
+    last_probe_warning_ms: i64,
+    /// Probes actually executed — diagnostic/test visibility into the tuning
+    /// path. The probe itself is allocation-free, so it can keep running on
+    /// every packet; see `AutoTune::probe`.
+    tune_probes: u64,
 }
 
 impl FecDecoder {
@@ -530,6 +634,8 @@ impl FecDecoder {
             codec,
             auto_tune: AutoTune::new(),
             should_tune: false,
+            last_probe_warning_ms: 0,
+            tune_probes: 0,
         })
     }
 
@@ -582,14 +688,14 @@ impl FecDecoder {
 
         // Auto-tune if needed
         if self.should_tune {
-            let mut auto_ds = self.auto_tune.find_period(true, self.paws);
-            let mut auto_ps = self.auto_tune.find_period(false, self.paws);
-            if auto_ds == 0 || auto_ps == 0 {
-                if let Some((data, parity)) = self.auto_tune.infer_dimensions(self.paws) {
-                    auto_ds = data;
-                    auto_ps = parity;
-                }
-            }
+            // One probe over one sorted snapshot of the ring. The review's
+            // concern was the cost of re-running this on every packet while the
+            // flag is stuck; making the probe allocation-free (and sorting
+            // once instead of three times) removes that cost without delaying
+            // recovery, which a sample-count throttle would have done — a
+            // stride that divides the group period can never realign with it.
+            self.tune_probes += 1;
+            let (auto_ds, auto_ps) = self.auto_tune.probe(self.paws);
             log::debug!(
                 "FEC tune probe: auto_ds={auto_ds} auto_ps={auto_ps} current={}/{} samples={}",
                 self.data_shards,
@@ -624,9 +730,15 @@ impl FecDecoder {
                 // enough to set the flag.
                 self.should_tune = false;
             } else {
-                log::warn!(
-                    "FEC tune could not resolve (auto_ds={auto_ds} auto_ps={auto_ps}) — still dropping every packet"
-                );
+                let now = current_ms();
+                if self.last_probe_warning_ms == 0
+                    || now.saturating_sub(self.last_probe_warning_ms) >= 30_000
+                {
+                    self.last_probe_warning_ms = now;
+                    log::warn!(
+                        "FEC tune could not resolve (auto_ds={auto_ds} auto_ps={auto_ps}); FEC reconstruction is paused while collecting more shards"
+                    );
+                }
             }
             return Vec::new();
         }
@@ -799,6 +911,9 @@ impl FecDecoder {
             .retain(|&id, _| age(id) <= MAX_SHARD_SETS);
     }
 }
+
+#[cfg(test)]
+mod tune_tests;
 
 // ─── Utilities ───────────────────────────────────────────────────────────
 

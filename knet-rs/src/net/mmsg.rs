@@ -1,7 +1,7 @@
-//! Linux/BSD `sendmmsg`/`recvmmsg` helpers for batch UDP send/recv (P1.2b).
+//! Linux `sendmmsg`/`recvmmsg` helpers for batch UDP send/recv (P1.2b).
 //!
-//! Compiled on Linux and macOS (both provide `recvmmsg`; only Linux provides
-//! `sendmmsg`). Other platforms keep the try_send / sequential path.
+//! Linux only — `#![cfg(target_os = "linux")]`. macOS and other platforms
+//! keep the try_send / sequential path.
 //!
 //! The `iovec`/`mmsghdr`/`sockaddr_storage` arrays are built in a per-thread
 //! reusable scratch buffer (capacity retained across calls) so the hot path
@@ -190,13 +190,13 @@ pub fn recvmmsg_from(
         s.names.resize(n, unsafe { mem::zeroed() });
 
         for b in bufs.iter_mut().take(n) {
+            b.clear();
             if b.capacity() < 2048 {
                 b.reserve(2048);
             }
             let cap = b.capacity();
-            unsafe {
-                b.set_len(cap);
-            }
+            // The kernel writes into spare capacity. Length is set only for
+            // bytes actually initialized by a successful recvmmsg call.
             s.iov.push(libc::iovec {
                 iov_base: b.as_mut_ptr() as *mut _,
                 iov_len: cap,
@@ -225,11 +225,6 @@ pub fn recvmmsg_from(
             )
         };
         if ret < 0 {
-            for b in bufs.iter_mut().take(n) {
-                unsafe {
-                    b.set_len(0);
-                }
-            }
             return Err(io::Error::last_os_error());
         }
         let got = ret as usize;
@@ -244,11 +239,8 @@ pub fn recvmmsg_from(
             let truncated = (s.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC) != 0;
             let len = s.msgs[i].msg_len as usize;
             let addr = sockaddr_storage_to_addr(&s.names[i], s.msgs[i].msg_hdr.msg_namelen);
-            if truncated {
+            if truncated || len > bufs[i].capacity() {
                 // Dropped: never surfaces upstream, never occupies a slot.
-                unsafe {
-                    bufs[i].set_len(0);
-                }
                 continue;
             }
             // Move this buffer to the write cursor so bufs[w] pairs with out[w].
@@ -260,11 +252,6 @@ pub fn recvmmsg_from(
             }
             out.push((len, addr));
             w += 1;
-        }
-        for b in bufs.iter_mut().skip(w).take(n.saturating_sub(w)) {
-            unsafe {
-                b.set_len(0);
-            }
         }
         Ok(out)
     })
@@ -296,13 +283,12 @@ pub fn recvmmsg_from_into(
         s.names.resize(n, unsafe { mem::zeroed() });
 
         for b in bufs.iter_mut().take(n) {
+            b.clear();
             if b.capacity() < 2048 {
                 b.reserve(2048);
             }
             let cap = b.capacity();
-            unsafe {
-                b.set_len(cap);
-            }
+            // Do not mark spare capacity initialized before the syscall.
             s.iov.push(libc::iovec {
                 iov_base: b.as_mut_ptr() as *mut _,
                 iov_len: cap,
@@ -330,11 +316,6 @@ pub fn recvmmsg_from_into(
             )
         };
         if ret < 0 {
-            for b in bufs.iter_mut().take(n) {
-                unsafe {
-                    b.set_len(0);
-                }
-            }
             return Err(io::Error::last_os_error());
         }
         let got = ret as usize;
@@ -350,10 +331,7 @@ pub fn recvmmsg_from_into(
             // Unconnected recvmmsg always fills msg_name (msg_name was set
             // above), so sockaddr_storage_to_addr is Some for UDP.
             let addr = sockaddr_storage_to_addr(&s.names[i], s.msgs[i].msg_hdr.msg_namelen);
-            if truncated {
-                unsafe {
-                    bufs[i].set_len(0);
-                }
+            if truncated || len > bufs[i].capacity() {
                 continue;
             }
             if w != i {
@@ -368,14 +346,7 @@ pub fn recvmmsg_from_into(
                 peers.push(addr);
                 w += 1;
             } else {
-                unsafe {
-                    bufs[w].set_len(0);
-                }
-            }
-        }
-        for b in bufs.iter_mut().skip(w).take(n.saturating_sub(w)) {
-            unsafe {
-                b.set_len(0);
+                bufs[w].clear();
             }
         }
         Ok(w)
@@ -397,13 +368,12 @@ pub fn recvmmsg_connected(fd: RawFd, bufs: &mut [Vec<u8>]) -> io::Result<usize> 
         s.iov.clear();
         s.msgs.clear();
         for b in bufs.iter_mut().take(n) {
+            b.clear();
             if b.capacity() < 2048 {
                 b.reserve(2048);
             }
             let cap = b.capacity();
-            unsafe {
-                b.set_len(cap);
-            }
+            // Only bytes reported by recvmmsg become part of the Vec.
             s.iov.push(libc::iovec {
                 iov_base: b.as_mut_ptr() as *mut _,
                 iov_len: cap,
@@ -427,11 +397,6 @@ pub fn recvmmsg_connected(fd: RawFd, bufs: &mut [Vec<u8>]) -> io::Result<usize> 
             )
         };
         if ret < 0 {
-            for b in bufs.iter_mut().take(n) {
-                unsafe {
-                    b.set_len(0);
-                }
-            }
             return Err(io::Error::last_os_error());
         }
         let got = ret as usize;
@@ -441,10 +406,7 @@ pub fn recvmmsg_connected(fd: RawFd, bufs: &mut [Vec<u8>]) -> io::Result<usize> 
         for i in 0..got {
             let truncated = (s.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC) != 0;
             let len = s.msgs[i].msg_len as usize;
-            if truncated {
-                unsafe {
-                    bufs[i].set_len(0);
-                }
+            if truncated || len > bufs[i].capacity() {
                 continue;
             }
             if w != i {
@@ -454,11 +416,6 @@ pub fn recvmmsg_connected(fd: RawFd, bufs: &mut [Vec<u8>]) -> io::Result<usize> 
                 bufs[w].set_len(len);
             }
             w += 1;
-        }
-        for b in bufs.iter_mut().skip(w).take(n.saturating_sub(w)) {
-            unsafe {
-                b.set_len(0);
-            }
         }
         Ok(w)
     })

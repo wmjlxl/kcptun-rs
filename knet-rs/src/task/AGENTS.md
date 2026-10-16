@@ -25,8 +25,9 @@ None.
 - Dropping `JoinHandle` does **not** cancel work (tokio detaches on drop).
 - `cpu_block` is the shared offload path — binaries and CryptoBuf policy call into it; keep behavior stable.
 - Avoid nested parallel encrypt inside already-offloaded work without measuring.
-- `block_on` reuses a shared multi-thread Tokio runtime with Tokio's default
-  system-derived worker count; `KCPTUN_WORKER_THREADS` does not control it.
+- `block_on` reuses a shared multi-thread Tokio runtime; its worker count is
+  fixed once via `knet::configure_worker_threads(n)` before first use (`0` =
+  Tokio's system-derived default). No environment variable controls it.
 
 ### Testing Requirements
 

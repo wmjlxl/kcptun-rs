@@ -130,7 +130,9 @@ where
     // the message has been received.
     let tx_job = tx.clone();
     let job: Job = Box::new(move || {
-        let r = f();
+        // Keep the worker alive and deliver a panic to the awaiting caller.
+        // Captured shared state remains the caller's responsibility on unwind.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         // try_send is non-blocking; bounded(1) always has room for the first
         // item, and the receiver is the only consumer.
         let _ = tx_job.try_send(r);
@@ -148,7 +150,10 @@ where
     // next call. Not reached when this future is dropped — the pair dies with
     // it and the next call allocates a fresh one (old behaviour).
     recycle_result_pair::<R>((tx, rx));
-    r
+    match r {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 // ─── Pooled per-result-type channels ─────────────────────────────────────────
@@ -160,7 +165,10 @@ where
 // last await point.
 
 /// One drained, reusable result channel for result type `R`.
-type ResultPair<R> = (async_channel::Sender<R>, async_channel::Receiver<R>);
+type ResultPair<R> = (
+    async_channel::Sender<std::thread::Result<R>>,
+    async_channel::Receiver<std::thread::Result<R>>,
+);
 
 /// Free lists of drained pairs, keyed by the result type's `TypeId`.
 type ResultFreeLists = HashMap<TypeId, Vec<Box<dyn Any + Send>>>;
@@ -280,3 +288,6 @@ where
         .expect("failed to create multi-thread tokio runtime")
         .block_on(future)
 }
+
+#[cfg(test)]
+mod tests;

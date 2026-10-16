@@ -55,9 +55,8 @@ Throughput and CPU-profile tooling for Rust vs Go kcptun. Go-compatible pprof pr
   TCP stream and reports aggregate throughput; use a small per-connection size
   when exercising high fan-out (for example, `BENCH_CONNECTIONS=64 BENCH_DATA_MB=4`).
 - `run_bench.sh` applies a positive `BENCH_WORKERS` concurrency budget as
-  `GOMAXPROCS` for Go and `KCPTUN_WORKER_THREADS` for the Rust `KcpListener`
-  shard count. The shared Tokio runtime keeps its system-derived default.
-  Use `0` only when intentionally comparing backend defaults.
+  `GOMAXPROCS` for Go and `--threads` for the Rust binaries (shared Tokio
+  runtime worker count). `0` keeps each backend's own default.
 - `run_bench.sh` runs `BENCH_ROUNDS` (default 3) **interleaved rounds** per
   backend with rotated config order, then reports a MEDIAN summary table —
   compare medians, never a single 200 MB pass (single runs swing ±25% on a

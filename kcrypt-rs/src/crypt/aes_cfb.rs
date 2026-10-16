@@ -94,6 +94,18 @@ impl Drop for AesCfbCrypt {
 }
 
 impl AesCfbCrypt {
+    /// Checked constructor — rejects keys that are not 16, 24, or 32 bytes.
+    ///
+    /// Production PBKDF2 always produces a 32-byte key, so this is a guard
+    /// against accidental misuse via the public API. The existing [`new`]
+    /// retains its truncate-to-32 / pad-with-zeros behaviour for compatibility.
+    pub fn try_new(key: &[u8]) -> Result<Self, &'static str> {
+        match key.len() {
+            16 | 24 | 32 => Ok(Self::new(key)),
+            _ => Err("AES key must be 16, 24, or 32 bytes"),
+        }
+    }
+
     pub fn new(key: &[u8]) -> Self {
         let klen = key.len();
         let mut padded = [0u8; 32];
@@ -250,6 +262,55 @@ mod tests {
             &AesCfbCrypt::new(&[0u8; 32]),
             &mut b"hello kcp test 256!".to_vec(),
         );
+    }
+
+    /// `try_new` accepts exactly AES's 16/24/32-byte key sizes and rejects
+    /// everything else, so a caller cannot silently get a zero-padded or
+    /// truncated key. `new` keeps the legacy pad/truncate contract.
+    #[test]
+    fn try_new_accepts_only_aes_key_lengths() {
+        for len in [16usize, 24, 32] {
+            let key = vec![0x5au8; len];
+            let crypt = AesCfbCrypt::try_new(&key).expect("valid AES key length");
+            // The checked constructor must select the same cipher as `new`.
+            assert_eq!(crypt.name(), AesCfbCrypt::new(&key).name(), "len {len}");
+        }
+        for len in [0usize, 1, 15, 17, 23, 25, 31, 33, 64] {
+            let key = vec![0x5au8; len];
+            assert!(
+                AesCfbCrypt::try_new(&key).is_err(),
+                "{len}-byte key must be rejected"
+            );
+        }
+    }
+
+    /// The documented legacy behaviour: `new` zero-pads/truncates to 32 bytes,
+    /// so an over-long key must behave exactly like its 32-byte prefix (and a
+    /// short key like its zero-padded form). This is what wire compatibility
+    /// for already-deployed `--key` handling depends on.
+    #[test]
+    fn new_keeps_pad_and_truncate_contract() {
+        let long = AesCfbCrypt::new(&[0x11u8; 48]);
+        let truncated = AesCfbCrypt::new(&[0x11u8; 32]);
+        assert_eq!(long.name(), truncated.name());
+
+        let mut a = b"legacy key handling".to_vec();
+        let mut b = a.clone();
+        long.encrypt(&mut a);
+        truncated.encrypt(&mut b);
+        assert_eq!(a, b, "new() must truncate to the first 32 key bytes");
+
+        let short = AesCfbCrypt::new(&[0x22u8; 5]);
+        let padded = {
+            let mut k = vec![0u8; 32];
+            k[..5].copy_from_slice(&[0x22u8; 5]);
+            k
+        };
+        let mut c = b"legacy key handling".to_vec();
+        let mut d = c.clone();
+        short.encrypt(&mut c);
+        AesCfbCrypt::new(&padded).encrypt(&mut d);
+        assert_eq!(c, d, "new() must zero-pad a short key");
     }
 
     // ─── Go interop vectors ─────────────────────────────────────────

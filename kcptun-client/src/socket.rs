@@ -3,8 +3,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::warn;
-
 /// Create the datagram transport for a client connection, honoring `--tcp`.
 ///
 /// TCP mode dials a Linux raw-TCP socket (tcpraw); UDP mode uses a plain UDP
@@ -62,15 +60,9 @@ pub(crate) fn create_client_udp_socket(
     let _ = socket.set_reuse_address(true);
     if dscp > 0 {
         // Go: IPv4 → IP_TOS = dscp << 2; IPv6 → IPV6_TCLASS = dscp (no shift).
-        // socket2::set_tos maps to IP_TOS (IPv4) or IPV6_TCLASS (IPv6) on Linux.
-        let tos = if remote_addr.is_ipv4() {
-            dscp << 2
-        } else {
-            dscp
-        };
-        if let Err(e) = socket.set_tos(tos) {
-            warn!("set_tos (DSCP) failed for client socket: {}", e);
-        }
+        // socket2::set_tos only sets IP_TOS; knet helper adds IPV6_TCLASS
+        // for IPv6 sockets on Linux.
+        knet::set_dscp_on_socket(&socket, dscp, remote_addr.is_ipv6());
     }
     socket.connect(&remote_addr.into())?;
     socket.set_nonblocking(true)?;

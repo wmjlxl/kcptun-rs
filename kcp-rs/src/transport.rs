@@ -525,6 +525,18 @@ mod tests {
     use super::*;
     use crate::sharded::{acquire_buf, recycle_buf};
 
+    /// `MAX_DATAGRAM` is a cross-crate contract, not a local tuning knob: every
+    /// receive slot is sized with it (the `sharded` listener's per-peer slot and
+    /// the `conn` endpoint burst buffers), and `kcptun-common`'s
+    /// `validate_encrypted_mtu` derives the largest legal `--mtu` from it
+    /// (`mtu + crypto overhead <= 2048`). Growing it here without growing those
+    /// silently truncates full-size encrypted datagrams; shrinking it makes the
+    /// validator reject configurations that used to work.
+    #[test]
+    fn max_datagram_is_the_shared_receive_slot() {
+        assert_eq!(MAX_DATAGRAM, 2048);
+    }
+
     /// Idle peers must not preallocate packet buffers.
     #[test]
     fn peer_queue_storage_is_lazy() {

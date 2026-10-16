@@ -47,7 +47,7 @@ pub use kcp_config::{
     kcp_config_from, kcp_config_from_cli, parse_kcp_mode, KcpCliParams, DEFAULT_CONV,
 };
 #[cfg(feature = "tokio")]
-pub use kcp_transport::CryptoTransport;
+pub use kcp_transport::{validate_encrypted_mtu, CryptoTransport};
 #[cfg(feature = "tokio")]
 pub use kcptun_session::{KcptunConfig, KcptunSession, ACK_STALL_DEFAULT_SECS};
 #[cfg(feature = "tokio")]

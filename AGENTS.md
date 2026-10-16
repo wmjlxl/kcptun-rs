@@ -64,7 +64,7 @@ make clippy                   # -D warnings (workspace-wide clean as of 2026-10-
 make fmt
 make bench / profile / profile-rust-go / profiling-bins
 make release-armv7 / release-arm64
-make windows                  # x86_64-pc-windows-gnu via mingw-w64 (from macOS/Linux; --tcpraw needs Admin on Windows)
+make windows                  # x86_64-pc-windows-gnu via mingw-w64 (from macOS/Linux; --tcp needs Admin on Windows)
 ./publish_crates.sh [--execute]
 ```
 
@@ -139,7 +139,7 @@ the retirement path aborts in-flight downloads whenever a slot is replaced.
 
 ### Common Patterns
 
-- Global allocator: `mimalloc` in both binaries.
+- Global allocator: `mimalloc` in both binaries (wrapped by `kpprof::ProfilingAllocator` when the `pprof` feature is enabled, which is the default). The wrapper samples 1 allocation per 512 KB; both binaries switch sampling off at startup when `--pprof` is not set (`kpprof::set_heap_sample_rate(0)`), because heap samples can only be read back through the pprof HTTP endpoints.
 - Crypto selection: `kcrypt_rs::select_block_crypt` / `select_aead_crypt`; packet packing via `kcrypt_rs::wire::CryptoBuf` + `encrypt_batch`.
 - Socket buffers: go through `knet::set_socket_buffers` (not raw `set_recv_buffer_size`) so a container-clamped `net.core.{r,w}mem_max` is escalated with `SO_*BUFFFORCE`, and size the logical windows to fit the granted value: a KCP send window is `sndwnd × mtu × (ds+ps)/ds` bytes, and `--smuxbuf` should stay ≤ the granted socket buffer.
 - SNMP logging: `kcptun_common::snmp_log::snmp_logger` writes the Go CSV plus a Rust-only sidecar `<path>.rustobs` (`timestamp,WriteInlineSends,WriteFlushSends`).

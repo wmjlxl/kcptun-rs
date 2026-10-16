@@ -107,6 +107,9 @@ const EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(EOF_GRAC
 /// Receive half + state + read waker (single mutex).
 struct RecvInner {
     state: StreamState,
+    /// Final removal has returned this stream's receive tokens. A cached Arc
+    /// may still be used by an in-flight session input after map removal.
+    recycled: bool,
     /// Zero-copy receive queue (formerly `recv_buf_bytes`). Legacy contiguous
     /// `BytesMut` recv buffer was removed in R4.
     recv: VecDeque<Bytes>,
@@ -223,6 +226,7 @@ impl Stream {
             max_recv_buf,
             recv: Mutex::new(RecvInner {
                 state: StreamState::Init,
+                recycled: false,
                 recv: VecDeque::new(),
                 read_waker: None,
                 local_closed_at: None,
@@ -427,15 +431,19 @@ impl Stream {
             return Ok(());
         }
         let n = data.len();
-        let current = self.recv_buf_bytes_avail.load(Ordering::Relaxed);
-        if current + n > self.max_recv_buf {
-            return Err(StreamError::BufferOverflow);
-        }
         {
             let mut inner = self.recv.lock();
+            if inner.recycled || matches!(inner.state, StreamState::Closed | StreamState::Reset) {
+                return Err(StreamError::Closed);
+            }
+            let current = self.recv_buf_bytes_avail.load(Ordering::Relaxed);
+            if n > self.max_recv_buf.saturating_sub(current) {
+                return Err(StreamError::BufferOverflow);
+            }
             inner.recv.push_back(data);
+            self.recv_buf_bytes_avail
+                .store(current + n, Ordering::Relaxed);
         }
-        self.recv_buf_bytes_avail.fetch_add(n, Ordering::Relaxed);
         self.wakeup_reader();
         Ok(())
     }
@@ -647,6 +655,7 @@ impl Stream {
     pub fn recycle_tokens(&self) -> usize {
         let buffered = {
             let mut inner = self.recv.lock();
+            inner.recycled = true;
             inner.recv.clear();
             self.recv_buf_bytes_avail.swap(0, Ordering::Relaxed)
         };
@@ -1514,3 +1523,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod recv_tests;

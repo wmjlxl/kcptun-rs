@@ -19,9 +19,9 @@
 //!
 //! Known limitation: [`KcpTcpListener::close`] only flips the internal flag;
 //! it does not abort an `accept()` already blocked in the kernel (the
-//! underlying `TcpRawListener::accept` runs a blocking `accept(2)` inside
-//! `cpu_block`). A blocked `accept()` returns once the listener is dropped
-//! and the fd closes.
+//! underlying `TcpRawListener::accept` runs a blocking `accept(2)` on a
+//! dedicated per-listener thread, never on `cpu_block`). A blocked `accept()`
+//! returns once the listener is dropped and the fd closes.
 
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};

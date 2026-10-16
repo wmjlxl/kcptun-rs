@@ -205,6 +205,13 @@ mod sse2 {
     ///
     /// Each XMM register holds one state word from 4 different blocks
     /// (lane 0 = block 0, lane 1 = block 1, etc.).
+    ///
+    /// # Safety
+    ///
+    /// SSE2 is architecturally guaranteed on `x86_64`, so no runtime feature
+    /// check is needed. The caller passes `key`/`nonce` as fixed-size array
+    /// references and `out` as exactly 256 bytes; the body only writes through
+    /// `_mm_storeu_si128` (unaligned stores), so `out` needs no alignment.
     pub unsafe fn saltwenty_x4(key: &[u8; 32], nonce: &[u8; 8], ctr: u64, out: &mut [u8; 256]) {
         let u32le = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
 
@@ -372,6 +379,13 @@ mod neon {
     }
 
     /// 256 bytes keystream for counters ctr..ctr+3 (4×64B blocks).
+    ///
+    /// # Safety
+    ///
+    /// NEON is architecturally guaranteed on `aarch64`, so no runtime feature
+    /// check is needed. `key`/`nonce` are fixed-size array references and `out`
+    /// is exactly 256 bytes; stores are unaligned (`vst1q_u8`), so no alignment
+    /// requirement is placed on `out`.
     pub unsafe fn saltwenty_x4(key: &[u8; 32], nonce: &[u8; 8], ctr: u64, out: &mut [u8; 256]) {
         let u32le = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
 
@@ -483,9 +497,15 @@ impl BlockCrypt for Salsa20Crypt {
             use std::arch::x86_64::*;
             let mut ks = [0u8; 256];
             while off + 256 <= data.len() {
+                // SAFETY: SSE2 is baseline on x86_64 (no runtime check needed);
+                // `ks` is a 256-byte array and key/nonce are fixed-size.
                 unsafe { sse2::saltwenty_x4(&self.key, &nonce, ctr, &mut ks) };
                 // XOR 256 bytes using SSE2 (16 bytes per instruction)
                 for j in (0..256).step_by(16) {
+                    // SAFETY: `off + 256 <= data.len()` and `j < 256`, so the
+                    // 16-byte load/store at `data[off + j]` stays in bounds;
+                    // `ks[j..]` has 256 - j >= 16 bytes left. Both use the
+                    // unaligned `loadu`/`storeu` forms.
                     unsafe {
                         let d = _mm_loadu_si128(data[off + j..].as_ptr() as *const __m128i);
                         let k = _mm_loadu_si128(ks[j..].as_ptr() as *const __m128i);
@@ -505,8 +525,13 @@ impl BlockCrypt for Salsa20Crypt {
             use std::arch::aarch64::*;
             let mut ks = [0u8; 256];
             while off + 256 <= data.len() {
+                // SAFETY: NEON is baseline on aarch64; `ks` is 256 bytes and
+                // key/nonce are fixed-size arrays.
                 unsafe { neon::saltwenty_x4(&self.key, &nonce, ctr, &mut ks) };
                 for j in (0..256).step_by(16) {
+                    // SAFETY: `off + 256 <= data.len()` bounds `data` for the
+                    // 16-byte vector load/store; `ks` is 256 bytes so
+                    // `ks.as_ptr().add(j)` with `j < 256` is in bounds too.
                     unsafe {
                         let dp = data.as_mut_ptr().add(off + j);
                         let d = vld1q_u8(dp);
@@ -620,6 +645,7 @@ mod tests {
         }
 
         let mut sse2_out = [0u8; 256];
+        // SAFETY: baseline SSE2 on x86_64; output is a 256-byte array.
         unsafe { sse2::saltwenty_x4(&key, &nonce, ctr, &mut sse2_out) };
 
         assert_eq!(
@@ -645,6 +671,7 @@ mod tests {
         }
 
         let mut neon_out = [0u8; 256];
+        // SAFETY: baseline NEON on aarch64; output is a 256-byte array.
         unsafe { neon::saltwenty_x4(&key, &nonce, ctr, &mut neon_out) };
 
         assert_eq!(

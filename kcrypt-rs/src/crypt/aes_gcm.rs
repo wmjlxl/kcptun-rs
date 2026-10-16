@@ -22,6 +22,11 @@ use crate::nonce::NonceGen;
 const NONCE_SZ: usize = 12;
 const TAG_SZ: usize = 16;
 
+/// Bytes this AEAD adds to the plaintext on the wire: the 12-byte nonce prefix
+/// plus the 16-byte tag. Callers that size receive slots or MTU budgets must use
+/// this instead of re-deriving `12 + 16`.
+pub const AEAD_OVERHEAD: usize = NONCE_SZ + TAG_SZ;
+
 pub struct Aes128GcmCrypt {
     cipher: Aes128Gcm,
     /// Per-instance nonce source; see the module docs for why a counter is

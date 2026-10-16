@@ -38,6 +38,9 @@ Shared block-cipher and AEAD library for kcptun-rs. Port of Go `kcp-go/v5/crypt.
 - `null`/`none` both map to no-op encrypt; packet **header** difference is handled in binaries / `CryptoBuf` via `has_encryption` / `uses_cfb_header`.
 - Hot CFB paths (AES, 3DES, XTEA, Blowfish, …) are monomorphized — prefer that pattern for new ciphers.
 - On aarch64, `.cargo/config.toml` sets `--cfg aes_armv8` so AES is not soft fixslice.
+- Wire-overhead constants are public so callers size budgets from them instead of re-deriving literals: `CRYPTO_HEADER_SIZE` (20: 16B nonce + 4B CRC32, CFB/`none`) and `AEAD_OVERHEAD` (28: 12B nonce + 16B tag, AES-128-GCM). `kcptun-common::validate_encrypted_mtu` consumes both.
+- `AesCfbCrypt::try_new` rejects keys that are not 16/24/32 bytes; `AesCfbCrypt::new` keeps the legacy pad-with-zeros/truncate-to-32 behaviour (wire compatibility).
+- Salsa20 SIMD paths carry their invariants as `# Safety` / `SAFETY:` notes: SSE2 and NEON are architectural baseline on x86_64/aarch64 (no runtime feature check), and every 16-byte vector access is bounded by the `off + 256 <= data.len()` loop guard with unaligned loads/stores.
 
 ### Testing Requirements
 

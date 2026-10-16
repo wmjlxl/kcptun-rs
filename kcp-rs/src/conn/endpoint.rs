@@ -546,7 +546,11 @@ impl SharedIoState {
         // No FEC: skip the clone, send directly from `packets`.
         let fec_wire = if let Some(ref enc) = self.fec_encoder {
             let mut e = enc.lock();
-            Some(fec_expand_packets(&mut e, &packets, 500))
+            Some(fec_expand_packets(
+                &mut e,
+                &packets,
+                crate::fec::FEC_ENCODE_LATENCY_MS,
+            ))
         } else {
             None
         };
@@ -775,7 +779,7 @@ impl SharedIoState {
         // FEC-expand if configured (sync).
         let wire: Vec<Bytes> = if let Some(ref enc) = self.fec_encoder {
             let mut e = enc.lock();
-            let wire = fec_expand_packets(&mut e, packets, 500);
+            let wire = fec_expand_packets(&mut e, packets, crate::fec::FEC_ENCODE_LATENCY_MS);
             // `OutPkts` counts datagrams handed to the socket, matching Go —
             // so it is counted here, on the post-FEC wire batch, and not in the
             // KCP output callback (which fires per segment, before expansion).

@@ -10,7 +10,8 @@ use knet::AsyncWrite;
 /// When either direction completes, the reverse direction remains active for
 /// `closewait_secs` before the shared endpoints close.
 ///
-/// If `closewait_secs == 0`, returns immediately after copy completes.
+/// If `closewait_secs == 0`, the pipe still waits for both directions to
+/// reach EOF before returning — the value controls only the post-close linger.
 pub async fn pipe<A, B>(a: &mut A, b: &mut B, closewait_secs: u64) -> io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin,

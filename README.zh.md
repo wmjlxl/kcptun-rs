@@ -5,7 +5,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
-    <img src="https://img.shields.io/badge/tests-443%20passed-brightgreen" alt="Tests">
+    <img src="https://img.shields.io/badge/tests-551%20passed-brightgreen" alt="Tests">
     <img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
     <img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust">
@@ -18,7 +18,7 @@
     <tr>
       <td align="center" width="25%"><b>5.38×</b><br><sub>相对 Go 最高加速</sub></td>
       <td align="center" width="25%"><b>68 / 68</b><br><sub>Go↔Rust 端到端测试</sub></td>
-      <td align="center" width="25%"><b>443</b><br><sub>单元测试</sub></td>
+      <td align="center" width="25%"><b>551</b><br><sub>测试用例</sub></td>
       <td align="center" width="25%"><b>~2 MB</b><br><sub>strip 后二进制</sub></td>
     </tr>
   </table>
@@ -50,6 +50,7 @@
   🎛️ <a href="#-延迟调优指南linux">延迟调优指南（Linux）</a> ·
   🔬 <a href="#-优化历程">优化历程</a> ·
   🧪 <a href="#-测试严谨性">测试严谨性</a> ·
+  📋 <a href="#-cli-选项">CLI 选项</a> ·
   💡 <a href="#-为什么选择-rust">为什么选择 Rust？</a> ·
   📝 <a href="#-许可证">许可证</a>
 </p>
@@ -80,7 +81,7 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 
 - ✅ **线上兼容** Go kcptun（kcp-go v5）— Rust ↔ Go、Go → Rust、Rust → Rust 全部可互通
 - ⚡ **性能超越 Go** — 大多数加密/模式组合下都更快，macOS 最高达 **5.38 倍**，Linux VPS **1.11–1.59 倍**
-- 🧩 **13 种加密后端** + AES-128-GCM：AES、SM4、Salsa20、Blowfish、Twofish、CAST5、3DES、TEA、XTEA、XOR 等
+- 🧩 **15 种加密方法**（含 AES-128-GCM）：AES、SM4、Salsa20、Blowfish、Twofish、CAST5、3DES、TEA、XTEA、XOR 等
 - ⚡ **单一异步运行时**：tokio（多线程，高并发）
 - 🎯 **生产级功能**：FEC、SMUX v1/v2、QPP 混淆、SNMP 统计、速率限制、pprof 性能分析
 - 🔄 **跨平台**：macOS、Linux、ARMv7（树莓派）、ARM64（AWS Graviton）
@@ -90,7 +91,7 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 | 类别 | 详情 |
 |------|------|
 | **兼容性** | 与 Go kcptun（kcp-go v5）完全线上兼容 — 所有加密算法、模式、SMUX 版本、FEC、Snappy |
-| **加密** | 14 种后端：`null`、`none`、`xor`、`aes-128`、`aes-192`、`aes`(256)、`aes-128-gcm`、`sm4`、`tea`、`xtea`、`salsa20`、`blowfish`、`twofish`、`cast5`、`3des` |
+| **加密** | 15 种方法：`null`、`none`、`xor`、`aes-128`、`aes-192`、`aes`(256)、`aes-128-gcm`、`sm4`、`tea`、`xtea`、`salsa20`、`blowfish`、`twofish`、`cast5`、`3des`（别名：`aes-256`、`salsa`、`tripledes`）—— 见[加密认证说明](#-加密认证说明) |
 | **KCP 模式** | `normal`、`fast`、`fast2`、`fast3` |
 | **SMUX** | v1 & v2 多路复用 — 单条 KCP 连接承载多个 TCP 流 |
 | **FEC** | Reed-Solomon 前向纠错（默认 10/3，与 Go 兼容） |
@@ -136,9 +137,11 @@ cargo build --release
 ### 使用配置文件
 
 ```bash
-kcptun-server -c config.json
-kcptun-client -c config.json
+kcptun-client -c client.json
+kcptun-server -c server.json
 ```
+
+两份配置的字段集合**互不相通**：客户端专属字段（`localaddr`、`remoteaddr`、`conn`、`autoexpire`、`scavengettl`）会被服务端拒绝，服务端专属字段（`listen`、`target`、`shards`、`peripsessionrate`、`maxsessionsperip`）也会被客户端拒绝。
 
 ```json
 {
@@ -148,13 +151,33 @@ kcptun-client -c config.json
     "crypt": "aes-128",
     "mode": "fast2",
     "conn": 2,
+    "sndwnd": 128,
+    "rcvwnd": 512,
+    "datashard": 10,
+    "parityshard": 3,
+    "nocomp": false,
+    "smuxver": 2,
+    "keepalive": 10,
+    "autoexpire": 0,
+    "scavengettl": 600
+}
+```
+
+```json
+{
+    "listen": ":29900",
+    "target": "127.0.0.1:12948",
+    "key": "my-secret",
+    "crypt": "aes-128",
+    "mode": "fast2",
     "sndwnd": 1024,
     "rcvwnd": 1024,
     "datashard": 10,
     "parityshard": 3,
     "nocomp": false,
     "smuxver": 2,
-    "keepalive": 10
+    "keepalive": 10,
+    "shards": 0
 }
 ```
 
@@ -167,7 +190,7 @@ kcptun-client -c config.json
 **JSON 配置规则（审计加固）：**
 - JSON 中的值优先于命令行参数。
 - **未知字段直接报错**（`deny_unknown_fields`）——把 `"shards"` 写成 `"shard"` 会在启动时失败，而不是被静默忽略。
-- 服务端专属字段 `"shards"` 已支持（语义同 `--shards`）。
+- 服务端专属字段 `"shards"` 已支持（语义同 `--shards`）；`--threads` 仅命令行提供（无 JSON 字段）。
 - 非法值启动即失败：`--crypt` 必须是已知算法，`--mtu` ≥ 50，`--dscp` 0–63，`--conn` ≤ 256，`--shards` ≤ 64。
 
 ## 📊 性能深度分析
@@ -290,67 +313,41 @@ kcptun-client -c config.json
 <details>
 <summary><strong>压力测试（数据完整性）</strong></summary>
 
-全部 8 项压力测试通过 — 在并发负载下验证**逐字节精确性**：
+全部 10 项压力测试通过 — 在并发负载下验证**逐字节精确性**：
 
 | 测试 | 连接数 | 负载大小 | 结果 |
 |------|:-----:|:--------:|:----:|
 | 单连接混合大小 | 1 | 1B…64KB | ✅ |
+| 单连接 1 MB | 1 | 1 MB | ✅ |
 | 多线程 10 连接 | 10 | 各 256B | ✅ |
 | 多线程 50 连接 | 50 | 各 255B | ✅ |
 | 多线程 100 连接 | 100 | 1B + 4KB | ✅ |
 | 大数据（100 连接） | 100 | 各 64KB + 128KB | ✅ |
 | 页面刷新模拟 | 80（3 波） | 512B…128KB | ✅ |
 | 可压缩数据 | 1 | 压缩模式 | ✅ |
+| 多端口监听 | 2 | 2 端口范围 | ✅ |
+| closeWait 冒烟 | 1 | echo | ✅ |
 
 </details>
 
 ## 📡 客户端 I/O 模式对比
 
-`latency_p99` 示例支持三种客户端 I/O 模式，用于测量不同 KCP 调度架构对往返延迟的影响：
+`latency_p99` 示例用于测量裸 `kcp_rs::KcpStream` 的往返延迟。生产（也是唯一）的客户端架构是 **per-connection tokio task** —— 实验性的 WorkerPool 客户端模式（`--wp-client` / `--wp-workers`）已移除：额外的跨线程唤醒在实测中拖累了 P50 与吞吐量。
 
 ```bash
 # 1. 在独立进程中启动 echo server（避免 CPU 竞争）
 cargo run -p kcp-rs --features async --example latency_p99 -- --mode server --port 39001
 
-# 2a. 普通模式（per-connection tokio task）— 生产默认
+# 2a. 开环模型：固定请求速率
 cargo run -p kcp-rs --features async --example latency_p99 -- \
     --mode peer --addr 127.0.0.1:39001 --rps 200 --warmup 3 --duration 10
 
-# 2b. WorkerPool direct_rx（1 worker，无 reader 线程）
+# 2b. 闭环模型：保持 N 个在途请求
 cargo run -p kcp-rs --features async --example latency_p99 -- \
-    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 1 --rps 200 --warmup 3 --duration 10
-
-# 2c. WorkerPool channel（2 workers，独立 reader + channel）
-cargo run -p kcp-rs --features async --example latency_p99 -- \
-    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 2 --rps 200 --warmup 3 --duration 10
+    --mode peer --addr 127.0.0.1:39001 --concurrency 128 --warmup 3 --duration 10
 ```
 
-**架构对比：**
-
-| | 普通（per-conn） | WP direct\_rx（1w） | WP channel（2w） |
-|---|---|---|---|
-| **RX 路径** | `input_loop` tokio task → `kcp.input()` | worker 线程 `try_recv_from` → `kcp.input()` | reader 线程 `recv_from().await` → channel → worker `kcp.input()` |
-| **TX 路径** | `write_all` → 内联 `try_send_batch_to` | 同样内联发送；flush/重传在 worker | 同样内联发送；flush/重传在 worker |
-| **跨线程唤醒** | 0（同一 runtime） | 1（worker → client `read_notify`） | 2（reader → channel → worker，worker → client） |
-| **适用场景** | **所有客户端场景** | 实验：低 RPS P999 调优 | 实验：多连接服务端 demux |
-
-**实测（200 RPS，1KB，独立 server，macOS M1）：**
-
-| 模式 | P50 | P99 | P999 | Max |
-|------|----:|----:|-----:|----:|
-| **普通** | **604 μs** | **1.1 ms** | 16.6 ms | 26.3 ms |
-| WP direct\_rx（1w） | 1.5 ms | 3.8 ms | 33.4 ms | 42.1 ms |
-| WP channel（2w） | 1.4 ms | 3.7 ms | 15.1 ms | 23.8 ms |
-
-**实测（128 并发，1KB，独立 server）：**
-
-| 模式 | RPS | P50 | P99 | P999 |
-|------|----:|----:|----:|-----:|
-| **普通** | **49,766** | 2.4 ms | 4.4 ms | 22.6 ms |
-| WP direct\_rx（1w） | 37,764 | 3.3 ms | 4.7 ms | 9.1 ms |
-| WP channel（2w） | 2,465 | 3.7 ms | 5.3 ms | 5.6 ms |
-
-> **结论：** 普通模式（per-connection tokio task）是客户端的正确选择。WorkerPool 模式引入跨线程唤醒开销，导致 P50 和吞吐量下降。WorkerPool 的价值在**服务端** — 共享 UDP socket 的多连接 demux（此处未通过 `latency_p99` 基准测试覆盖）。
+`--rt single|multi` 与 `--workers N` 只决定基准进程自身使用哪种 runtime（单线程可避免跨线程唤醒，多线程贴近生产形态）。完整实测数据见 [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md)。
 
 ## 🔗 Go 兼容性
 
@@ -377,7 +374,7 @@ kcptun-rs 与 Go kcptun（kcp-go v5）**完全线上兼容**。全部 68 项端�
 加密算法:    15/15 种通过（Go→Rust + Rust→Go）
 KCP 模式:    4/4 通过
 SMUX:        2/2 版本通过
-压缩:        8/8 种加密×压缩组合通过
+压缩:        7/7 种加密×压缩组合通过（14 项检查）
 FEC:         2/2 配置通过
 总计:        68 通过，0 失败，0 跳过 🎉
 ```
@@ -407,7 +404,7 @@ FEC:         2/2 配置通过
 ```text
 kcptun-rs/
 ├── kcp-rs/          — KCP ARQ 协议状态机
-├── kcrypt-rs/       — 13 种分组密码 + AES-128-GCM
+├── kcrypt-rs/       — 加密引擎（15 种方法，含 AES-128-GCM）
 ├── smux-rs/         — SMUX 流多路复用器 (v1/v2)
 ├── qpp-rs/          — 量子置换垫混淆
 ├── knet-rs/          — 异步 I/O 抽象 (tokio)
@@ -422,18 +419,18 @@ kcptun-rs/
 - **tokio**（唯一运行时）— 多线程、高并发、适合生产规模
 - 业务代码仅使用 `knet::*` 抽象 — 绝不直接使用 tokio API
 
-### 刷新循环优化
+### 会话写管线
 
-刷新循环分为 **4 个阶段**，以最小化 KCP 互斥锁持有时间：
+会话写循环（`kcptun-common::kcptun_session::write_loop`）把昂贵的阶段全部挡在 KCP 互斥锁之外：
 
-| 阶段 | 工作内容 | KCP 锁 |
+| 步骤 | 工作内容 | KCP 锁 |
 |:----:|---------|:------:|
-| 1 | 排空 SMUX 发送缓冲区，收集 FIN 待处理的流 | ❌ 未持有 |
-| 2 | 编码 SMUX 帧 | ❌ 未持有 |
-| 3 | Snappy 压缩（如启用） | ❌ 未持有 |
-| 4 | `kcp.send()` + `kcp.update()` + `kcp.flush()` | ✅ 短暂持有 |
+| 1 | 排空 SMUX 发送缓冲区，编码帧与 FIN（`prepare_outbound_into_controlled`） | ❌ 未持有 |
+| 2 | 回收过期/linger 超时的流，并补发其 FIN | ❌ 未持有 |
+| 3 | Snappy 压缩（会话级）；大队列卸载到 `cpu_block`，超时后内联回退 | ❌ 未持有 |
+| 4 | `kcp.write_all(batch)` — 唯一触碰 KCP 的调用（`update`/`flush`/重传由 `KcpStream` 自身的事件驱动 flush loop 负责） | ✅ 短暂持有 |
 
-这使得 UDP 接收循环可以在刷新循环准备下一批帧的同时将数据输入 KCP — 消除了高并发下的锁争用问题。
+接收侧同理：FEC 解码在锁外完成，整个 UDP burst 只加一次锁（`process_inbound_batch`）。这使得接收循环可以在写循环准备下一批帧的同时持续向 KCP 喂数据 — 消除了高并发下的锁争用。
 
 ## 🔧 构建与运行
 
@@ -458,7 +455,7 @@ make linux-aarch64     # ARM64 Linux musl（从 macOS 交叉编译）
 make windows           # Windows x86_64 .exe（从 macOS/Linux 交叉编译）
 ```
 
-ARM 交叉构建使用 **tokio** 运行时，禁用 `pprof` 以保持二进制最小。
+所有交叉构建都使用 **tokio** 运行时和二进制默认特性集：`qpp` + `pprof` 均为默认特性，因此 pprof **并未**禁用。也正因如此，`*-full` 目标当前与基础目标构建的特性集相同。
 
 ### 从 macOS/Linux 交叉编译 Windows 二进制
 
@@ -474,7 +471,7 @@ make build-windows     # 调试构建
 
 Rust 的 `x86_64-pc-windows-gnu` 标准库采用自包含链接，产物 `.exe` 不依赖 `libgcc_s_seh-1.dll` / `libwinpthread-1.dll`，直接复制到 Windows 即可运行。导入表只有系统组件（`kernel32`、`ws2_32`、`advapi32`、`bcrypt`、`ntdll` + UCRT），因此需要 Windows 10 及以上。此处不构建 MSVC 三元组（`x86_64-pc-windows-msvc`），它需要 Windows 主机或 xwin + MSVC SDK。
 
-> Windows 运行时行为未纳入 CI：raw-TCP（`--tcpraw`/`--tcpmux`）需要管理员权限；`--pprof` 可提供 heap/allocs，但 CPU profile 返回 501（kpprof-rs 的 CPU 采样仅支持 Unix）。
+> Windows 运行时行为未纳入 CI：raw-TCP（`--tcp`）需要管理员权限；`--pprof` 可提供 heap/allocs，但 CPU profile 返回 501（kpprof-rs 的 CPU 采样仅支持 Unix）。
 
 ### 系统级 UDP 缓冲区调优（macOS）
 
@@ -508,7 +505,6 @@ net.inet.udp.recvspace=4194304
 | 变量 | 默认值 | 作用域 | 说明 |
 |---|---|---|---|
 | `KCP_BUSY_YIELDS` | `0`（禁用） | kcp-rs `KcpStream::read` | 自旋上限忙轮询：`read()` 在挂起等待唤醒 `Notify` 之前先 `yield_now` 自旋的次数。用于补偿 tokio 的 notify→wake→schedule→poll 调度跳变（每次唤醒 ~0.2–2ms）—— Go 运行时的 µs 级 goroutine 唤醒天然没有这个代价。 |
-| `KCPTUN_WORKER_THREADS` | 可用并行度（限制在 1–16） | `KcpListener` shard | 默认监听器 shard 数量。正整数覆盖自动检测；显式 Builder `worker_count(n)` 优先于环境变量。该变量不控制共享 Tokio runtime 的线程数。 |
 
 **`KCP_BUSY_YIELDS` 使用规则**（arm64 macOS 实测，500 RPS × 26 KB 回声；见 [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md)）：
 
@@ -516,31 +512,23 @@ net.inet.udp.recvspace=4194304
 - **监听端 / 高并发服务端**：保持 `0`。自旋 reader 会与连接处理及 flush task 争抢调度资源，可能显著放大 P99。
 - **吞吐优先 / 闭环负载**：保持 `0`。实测自旋会拖累闭环 req/s。因此 `bench/run_p99.sh` 只给独立的 Rust→Go 请求发起端（组合 3）设置 `512`；Rust↔Rust self 模式、Rust 服务端和闭环测试明确使用事件驱动配置。
 
-库默认值保持 `0`，生产部署保持事件驱动语义。`KcpListener` 每个 shard 使用一个独立 current-thread runtime。共享多线程 Tokio runtime 使用 Tokio 根据系统环境选择的默认 worker 数量。
+库默认值保持 `0`，生产部署保持事件驱动语义。`KcpListener` 完全运行在调用方的 runtime 上（没有私有 runtime）；`kcptun-server` 为每个多 shard socket 配备独立的 OS 线程 + current-thread runtime，共享多线程 Tokio runtime 的 worker 数由 `--threads N` 设置（0 = 自动）。
 
 ## 🎛️ 延迟调优指南（Linux）
 
 来自 P99 优化工作（2026-09）的实用调优结论。全部数据来自 1 vCPU Linux 虚拟机上
 受控同机 A/B 测试（[docs/kcp-rs-optimization-2026-09-01.md](docs/kcp-rs-optimization-2026-09-01.md) §6–§9）。
 
-### 1. 让监听器自动选择拓扑（无需操作）
+### 1. 监听器架构（无需操作）
 
-`KcpListener`（`kcptun-server` 使用）在绑定时选择接收管线：
-
-| 拓扑 | 触发条件 | 效果 |
-|:-----|:---------|:-----|
-| **直连单 worker** | `worker_count == 1`（任意平台） | worker 自己排空 UDP socket —— 无 RX 线程、无队列跳转。1–2 vCPU 主机的最佳默认值。 |
-| **直连 SO_REUSEPORT 组** | Linux、新绑定、N 个 worker | 每 worker 一个 socket；内核 4-tuple hash 把每个会话固定到一个 worker（无需用户态路由的会话亲和）。多核主机最佳。 |
-| **Reader 管线** | 共享/外部 socket + N 个 worker | 专用 RX 线程向 worker 队列分发（macOS/Windows 上因 SO_REUSEPORT 不分发 UDP 流而作为回退）。 |
-
-用 `KCPTUN_WORKER_THREADS`（库）设置 shard 数——Linux 上新绑定且值 > 1 时自动使用 reuseport 组。
+`KcpListener`（`kcptun-server` 使用）完全运行在**调用方的 runtime** 上：单个异步接收任务排空共享 socket，将每个 burst 按源地址分组，并就地喂给每个存活会话 —— 每个 peer 每个 burst 只有一次解密、一次 KCP 加锁、一次 flush 和一次发送系统调用。不再有 worker 数或拓扑开关（旧的 `KCPTUN_WORKER_THREADS` 已删除）；并行度来自 `kcptun-server` 的 shards（见下），共享 Tokio worker 数由 `--threads` 设置。
 
 ### 2. kcptun-server 的 `--shards N`（Linux）
 
-每个 shard 是独立的 SO_REUSEPORT socket、由独立线程处理，不存在共享 fd 的发送争用。
+每个 shard 在监听端口上绑定自己的 SO_REUSEPORT socket，不存在共享 fd 的发送争用。
 
 - 默认（`--shards 0`）：**Linux** 上每个逻辑 CPU 一个 shard；其他平台单 shard（macOS 的 SO_REUSEPORT 不分发 UDP 流）。
-- **硬上限 64**：每个 shard 是一个 OS 线程 + 一个绑定的 UDP socket；更大的值会在启动时报错退出（以前会 `expect` panic/abort）。
+- **硬上限 64**：每个 shard 绑定自己的 UDP socket；多 shard 时为每个 socket 配备独立 OS 线程 + current-thread runtime（严格 fd 亲和），单 shard 情况则作为共享 runtime 上的一个任务运行。更大的值会在启动时报错退出（以前会 `expect` panic/abort）。
 - 经验法则：**shards ≈ vCPU 数**。1–2 vCPU 的机器保持 1 个 shard —— 多余的 worker 在同一个核上只增加跨核唤醒（N=2 reuseport 路径功能验证正确，但在单 vCPU 上严格更慢）。
 
 ### 3. 内核 CFS wakeup granularity —— Linux 上对 P99 影响最大的单项参数
@@ -571,7 +559,7 @@ sudo sysctl -w net.core.wmem_max=4194304
 
 | 场景 | 设置 |
 |:-----|:-----|
-| 1–2 vCPU 主机（VPS、容器） | 1 个 shard（`--shards 1` 或默认 worker 数 1）+ `wakeup_granularity=1ms` |
+| 1–2 vCPU 主机（VPS、容器） | 1 个 shard（`--shards 1`；非 Linux 平台默认就是 1）+ `wakeup_granularity=1ms` |
 | 多核主机、大量并发会话 | 默认 `--shards`（= CPU 数，Linux 上为 reuseport 组）+ `wakeup_granularity=1ms` |
 | 高丢包网络 | 保持默认；FEC（`--datashard/--parityshard`）用带宽换尾延迟 |
 | 吞吐基准测试 | 恢复 `wakeup_granularity` 默认值（1ms 会略微增加公平切换开销） |
@@ -661,9 +649,9 @@ wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）�
 
 | 测试类型 | 数量 | 验证内容 |
 |:--------|:---:|---------|
-| 单元测试 | 443 | 各 crate 的正确性 |
+| 测试 | 551 | `cargo test --workspace` — 422 单元 + 118 集成 + 11 文档测试 |
 | E2E 互通 | 68 | Go↔Rust 双向兼容性 |
-| 压力测试 | 8 | 大规模下逐字节数据完整性 |
+| 压力测试 | 10 | 大规模下逐字节数据完整性 |
 | 稳定性长跑 | PASS | 远端 1 小时 × 20 客户端正式测试，六项判据全过（停摆阈值 2026-10-12 起为 150 秒） |
 | 完整性猎捕 | 2708 万 / 0 | 仪器化交换逐字节校验（约 358 GB），截至 2026-10-15 零失败 |
 | Clippy | `-D warnings` | 零警告强制 |
@@ -671,6 +659,86 @@ wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）�
 
 停摆说明：高丢包下 KCP 重传槽位会膨胀至与 Go 完全一致的 `RTO_MAX`（60 秒）上限——属可自愈的算法固有行为，不是缺陷
 （`bugs/ANALYSIS_KCP_RTO_INFLATION_TAIL_STALLS.md`）。监听器不会仅因 `dead_link` 状态拆除会话，与 Go 行为一致。
+
+## 📋 CLI 选项
+
+下表中的默认值为**生效值**（部分默认值在代码中解析，`--help` 不会显示）。
+
+### kcptun-client
+
+| 参数 | 默认值 | 说明 |
+|:-----|:--------|:-----|
+| `-l` / `--localaddr` | `:12948` | 本地 TCP 监听地址 |
+| `-r` / `--remoteaddr` | `vps:29900` | 远端服务端地址（IP、DNS 域名或多端口范围 `host:29900-29910`） |
+| `-k` / `--key` | `it's a secrect` | 预共享密钥（也支持 `KCPTUN_KEY` 环境变量） |
+| `--crypt` | `aes` | 加密算法；未知名称启动即失败。生产建议 `aes-128-gcm`（唯一带认证的算法） |
+| `-m` / `--mode` | `fast` | KCP 模式：`normal`/`fast`/`fast2`/`fast3`；其他值进入 manual 模式并使用下面四个旋钮 |
+| `--conn` | `1` | UDP 连接数（**1–256**，超出会被拒绝） |
+| `--autoexpire` | `0`（关闭） | 会话创建 N 秒后替换池槽位（被替换会话继续服务，随后由 scavenger 回收） |
+| `--scavengettl` | `600` | 退役会话的回收 TTL（秒） |
+| `--mtu` | `1350` | 最大传输单元（**≥ 50**，且需容纳 2048 字节接收缓冲） |
+| `--ratelimit` | `0` | 每连接限速（字节/秒，0 = 关闭） |
+| `--sndwnd` | `128` | KCP 发送窗口 |
+| `--rcvwnd` | `512` | KCP 接收窗口 |
+| `--datashard` | `10` | FEC 数据分片 |
+| `--parityshard` | `3` | FEC 校验分片 |
+| `--dscp` | `0` | IP 包 DSCP（**0–63**） |
+| `--nocomp` | `false` | 关闭会话级 Snappy 压缩 |
+| `--acknodelay` | `false` | ACK nodelay |
+| `--nodelay` / `--interval` / `--resend` / `--nc` | `0` / `50` / `0` / `0` | 手动 KCP 旋钮（`--mode` 为已知名称时不生效） |
+| `--sockbuf` | `4 MiB` | Socket 缓冲区大小（字节） |
+| `--smuxver` | `2` | SMUX 版本（1 或 2） |
+| `--smuxbuf` | `4 MiB` | SMUX 接收缓冲 |
+| `--streambuf` | `2 MiB` | SMUX 流缓冲 |
+| `--framesize` | `8192` | SMUX 最大帧长 |
+| `--keepalive` | `10` | SMUX keepalive 间隔（秒；0 = 关闭） |
+| `--keepalivetimeout` | `30` | 入站静默超时（秒；0 = 关闭） |
+| `--ackstalltimeout` | `10` | 出站未 ACK 超时（秒；0 = 关闭） |
+| `--closewait` | `0` | closeWait 宽限期（秒） |
+| `--snmplog` / `--snmpperiod` | 未设置 / `60` | SNMP CSV 日志路径 + 记录周期（秒） |
+| `--log` | stderr | 日志文件路径（10 MiB 轮转） |
+| `--quiet` | `false` | 关闭日志输出 |
+| `--tcp` | `false` | 使用 raw-TCP 传输代替 UDP |
+| `--pprof` / `--pprofaddr` | `false` / `127.0.0.1:6060` | pprof HTTP 端点（同一时间只允许一个 CPU profile，额外请求返回 429） |
+| `--threads` | `0`（自动） | 全局异步 runtime 的 Tokio worker 线程数 |
+| `--QPP` / `--QPPCount` | `false` / `61` | QPP 混淆 + pad 数量 |
+| `-c` | — | JSON 配置文件路径 |
+| `-v` / `--version` | — | 打印版本并退出 |
+
+### kcptun-server
+
+| 参数 | 默认值 | 说明 |
+|:-----|:--------|:-----|
+| `-l` / `--listen` | `:29900` | KCP 监听地址（UDP；支持端口范围） |
+| `-t` / `--target` | `127.0.0.1:12948` | 转发目标 TCP 地址 |
+| `-k` / `--key` | `it's a secrect` | 预共享密钥（也支持 `KCPTUN_KEY` 环境变量） |
+| `--crypt` | `aes` | 加密算法（同客户端）；未知名称启动即失败 |
+| `-m` / `--mode` | `fast` | KCP 模式 |
+| `--shards` | `0`（自动：Linux 按 CPU 数，其他平台 1） | SO_REUSEPORT shard socket 数。**硬上限 64**（更大的值以前会直接 abort 进程） |
+| `--peripsessionrate` | `20` | 每源 IP 每秒新建会话上限（0 = 不限） |
+| `--maxsessionsperip` | `0` | 每源 IP 并发会话上限（0 = 不限；NAT 后建议保持 0） |
+| `--mtu` | `1350` | MTU（**≥ 50**） |
+| `--ratelimit` | `0` | 每连接限速（字节/秒，0 = 关闭） |
+| `--sndwnd` / `--rcvwnd` | `1024` / `1024` | KCP 发送 / 接收窗口 |
+| `--datashard` / `--parityshard` | `10` / `3` | FEC 数据 / 校验分片 |
+| `--dscp` | `0` | IP 包 DSCP（**0–63**） |
+| `--nocomp` | `false` | 关闭会话级 Snappy 压缩 |
+| `--acknodelay` | `false` | ACK nodelay |
+| `--nodelay` / `--interval` / `--resend` / `--nc` | `0` / `50` / `0` / `0` | 手动 KCP 旋钮（`--mode` 为已知名称时不生效） |
+| `--sockbuf` | `4 MiB` | Socket 缓冲区大小（字节） |
+| `--smuxver` | `2` | SMUX 版本（1 或 2） |
+| `--smuxbuf` / `--streambuf` / `--framesize` | `4 MiB` / `2 MiB` / `8192` | SMUX 接收缓冲 / 流缓冲 / 最大帧长 |
+| `--keepalive` / `--keepalivetimeout` / `--ackstalltimeout` | `10` / `30` / `10` | SMUX keepalive、入站静默、出站 ACK 停滞超时（秒；0 = 关闭） |
+| `--closewait` | `30` | closeWait 宽限期（秒） |
+| `--snmplog` / `--snmpperiod` | 未设置 / `60` | SNMP CSV 日志路径 + 记录周期（秒） |
+| `--log` | stderr | 日志文件路径（10 MiB 轮转） |
+| `--quiet` | `false` | 关闭日志输出 |
+| `--tcp` | `false` | 使用 raw-TCP 传输代替 UDP |
+| `--pprof` / `--pprofaddr` | `false` / `127.0.0.1:6060` | HTTP pprof（默认仅回环；同一时间一个 CPU profile，额外请求 429） |
+| `--threads` | `0`（自动） | 全局异步 runtime 的 Tokio worker 线程数 |
+| `--QPP` / `--QPPCount` | `false` / `61` | QPP 混淆 + pad 数量 |
+| `-c` | — | JSON 配置文件路径 |
+| `-v` / `--version` | — | 打印版本并退出 |
 
 ## 💡 为什么选择 Rust？
 

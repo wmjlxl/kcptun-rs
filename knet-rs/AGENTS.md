@@ -31,7 +31,16 @@ Tokio-based network I/O extensions for kcptun (`lib` name: `knet`). Provides `mm
 - Crate name is `knet` (imported as `use knet::*` in business code).
 - `cpu_block` offloads CPU work (crypto/snappy) to a blocking pool — used heavily on flush paths.
 - `mmsg` provides Linux `sendmmsg`/`recvmmsg` for batch UDP I/O (no-op on non-Linux).
-- `tcpraw` provides Linux `TCP_REPAIR` mode raw TCP transport.
+- `tcpraw` provides Linux `TCP_REPAIR` mode raw TCP transport. `sendto` uses `MSG_DONTWAIT` (the raw fd stays blocking for the capture thread) and `send_batch_to` retries a `WouldBlock` packet for at most 500 ms before erroring — never an unbounded busy loop. A failed `accept` rolls its `channels`/`flows` registration back through `PendingPeerRegistration` so retries cannot accumulate dead peers.
+- `TcpRawConn` derives `Send`/`Sync` from its fields; the hand-written `unsafe impl`s were removed (verified with `cargo check --target x86_64-unknown-linux-musl -p knet-rs`).
+- `net::tcp_pkt` holds the TCP checksum for `tcpraw`. It is pure arithmetic, so it lives outside the Linux-only
+  module and is compiled for every test build: the pseudo-header words and segment words are summed in place
+  (no temporary buffer), verified byte-for-byte against the previous build-a-buffer implementation for every
+  length 0..=2048 plus independent golden vectors. Do not move it back into `tcpraw.rs` — that makes it
+  untestable on non-Linux hosts.
+- `set_dscp_on_socket(socket, dscp, is_ipv6)` sets `IP_TOS = dscp << 2` for IPv4 and additionally `IPV6_TCLASS = dscp` (raw, no shift — Go parity) on Linux, where `socket2::set_tos` does not reach the IPv6 option. `dscp` must be 0–63; callers validate.
+- `cpu_block` catches a panic in the job and re-raises it on the awaiting caller, so one panicking job neither strands the caller nor kills the pool worker.
+- `tcpraw`/`mmsg` are `cfg(target_os = "linux")`; macOS compiles stubs, so **compile-check Linux-only edits with `cargo check --target x86_64-unknown-linux-musl`** before trusting a macOS build.
 - UDP socket buffers: 4 MB recv/send via the shared socket2 setup.
 
 ### Testing Requirements

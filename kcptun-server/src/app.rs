@@ -66,6 +66,7 @@ impl ServerSetup {
         }
         let mode = cli.mode.as_deref().unwrap_or("fast");
         let mtu = cli.mtu.unwrap_or(1350);
+        kcptun_common::validate_encrypted_mtu(mtu, crypt_method)?;
         let sndwnd = cli.sndwnd.unwrap_or(1024);
         let rcvwnd = cli.rcvwnd.unwrap_or(1024);
         let datashard = cli.datashard;
@@ -366,7 +367,10 @@ fn start_diagnostics(cli: &Cli, stop_flag: &Arc<AtomicBool>) {
     #[cfg(feature = "pprof")]
     if cli.pprof {
         let pprof_addr = cli.pprofaddr.clone();
-        info!("starting pprof HTTP server on {pprof_addr}");
+        info!(
+            "starting pprof HTTP server on {pprof_addr} (heap sampling: 1 per {} bytes)",
+            kpprof::heap_sample_rate()
+        );
         #[cfg(feature = "pprof-deadlock")]
         kpprof::start_deadlock_detector();
         let pprof_stop = stop_flag.clone();
@@ -378,6 +382,14 @@ fn start_diagnostics(cli: &Cli, stop_flag: &Arc<AtomicBool>) {
                 error!("pprof server error: {}", e);
             }
         });
+    }
+    // Heap sampling can only be read back through the pprof HTTP endpoints, so
+    // without `--pprof` it is switched off: leaving the default 512 KiB rate on
+    // makes every allocation in a busy relay pay for an unreadable profile.
+    #[cfg(feature = "pprof")]
+    if !cli.pprof {
+        let previous = kpprof::set_heap_sample_rate(0);
+        info!("heap sampling disabled (was 1 sample per {previous} bytes): --pprof not enabled");
     }
     #[cfg(not(feature = "pprof"))]
     if cli.pprof {

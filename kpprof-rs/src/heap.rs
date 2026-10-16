@@ -13,7 +13,8 @@
 //!   (NO symbolization — avoids `addr2line` `OnceCell` reentrant init panics
 //!   when the `pprof` crate's CPU profiler or its `trigger_lazy()` is active).
 //! - Symbolization is deferred to `build_profile()` via `backtrace::resolve()`.
-//! - Zero-cost when `sample_rate == 0` (profiling disabled).
+//! - With `sample_rate == 0` the hook still runs an atomic load and a branch,
+//!   then returns before touching the counter (see [`set_heap_sample_rate`]).
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
@@ -58,6 +59,26 @@ static TOTAL_FREE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Sample rate (0 = disabled). Set by the binary on startup.
 static SAMPLE_RATE: AtomicUsize = AtomicUsize::new(DEFAULT_SAMPLE_RATE);
+
+/// Set the heap sampling rate at runtime: one sample per `rate` bytes
+/// allocated, or `0` to stop sampling entirely.
+///
+/// Intended to be called **once at startup**, before the workload runs.
+/// Samples already recorded are kept (heap profiles are cumulative), and the
+/// alloc/free byte totals stay consistent because a free is always accounted
+/// against the allocation that preceded it.
+///
+/// Returns the previous rate. Disabling sampling while the pprof HTTP server
+/// is *not* running removes its cost from every allocation; enabling it later
+/// cannot recover the allocation history that was never sampled.
+pub fn set_heap_sample_rate(rate: usize) -> usize {
+    SAMPLE_RATE.swap(rate, Ordering::Relaxed)
+}
+
+/// Current heap sampling rate (bytes per sample; `0` = sampling disabled).
+pub fn heap_sample_rate() -> usize {
+    SAMPLE_RATE.load(Ordering::Relaxed)
+}
 
 /// Start time of heap profiling (first sample). Used for time_nanos / duration_nanos.
 static PROFILE_START: OnceLock<SystemTime> = OnceLock::new();
@@ -212,8 +233,11 @@ fn record_sample(is_alloc: bool, size: usize) {
 /// A global allocator that wraps `mimalloc::MiMalloc` and samples allocations.
 ///
 /// Use this as `#[global_allocator]` when the `pprof` feature is enabled.
-/// When `sample_rate == 0`, the fast path is a single atomic add — effectively
-/// zero-cost.
+/// With `sample_rate == 0` the hook is an atomic load plus a branch — cheap,
+/// but not free (there is no counter add in that case). At the default
+/// 512 KiB rate it also does a TLS check and a shared `fetch_add` per
+/// allocation, which is why binaries that never start the pprof HTTP server
+/// disable it with [`set_heap_sample_rate(0)`](set_heap_sample_rate).
 pub struct ProfilingAllocator;
 
 impl Default for ProfilingAllocator {

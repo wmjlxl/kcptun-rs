@@ -20,6 +20,7 @@ pub mod task;
 pub mod time;
 
 // ─── Convenience re-exports ────────────────────────────────────────────────────
+pub use net::set_dscp_on_socket;
 pub use net::sockbuf::{set_socket_buffers, SocketBuffers};
 #[cfg(unix)]
 pub use net::UnixListener;
@@ -70,8 +71,9 @@ where
 /// second direction receives the same grace before the function returns. This
 /// matches Go's two copy goroutines and `sync.Once` close sequence.
 ///
-/// If `postwait_secs == 0`, returns immediately after copy completes
-/// (no wait). This is the Go default for the client side.
+/// If `postwait_secs == 0`, the pipe still waits for **both** directions to
+/// reach EOF before returning — it is not a single-direction early exit.
+/// The value controls only the post-close linger, not the bidirectional wait.
 pub async fn copy_bidirectional_postwait<A, B>(
     a: &mut A,
     b: &mut B,

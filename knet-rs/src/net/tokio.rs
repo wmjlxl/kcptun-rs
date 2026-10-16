@@ -582,8 +582,10 @@ impl TcpStream {
                     inner: TcpStreamInner::Tcp(stream),
                 })
             }
-            Ok(Err(_)) | Err(_) => {
-                // Fall back to Unix-domain socket.
+            Ok(Err(tcp_err)) => {
+                // Fall back to Unix-domain socket, but preserve the real TCP
+                // error so the caller can distinguish refusal/timeout from a
+                // missing Unix path.
                 #[cfg(unix)]
                 {
                     match tokio::net::UnixStream::connect(&addr_str).await {
@@ -591,15 +593,36 @@ impl TcpStream {
                             inner: TcpStreamInner::Unix(stream),
                         }),
                         Err(unix_err) => Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("could not connect to {addr_str} as TCP or Unix: {unix_err}"),
+                            tcp_err.kind(),
+                            format!(
+                                "could not connect to {addr_str} as TCP ({tcp_err}) or Unix ({unix_err})"
+                            ),
+                        )),
+                    }
+                }
+                #[cfg(not(unix))]
+                Err(tcp_err)
+            }
+            Err(_) => {
+                // Timeout on the hostname connect — try Unix as a last resort.
+                #[cfg(unix)]
+                {
+                    match tokio::net::UnixStream::connect(&addr_str).await {
+                        Ok(stream) => Ok(Self {
+                            inner: TcpStreamInner::Unix(stream),
+                        }),
+                        Err(unix_err) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "connect timeout to {addr_str}; Unix fallback also failed: {unix_err}"
+                            ),
                         )),
                     }
                 }
                 #[cfg(not(unix))]
                 Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid TCP address: {addr_str}"),
+                    io::ErrorKind::TimedOut,
+                    format!("connect timeout: {addr_str}"),
                 ))
             }
         }

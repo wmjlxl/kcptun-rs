@@ -605,3 +605,45 @@ fn inbound_null_identity() {
     let b = b"raw datagram";
     assert_eq!(inbound_null(b), b);
 }
+
+/// A reused output `Vec` must be big enough for the whole batch before the
+/// pushes start. `clear()` leaves `len == 0`, so a reserve argument computed
+/// from `capacity()` under-reserves: with cap 8 and 9 packets the old
+/// expression asked for exactly one byte, left the capacity at 8, and let the
+/// 9 pushes reallocate.
+#[test]
+fn reserve_batch_capacity_covers_reused_buffer() {
+    for batch in [9usize, 12, 16, 17, 64] {
+        let mut out: Vec<Bytes> = Vec::with_capacity(8);
+        out.push(Bytes::from_static(b"previous cycle"));
+        reserve_batch_capacity(&mut out, batch);
+        assert!(
+            out.capacity() >= batch,
+            "batch={batch} cap={} — reserve must count from len",
+            out.capacity()
+        );
+        assert_eq!(out.len(), 0, "reuse buffer must be cleared");
+    }
+}
+
+/// Output order and packet count are unchanged by the reservation fix.
+#[test]
+fn batch_ref_into_preserves_order_and_count() {
+    let (crypt, _) = CryptEngine::select("aes-128", b"test-key-12345678");
+    let cb = parking_lot::Mutex::new(CryptoBuf::new(0xDEADBEEF));
+    for batch in [9usize, 12, 16] {
+        let packets: Vec<Bytes> = (0..batch).map(|i| Bytes::from(vec![i as u8; 32])).collect();
+        let mut out: Vec<Bytes> = Vec::with_capacity(8);
+        encrypt_batch_ref_into(&packets, &crypt, &cb, true, false, &mut out);
+        assert_eq!(out.len(), batch, "one output packet per input");
+        for (i, enc) in out.iter_mut().enumerate() {
+            let mut buf = enc.to_vec();
+            let dec = cb
+                .lock()
+                .decrypt_cfb(&mut buf, &crypt)
+                .expect("decrypt")
+                .to_vec();
+            assert_eq!(dec, vec![i as u8; 32], "packet {i} of {batch}");
+        }
+    }
+}

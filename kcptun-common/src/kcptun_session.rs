@@ -465,15 +465,20 @@ async fn read_loop(
             .last_inbound_ms
             .store(knet::mono_ms(), Ordering::Release);
         let result = if let Some(decoder) = decoder.as_mut() {
-            decoder.feed(&buf[..n]).and_then(|data| {
-                if data.is_empty() {
-                    Ok(())
-                } else {
-                    smux.process_data(&data)
-                        .map(|_| ())
-                        .map_err(std::io::Error::other)
+            let data = match decoder.feed(&buf[..n]) {
+                Ok(data) => data,
+                Err(error) => {
+                    log::warn!("Snappy decoder rejected session input: {error}");
+                    break;
                 }
-            })
+            };
+            if data.is_empty() {
+                Ok(())
+            } else {
+                smux.process_data(&data)
+                    .map(|_| ())
+                    .map_err(std::io::Error::other)
+            }
         } else {
             smux.process_data(&buf[..n])
                 .map(|_| ())
@@ -946,6 +951,9 @@ async fn write_loop(
                 }
                 if stream.is_local_closed() && !stream.is_fin_sent() {
                     fin_pending = true;
+                }
+                if more_data && fin_pending {
+                    break;
                 }
             }
         }

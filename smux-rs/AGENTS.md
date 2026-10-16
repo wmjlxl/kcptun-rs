@@ -56,6 +56,18 @@ None (flat `src/`).
 - A received frame whose `ver` differs from `config.version` closes the
   session (Go's `ErrInvalidProtocol`). `Frame::new` still defaults to
   `SMUX_VER` (2), so build frames with `.with_ver(session.version())`.
+- `Frame`'s fields are public, so `Frame::new` is not the only way to build one.
+  `try_new` rejects payloads over 65535 (the `u16` length field) and
+  `try_encode` rejects a frame whose `length` disagrees with `data.len()` or
+  overflows the field; `new`/`encode` keep the legacy truncating behaviour the
+  internal framed paths rely on.
+- A final stream removal (`recycle_tokens`) sets a lock-protected `recycled`
+  flag inside the same critical section that clears the queue. A session input
+  loop that cached a `Stream` `Arc` before the removal must therefore get
+  `StreamError::Closed` (not a silent buffer) from `push_data_bytes`, and the
+  session's `PSH`/`FIN` arms return that packet's tokens — otherwise the bytes
+  would be charged with no reclaim path left. Local half-close is *not* a
+  reject reason: the inbound tail must still be accepted.
 - Compression is **not** in this crate; binaries wrap transport with Snappy before/after SMUX.
 - **Do not restore `with_backpressure`.** KCP backpressure belongs on the transport / KcpStream layer, not SmuxIo.
 - **R4 lock model (`Stream`):** `recv: Mutex<RecvInner>` (state + recv queue + read_waker + local_closed_at) and `send: Mutex<SendInner>` (send queue + write_waker). If both locks are needed: **recv then send**. Take wakers under lock, **wake after release**. No legacy contiguous `recv_buf`; only `VecDeque<Bytes>`. Peer window / half-close flags stay atomic.

@@ -302,38 +302,10 @@ fn open_raw_tcp_socket() -> io::Result<OwnedFd> {
 }
 
 // ─── Checksum ────────────────────────────────────────────────────────────────
-
-fn ones_complement_sum(data: &[u8]) -> u32 {
-    let mut sum: u32 = 0;
-    let chunks = data.chunks_exact(2);
-    let remainder = chunks.remainder();
-    for chunk in chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    if remainder.len() == 1 {
-        sum += (remainder[0] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    sum
-}
-
-fn tcp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_segment: &[u8]) -> u16 {
-    let mut buf = Vec::with_capacity(12 + tcp_segment.len() + 1);
-    buf.extend_from_slice(src_ip);
-    buf.extend_from_slice(dst_ip);
-    buf.push(0);
-    buf.push(6); // TCP
-    let tcp_len = tcp_segment.len() as u16;
-    buf.extend_from_slice(&tcp_len.to_be_bytes());
-    buf.extend_from_slice(tcp_segment);
-    if buf.len() % 2 != 0 {
-        buf.push(0);
-    }
-    !ones_complement_sum(&buf) as u16
-}
-
+//
+// `tcp_checksum`/`ones_complement_sum` now live in `net::tcp_pkt`, which is
+// portable (and unit-testable) instead of being locked inside this Linux-only
+// module.
 // ─── Packet Construction ─────────────────────────────────────────────────────
 
 /// Build a TCP segment only (no IP header) — Go tcpraw / IPPROTO_TCP raw shape.
@@ -370,7 +342,7 @@ fn build_tcp_segment(
 
     pkt[TCP_HDR_LEN..].copy_from_slice(payload);
 
-    let csum = tcp_checksum(src_ip, dst_ip, &pkt);
+    let csum = crate::net::tcp_pkt::tcp_checksum(src_ip, dst_ip, &pkt);
     pkt[16..18].copy_from_slice(&csum.to_be_bytes());
     pkt
 }
@@ -422,8 +394,11 @@ pub struct TcpRawConn {
     )>,
 }
 
-unsafe impl Send for TcpRawConn {}
-unsafe impl Sync for TcpRawConn {}
+// `Send`/`Sync` are auto-derived: every field is `Send + Sync` (owned fds,
+// `Arc<TcpFlowState>` of atomics, async_channel endpoints, join handles),
+// verified by `cargo check --target x86_64-unknown-linux-musl -p knet-rs`.
+// Hand-written `unsafe impl`s were removed with the audit-review fix that
+// proved them redundant — re-add only with a real invariant to state.
 
 impl TcpRawConn {
     fn raw_send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -463,12 +438,16 @@ impl TcpRawConn {
             sin_zero: [0; 8],
         };
 
+        // MSG_DONTWAIT avoids blocking the runtime worker under kernel
+        // send-buffer pressure. The raw socket is shared with the capture
+        // receive thread; setting it nonblocking globally would risk
+        // altering capture behaviour.
         let sent = unsafe {
             libc::sendto(
                 self.raw_fd.as_raw_fd(),
                 pkt.as_ptr() as *const libc::c_void,
                 pkt.len(),
-                0,
+                libc::MSG_DONTWAIT,
                 &dst as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             )
@@ -554,8 +533,47 @@ impl TcpRawConn {
         bufs: &[B],
         _target: &SocketAddr,
     ) -> io::Result<()> {
-        for buf in bufs {
-            self.raw_send(buf.as_ref())?;
+        // Total time one packet may wait for send-buffer space. The wait has to
+        // be bounded: an unbounded retry would park the session's send path
+        // forever on a peer that stopped draining, and every `sleep_ms` yields
+        // the worker but keeps the KCP output queued behind us.
+        const SEND_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+        const SEND_RETRY_SLEEP_MS: u64 = 5;
+        for (i, buf) in bufs.iter().enumerate() {
+            let deadline = std::time::Instant::now() + SEND_RETRY_BUDGET;
+            loop {
+                match self.raw_send(buf.as_ref()) {
+                    Ok(_) => break,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Back off instead of a tight loop, but never past the
+                        // budget: the packet prefix already sent stays sent, and
+                        // the error carries the index so progress is explicit.
+                        if std::time::Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                format!(
+                                    "raw_send still blocked after {}ms at index {}/{}",
+                                    SEND_RETRY_BUDGET.as_millis(),
+                                    i,
+                                    bufs.len()
+                                ),
+                            ));
+                        }
+                        // socket.writable() edge-triggered readiness can miss
+                        // the drain between the failed send and the wait.
+                        crate::sleep_ms(SEND_RETRY_SLEEP_MS).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        // The seq has only advanced for the prefix; return an
+                        // error naming where the batch stopped.
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("raw_send failed at index {i}/{}: {e}", bufs.len()),
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -677,6 +695,28 @@ pub struct TcpRawListener {
     iptables_rule: std::sync::Mutex<Option<Vec<String>>>,
 }
 
+/// Rolls back a peer's registration if accept fails before TcpRawConn owns it.
+struct PendingPeerRegistration<'a> {
+    listener: &'a TcpRawListener,
+    peer: SocketAddr,
+    flow: Arc<TcpFlowState>,
+    armed: bool,
+}
+
+impl Drop for PendingPeerRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut flows = self.listener.flows.lock().unwrap();
+        if matches!(flows.get(&self.peer), Some(flow) if Arc::ptr_eq(flow, &self.flow)) {
+            flows.remove(&self.peer);
+            drop(flows);
+            self.listener.channels.lock().unwrap().remove(&self.peer);
+        }
+    }
+}
+
 impl TcpRawListener {
     pub fn bind(addr: &SocketAddr) -> io::Result<Self> {
         let real = std::net::TcpListener::bind(*addr)?;
@@ -789,6 +829,12 @@ impl TcpRawListener {
             let mut flows = self.flows.lock().unwrap();
             flows.insert(peer_addr, flow.clone());
         }
+        let mut registration = PendingPeerRegistration {
+            listener: self,
+            peer: peer_addr,
+            flow: flow.clone(),
+            armed: true,
+        };
 
         let (takeover, seq, ack, drain) = match takeover_from_env() {
             Some(Takeover::Repair) => {
@@ -816,6 +862,7 @@ impl TcpRawListener {
 
         let (close_tx, _close_rx) = async_channel::bounded::<()>(1);
 
+        registration.armed = false;
         Ok((
             TcpRawConn {
                 _real: stream,

@@ -1158,11 +1158,9 @@ impl Session {
         if ids.is_empty() {
             return;
         }
-        let snapshot = self.stream_snapshot();
-        // fin_ids is 0–2 entries per flush cycle; a linear scan over `ids`
-        // (≤2 comparisons per stream) beats heap-allocating a HashSet.
-        for &(stream_id, ref s) in snapshot.iter() {
-            if ids.contains(&stream_id) {
+        let streams = self.streams.lock();
+        for &stream_id in ids {
+            if let Some(s) = streams.get(&stream_id) {
                 s.mark_fin_sent();
             }
         }

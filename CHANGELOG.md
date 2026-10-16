@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — the deferred audit items, implemented and measured
+
+`bugs/AUDIT_REVIEW_AND_FIX_PLAN_2026-10-15.md` left several items open pending
+measurement. Each was measured first; the numbers are in `docs/evidence/`.
+
+- **`tcpraw` per-packet checksum** (`knet`, raw-TCP mode): the segment was copied
+  into a temporary `Vec` before summing. The pseudo-header and segment words are
+  now summed in place. 32-byte segment 36.2 → 3.8 ns, 1350-byte segment
+  104.9 → 54.9 ns (no allocation per packet). The code moved to the portable
+  `net::tcp_pkt` module, so for the first time it is covered on non-Linux hosts
+  by equivalence tests against the previous implementation (every length
+  0..=2048), independent golden vectors, and the verify-to-zero property.
+- **FEC auto-tune probe** (`kcp-rs`): while `should_tune` is set — one stale or
+  injected packet is enough — the probe ran on every packet and built five
+  allocations and three sorts per call. It is now allocation-free with a
+  sortedness fast path: 3.3x faster on a 3+2 history, 3.5x on a reordered one,
+  1.7x on 128+128. A sample-count throttle was tried first and **rejected**: a
+  fixed stride aliases with the group period, so a 128+128 stream could never be
+  re-detected. Both the period search and the dimension fallback are pinned
+  against the pre-change implementations (verbatim, from 3552b46c) on 400
+  randomized and on structured periodic histories.
+- Measured and **not** changed, with data: the receive-path CFB memmove
+  (20.6 ns/packet ≈ 0.1% of a core at 50k pkt/s — not worth touching the wire
+  decrypt path, and AES-GCM cannot use the same trick), the session write-loop
+  scans (0.54 µs per flush cycle at 64 streams, 8 µs at 1024 — far below the
+  prepare cost they accompany), and the pprof heap-sampling hook, which costs
+  17–92% of the allocation path depending on thread count and object size — the
+  measurement that justifies disabling it when `--pprof` is off.
+
+
+### Fixed / Hardened — external audit review (`bugs/AUDIT_REVIEW_AND_FIX_PLAN_2026-10-15.md`)
+
+Applied after reviewing the external audit against the sources; the review's own
+corrections are recorded in that document. No wire-format change.
+
+- **Linux-only paths did not compile.** `knet`'s `tcpraw` send-retry called
+  `knet::sleep_ms` from inside the `knet` crate itself, and the new IPv6 DSCP
+  helper used `socket.as_raw_fd()` without importing `AsRawFd`. Both live behind
+  `cfg(target_os = "linux")`; macOS builds stubs, so the workspace had never
+  compiled them. `cargo check --target x86_64-unknown-linux-musl --workspace`
+  (and the two binaries with `--all-features`) is now green and is the check to
+  run for anything in `mmsg`/`tcpraw`/`sharded`.
+- **Snappy decoder rejected legal streams.** `SnappyStreamDecoder::feed` gated
+  the incoming slice against a 128 KiB budget that ignored the bytes already
+  retained, so a legal pair of maximum-size chunks split across two 64 KiB
+  session reads could exceed it — and `read_loop` treats a rejected feed as
+  fatal, tearing down a healthy session. The budget is now: per-call input cap,
+  at most one incomplete chunk retained between calls, per-call output cap.
+- **`tcpraw` batch retry was unbounded** (`knet`). A peer that stopped draining
+  could park a session's send path forever; each packet now retries a
+  `WouldBlock` send for at most 500 ms and then fails with the batch index.
+- **`TcpRawConn`'s hand-written `unsafe impl Send/Sync` were redundant** and
+  undocumented. A Linux compile probe (macOS uses a stub) proved the fields
+  derive both traits; the impls are gone.
+- **SMUX receive accounting** (`smux-rs`, from the same review): a final
+  `recycle_tokens` now marks the stream `recycled` inside the same lock that
+  clears the queue, so a session input loop holding a cached `Stream` `Arc`
+  cannot enqueue after removal; capacity check, enqueue and byte count share one
+  critical section, and a rejected push leaves the counter untouched. Local
+  half-close still accepts the inbound tail.
+- **Encrypted-MTU guard** (`kcptun-common`): overhead now comes from
+  `kcrypt_rs::AEAD_OVERHEAD` / `CRYPTO_HEADER_SIZE` instead of duplicated
+  literals, and `kcp-rs` pins `MAX_DATAGRAM` (the shared receive-slot size the
+  guard is derived from) with a contract test.
+- Smaller items from the same review: `Frame::try_encode` (checked length
+  against payload, no silent `u16` truncation), `AesCfbCrypt::try_new` plus
+  key-length tests, a named `FEC_ENCODE_LATENCY_MS` (Go's 500 ms constant),
+  `PendingPeerRegistration` rollback for failed raw-TCP accepts, a bounded
+  `send_batch_to`, the client scavenger now closes sessions *outside* the pool
+  lock, and the server's `--pprof` help text matches its loopback default.
+
+### Added — heap sampling can be switched off at runtime (`kpprof`)
+
+`set_heap_sample_rate(n)` / `heap_sample_rate()` are public; both binaries call
+the former with `0` at startup when `--pprof` is absent (heap samples are only
+readable through the HTTP endpoints, so sampling without a server is cost with
+no reader). The pprof HTTP server now handles one connection per task with a
+64-connection cap, a 5 s request deadline, an 8 KiB header cap and a 64 KiB body
+cap on `/debug/pprof/symbol`, and releases `PROFILE_BUSY` through a drop guard so
+a cancelled request cannot leave the endpoint latched.
+
+
 ### Fixed — `kcp-rs` divergences from kcp-go v5 (FEC auto-tune, packet type, early retransmit, `NoDelay`)
 
 Six semantic divergences found by diffing against the Go sources (`master`

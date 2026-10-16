@@ -8,8 +8,8 @@
 | Created | 2026-08-05 |
 | Scope | 以 `kcp-rs/src/conn.rs`、`listener.rs` 为核心，覆盖必要的 `transport.rs`、`fec.rs`、`kcp.rs`、`kio-rs` 与 server shard 接入；优化吞吐、P99/P999、连接风暴与空闲连接规模 |
 | Out of scope | 改变 KCP/SMUX/crypto wire format；以扩大拥塞窗口伪造性能；把 `kcp-rs` 重新耦合到 crypto；未经证据直接重写为游戏服务器 actor；生产可用性承诺 |
-| Supersedes | `docs/superpowers/plans/2026-08-02-P99_OPTIMIZATION_IMPLEMENTATION.md` 中尚未执行且与当前实现冲突的部分；已实施历史仍以各 spec 为准 |
-| Related | `kcp-rs/AGENTS.md`；`bench/LATENCY_P99_REPORT.md`；`bench/profiles/HOTSPOTS.md`；`docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md`；`docs/superpowers/specs/2026-08-05-P99_MULTITHREAD_INLINE_SEND_OPTIMIZATION.md`；两份用户提供的 conn/listener 分析文档 |
+| Supersedes | 2026-08-02 P99 优化计划（该文档已删除）中尚未执行且与当前实现冲突的部分；已实施历史仍以各 spec 为准 |
+| Related | `kcp-rs/AGENTS.md`；`bench/LATENCY_P99_REPORT.md`；`bench/profiles/HOTSPOTS.md`；`docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md`（已删除）；`docs/superpowers/specs/2026-08-05-P99_MULTITHREAD_INLINE_SEND_OPTIMIZATION.md`；两份用户提供的 conn/listener 分析文档 |
 
 ## 1. 结论摘要
 
@@ -636,7 +636,7 @@ spec、迁移说明、内存预算和安全模型，不与前述微优化同一 
 | Phase 7 SO_REUSEPORT shard ownership | 延期 | 结构正确性收益需 Linux 实测（本机 macOS 单 shard 不回退）；smol 无 "local" 语义 |
 | Phase 8 `KcpEndpoint` | 未开始 | 仅数万游戏会话目标；需独立 spec + 内存预算 |
 
-> **证据结论**：macOS lossless profile（`bench/profiles/HOTSPOTS.md` + `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md` §14.2）显示 `send_to` 51.6% / `recv_from` 4.3% — 服务器 syscall-bound，kcp-rs 内已非热点。FEC recovery 仅在高丢包（C5）激活，当前 bench 无法注入 loss；按计划 §17 停止微优化并记录。
+> **证据结论**：macOS lossless profile（`bench/profiles/HOTSPOTS.md` + `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md`（已删除）§14.2）显示 `send_to` 51.6% / `recv_from` 4.3% — 服务器 syscall-bound，kcp-rs 内已非热点。FEC recovery 仅在高丢包（C5）激活，当前 bench 无法注入 loss；按计划 §17 停止微优化并记录。
 
 ## 20. Linux 验证（2026-08-06，`rustlang/rust:nightly` Docker 容器）
 

@@ -41,9 +41,9 @@ CONNECTIONS="${BENCH_CONNECTIONS:-1}"
 # Interleaved rounds per backend; results are summarized by median.
 BENCH_ROUNDS="${BENCH_ROUNDS:-3}"
 # Give both implementations the same top-level concurrency budget:
-# Go receives GOMAXPROCS, Rust KcpListener receives KCPTUN_WORKER_THREADS.
-# Rust's shared Tokio runtime keeps its system-derived default worker count.
-# Set 0 to preserve each backend's own default instead.
+# Go receives GOMAXPROCS, the Rust binaries receive `--threads` (shared
+# Tokio runtime worker count). Set 0 to preserve each backend's own default
+# instead.
 BENCH_WORKERS="${BENCH_WORKERS:-4}"
 
 # Backend logs. A failed transfer ("only received 0/2097152 bytes") says nothing
@@ -146,7 +146,7 @@ launch_backend() {
     if [ "$bin" = "$GO_SERVER" ] || [ "$bin" = "$GO_CLIENT" ]; then
         exec env GOMAXPROCS="$BENCH_WORKERS" "$bin" "$@"
     fi
-    exec env KCPTUN_WORKER_THREADS="$BENCH_WORKERS" "$bin" "$@"
+    exec "$bin" --threads "$BENCH_WORKERS" "$@"
 }
 
 # A listening TCP socket only proves that the client process started.  It does

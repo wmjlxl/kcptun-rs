@@ -14,7 +14,7 @@
 #
 # Profiles: PROFILE=game (default, 512B) or PROFILE=bulk (26624B).
 # Env overrides: RPS (500), WARMUP (5s), DURATION (60s), SIZE (profile default),
-# CONCURRENCY (32), WORKERS (0=runtime defaults), RUST_SHARDS (1),
+# CONCURRENCY (32), WORKERS (0=runtime defaults),
 # RUST_CLIENT_BUSY_YIELDS (profile default), RUST_SERVER_BUSY_YIELDS (0), and
 # READER_POLL_US (profile default). The closed-loop runs use the same warm-up
 # and duration.
@@ -45,14 +45,12 @@ WARMUP=${WARMUP:-5}
 DURATION=${DURATION:-60}
 CONCURRENCY=${CONCURRENCY:-32}
 WORKERS=${WORKERS:-0}
-RUST_SHARDS=${RUST_SHARDS:-1}
 RUST_SERVER_BUSY_YIELDS=${RUST_SERVER_BUSY_YIELDS:-0}
 CONV=0x00C0_FFEE
 
 # A positive budget sets Go's GOMAXPROCS and the Rust probe's top-level Tokio
-# runtime. Listener shards are independent because this benchmark has exactly
-# one KCP session; RUST_SHARDS=1 avoids idle shard threads contaminating tail
-# latency while retaining the production listener pipeline.
+# runtime (`--workers`). `KcpListener` has no shard knob, and this benchmark
+# runs exactly one KCP session per process.
 if [ "$WORKERS" -gt 0 ]; then
   export GOMAXPROCS="$WORKERS"
 fi
@@ -146,7 +144,7 @@ run_step() {
 }
 
 echo "==> [1/6] kcp-rs(tokio) ↔ kcp-rs(tokio) baseline"
-env KCPTUN_WORKER_THREADS="$RUST_SHARDS" KCP_BUSY_YIELDS="$RUST_SERVER_BUSY_YIELDS" \
+env KCP_BUSY_YIELDS="$RUST_SERVER_BUSY_YIELDS" \
   "$EX_TOKIO" --mode server --port "$P_RT1" --size "$SIZE" --workers "$WORKERS" 2>/dev/null & SRV=$!
 ACTIVE_PID=$SRV
 sleep 1.5
@@ -183,7 +181,7 @@ kill_wait "$SRV"
 ACTIVE_PID=""
 
 echo "==> [4/6] kcp-go → kcp-rs(tokio) (cross)"
-env KCPTUN_WORKER_THREADS="$RUST_SHARDS" KCP_BUSY_YIELDS="$RUST_SERVER_BUSY_YIELDS" \
+env KCP_BUSY_YIELDS="$RUST_SERVER_BUSY_YIELDS" \
   "$EX_TOKIO" --mode server --port "$P_RT2" --size "$SIZE" --workers "$WORKERS" 2>/dev/null & RSRV=$!
 ACTIVE_PID=$RSRV
 sleep 1.5
@@ -193,7 +191,7 @@ kill_wait "$RSRV"
 ACTIVE_PID=""
 
 echo "==> [5/6] kcp-rs(tokio) ↔ kcp-rs(tokio) max-throughput baseline"
-R_TT_CLOSED=$(run_step "5/6" env KCPTUN_WORKER_THREADS="$RUST_SHARDS" KCP_BUSY_YIELDS=0 \
+R_TT_CLOSED=$(run_step "5/6" env KCP_BUSY_YIELDS=0 \
   "$EX_TOKIO" --mode self --concurrency "$CONCURRENCY" --warmup "$WARMUP" \
   --duration "$DURATION" --size "$SIZE" --workers "$WORKERS")
 echo "$R_TT_CLOSED"
@@ -265,7 +263,7 @@ cat <<EOF
 - 结构: 四个开放模型组合均为独立的「客户端进程计时 + 服务端进程回声」（kcp-rs=KcpListener+KcpStream, kcp-go=ListenWithOptions+NewConn3）
 - Rust 读取策略: client_busy_yields=$RUST_CLIENT_BUSY_YIELDS, server_busy_yields=$RUST_SERVER_BUSY_YIELDS, reader_poll_us=$READER_POLL_US
 - 调度口径: Go reader 固定使用 100µs ReadDeadline；Rust reader 使用上述配置。两者是各自 runtime 的原生唤醒路径，并非相同 polling 实现，因此结果同时包含 probe/runtime 调度开销。
-- 参数: target_rps=$RPS, warmup=${WARMUP}s (排除), duration=${DURATION}s, workers=$WORKERS (0=runtime 默认), rust_shards=$RUST_SHARDS
+- 参数: target_rps=$RPS, warmup=${WARMUP}s (排除), duration=${DURATION}s, workers=$WORKERS (0=runtime 默认)
 - **OS 调优**: $OS_TUNING
 
 ## 结果（微秒 µs，越小越好；P50/P90/P99/P999 由全部原始样本一次性聚合计算）

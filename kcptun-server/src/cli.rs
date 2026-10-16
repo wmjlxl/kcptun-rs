@@ -209,7 +209,8 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub tcp: bool,
 
-    /// Enable pprof HTTP server on :6060 (matching Go kcptun).
+    /// Enable pprof HTTP server on 127.0.0.1:6060 (loopback only; use
+    /// `--pprofaddr` to change the bind address).
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub pprof: bool,
 

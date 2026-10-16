@@ -3,7 +3,7 @@
 **Date**: 2026-08-01
 **Status**: implemented
 **Implementation**: branch `feat-tcpraw-rst-kcp-rs`, 10 commits, plan `docs/superpowers/plans/2026-08-01-TCPRAW_RST_KCP_RS_SURFACE.md`
-**Predecessor**: `2026-07-29-TCPRAW_TRANSPORT_DESIGN.md` (tcpraw transport implementation; this spec supersedes its TCP_REPAIR-only fallback assumption)
+**Predecessor**: `2026-07-29-TCPRAW_TRANSPORT_DESIGN.md`（已删除） (tcpraw transport implementation; this spec supersedes its TCP_REPAIR-only fallback assumption)
 
 ## Context
 
@@ -162,7 +162,7 @@ Per-connection thread (client + accepted server conn): blocking `recv` → disca
 - `kio-rs/src/net/mod.rs` — expose takeover knob as needed.
 - `kcp-rs/src/conn.rs` — `KcpConn::connect_tcp`, `KcpTcpListener` (+ builder).
 - `kio-rs` / `kcp-rs` tests — new Linux-gated suites.
-- `docs/superpowers/specs/2026-07-29-TCPRAW_TRANSPORT_DESIGN.md` — pointer note that this spec supersedes its TCP_REPAIR-only assumption.
+- `docs/superpowers/specs/2026-07-29-TCPRAW_TRANSPORT_DESIGN.md`（已删除） — pointer note that this spec supersedes its TCP_REPAIR-only assumption.
 
 ## Non-Goals
 

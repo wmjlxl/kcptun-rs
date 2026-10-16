@@ -117,6 +117,11 @@ pub use self::tokio::{TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "linux")]
 mod tcpraw;
 
+// Pure-arithmetic TCP checksum used by `tcpraw`; compiled for test builds on
+// every platform so it can be verified without a Linux host.
+#[cfg(any(target_os = "linux", test))]
+mod tcp_pkt;
+
 #[cfg(not(target_os = "linux"))]
 mod tcpraw_stub;
 
@@ -312,6 +317,115 @@ impl DatagramSocket {
                 io::ErrorKind::Unsupported,
                 "ttl not available on TcpRaw",
             )),
+        }
+    }
+}
+
+/// Set DSCP (Differentiated Services Code Point) on a `socket2::Socket`.
+///
+/// **DSCP is a 6-bit field (0–63)** per RFC 2474. Values > 63 must be rejected
+/// by the caller before calling this.
+///
+/// Go kcptun v5.6.64 behaviour:
+/// - IPv4: `IP_TOS = dscp << 2` (the kernel places DSCP in the DS field).
+/// - IPv6: `IPV6_TCLASS = dscp` (no shift — Go passes the raw value).
+///
+/// `socket2::Socket::set_tos` only calls `setsockopt(IPPROTO_IP, IP_TOS)`,
+/// which does **not** set `IPV6_TCLASS` on IPv6 sockets. This helper adds the
+/// missing `IPV6_TCLASS` setsockopt for IPv6 on Unix.
+pub fn set_dscp_on_socket(socket: &socket2::Socket, dscp: u32, is_ipv6: bool) {
+    if dscp == 0 {
+        return;
+    }
+    // IPv4: shift into the DS field. IPv6: pass raw (Go-compatible).
+    let tos = if is_ipv6 { dscp } else { dscp << 2 };
+    if let Err(e) = socket.set_tos(tos) {
+        log::warn!("set_tos (DSCP {}) failed: {}", dscp, e);
+    }
+    #[cfg(unix)]
+    if is_ipv6 {
+        // socket2 does not expose setsockopt(IPPROTO_IPV6, IPV6_TCLASS).
+        // Set it directly so the IPv6 traffic class actually takes effect.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::fd::AsRawFd;
+
+            let fd = socket.as_raw_fd();
+            let val: libc::c_int = dscp as libc::c_int;
+            let ret = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_TCLASS,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            );
+            if ret < 0 {
+                log::warn!(
+                    "setsockopt IPV6_TCLASS={} failed: {}",
+                    dscp,
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dscp_tests {
+    use super::set_dscp_on_socket;
+
+    fn udp_socket(ipv6: bool) -> socket2::Socket {
+        let domain = if ipv6 {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        socket2::Socket::new(domain, socket2::Type::DGRAM, None).expect("create socket")
+    }
+
+    /// IPv4: Go writes `IP_TOS = dscp << 2`, and that is what the kernel must
+    /// report back through `getsockopt`. Values 0/46/63 cover the 6-bit range
+    /// (46 = EF, the value live configs use).
+    #[test]
+    fn ipv4_sets_ip_tos_shifted() {
+        for dscp in [0u32, 46, 63] {
+            let sock = udp_socket(false);
+            set_dscp_on_socket(&sock, dscp, false);
+            // dscp == 0 returns early (the default TOS is already 0).
+            assert_eq!(
+                sock.tos().expect("getsockopt IP_TOS"),
+                dscp << 2,
+                "dscp {dscp} must land in the DS field"
+            );
+        }
+    }
+
+    /// IPv6: Go writes the raw value into `IPV6_TCLASS` (no shift), which
+    /// `socket2::set_tos` does not reach — the helper's own `setsockopt` does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_sets_ipv6_tclass_unshifted() {
+        for dscp in [46u32, 63] {
+            let sock = udp_socket(true);
+            set_dscp_on_socket(&sock, dscp, true);
+            let mut val: libc::c_int = -1;
+            let mut len = std::mem::size_of_val(&val) as libc::socklen_t;
+            let ret = unsafe {
+                libc::getsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&sock),
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_TCLASS,
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(
+                ret,
+                0,
+                "getsockopt IPV6_TCLASS: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(val as u32, dscp, "IPv6 traffic class must not be shifted");
         }
     }
 }

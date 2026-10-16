@@ -191,7 +191,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -201,14 +201,38 @@ use anyhow::{Context, Result};
 /// request would occupy another thread for up to 300s and starve crypto
 /// offload; it is rejected with 429 instead.
 static PROFILE_BUSY: AtomicBool = AtomicBool::new(false);
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+const MAX_CONNECTIONS: usize = 64;
+const MAX_BODY: usize = 64 * 1024;
+
+struct ConnectionPermit;
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(unix)]
+struct ProfilePermit;
+
+#[cfg(unix)]
+impl Drop for ProfilePermit {
+    fn drop(&mut self) {
+        PROFILE_BUSY.store(false, Ordering::SeqCst);
+    }
+}
 
 #[cfg(unix)]
 use pprof::protos::{self as protos, Message};
 
-// ─── Heap profiling (always compiled; zero-cost when sample_rate == 0) ───────
+// ─── Heap profiling (always compiled; near-zero cost when sample_rate == 0) ──
 
 mod heap;
-pub use heap::{build_allocs_profile, build_heap_profile, ProfilingAllocator};
+pub use heap::{
+    build_allocs_profile, build_heap_profile, heap_sample_rate, set_heap_sample_rate,
+    ProfilingAllocator,
+};
 
 // ─── Deadlock detection (optional) ──────────────────────────────────────────
 
@@ -225,8 +249,6 @@ pub use deadlock::{dump_deadlocks, start_deadlock_detector};
 /// Listens on `addr` and serves `/debug/pprof/*` endpoints.
 /// Returns when `stop` is set to `true`.
 pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
-    use knet::AsyncReadExt;
-
     let socket_addr: SocketAddr = addr.parse().context("invalid pprof address")?;
     let listener = knet::TcpListener::bind(socket_addr).await?;
     log::info!("pprof listening on http://{}/debug/pprof/", socket_addr);
@@ -239,18 +261,56 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
         #[allow(unused_variables)]
         let (mut stream, peer) = match accepted {
             Ok(Ok(v)) => v,
-            _ => continue,
+            Ok(Err(error)) => {
+                log::warn!("pprof accept failed: {error}");
+                continue;
+            }
+            Err(_) => continue,
         };
+        if ACTIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+            respond(
+                &mut stream,
+                "503 Service Unavailable",
+                "text/plain; charset=utf-8",
+                "",
+                b"too many pprof connections\n",
+            )
+            .await;
+            continue;
+        }
+        knet::spawn_task(async move {
+            let _permit = ConnectionPermit;
+            handle_pprof_connection(stream, peer).await;
+        });
+    }
 
+    log::info!("pprof server stopped");
+    Ok(())
+}
+
+async fn handle_pprof_connection(mut stream: knet::TcpStream, peer: SocketAddr) {
+    use knet::AsyncReadExt;
+
+    // Existing route branches use `continue` to end a response. This loop
+    // executes once and keeps that control flow local to the connection.
+    #[allow(clippy::never_loop)]
+    'request: loop {
         // Read HTTP request headers
         let mut buf = vec![0u8; 8192];
         let mut filled = 0usize;
         let mut header_end: Option<usize> = None;
+        let request_deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if filled >= buf.len() {
                 break;
             }
-            match knet::timeout(Duration::from_secs(2), stream.read(&mut buf[filled..])).await {
+            match knet::timeout(
+                request_deadline.saturating_duration_since(std::time::Instant::now()),
+                stream.read(&mut buf[filled..]),
+            )
+            .await
+            {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     filled += n;
@@ -268,6 +328,18 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 }
                 _ => break,
             }
+        }
+
+        if header_end.is_none() {
+            respond(
+                &mut stream,
+                "431 Request Header Fields Too Large",
+                "text/plain; charset=utf-8",
+                "",
+                b"incomplete or oversized request headers\n",
+            )
+            .await;
+            break 'request;
         }
 
         let req = String::from_utf8_lossy(&buf[..filled]);
@@ -293,7 +365,18 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
 
         // Read POST body if present (for symbol endpoint)
         let mut post_body: Vec<u8> = Vec::new();
-        if method == "POST" && content_length > 0 {
+        if method == "POST" && path == "/debug/pprof/symbol" && content_length > 0 {
+            if content_length > MAX_BODY {
+                respond(
+                    &mut stream,
+                    "413 Content Too Large",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"pprof request body too large\n",
+                )
+                .await;
+                break 'request;
+            }
             if let Some(hend) = header_end {
                 if filled > hend {
                     post_body.extend_from_slice(&buf[hend..filled]);
@@ -301,11 +384,28 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             }
             while post_body.len() < content_length {
                 let mut tmp = [0u8; 4096];
-                match knet::timeout(Duration::from_secs(2), stream.read(&mut tmp)).await {
+                let want = (content_length - post_body.len()).min(tmp.len());
+                match knet::timeout(
+                    request_deadline.saturating_duration_since(std::time::Instant::now()),
+                    stream.read(&mut tmp[..want]),
+                )
+                .await
+                {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => post_body.extend_from_slice(&tmp[..n]),
                     _ => break,
                 }
+            }
+            if post_body.len() < content_length {
+                respond(
+                    &mut stream,
+                    "408 Request Timeout",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"incomplete pprof request body\n",
+                )
+                .await;
+                break 'request;
             }
             post_body.truncate(content_length);
         }
@@ -325,7 +425,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"method not allowed\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
             let body = build_index_html();
             respond(
@@ -336,7 +436,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 body.as_bytes(),
             )
             .await;
-            continue;
+            break 'request;
         }
 
         // ── CPU profile ─────────────────────────────────────────────────
@@ -355,7 +455,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"method not allowed\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
             // P1-7 / M-14: at most one CPU profile in flight. A second
             // request would otherwise occupy another shared-pool thread for
@@ -369,8 +469,9 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"cpu profile already in progress\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
+            let profile_permit = ProfilePermit;
             let mut seconds: u64 = 30;
             for part in query.split('&') {
                 if let Some(v) = part.strip_prefix("seconds=") {
@@ -389,6 +490,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 std::thread::Builder::new()
                     .name("kpprof-cpu".into())
                     .spawn(move || {
+                        let _permit = profile_permit;
                         let result = (|| -> std::result::Result<Vec<u8>, String> {
                             let builder = pprof::ProfilerGuardBuilder::default().frequency(997);
                             #[cfg(any(
@@ -418,7 +520,6 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                         let _ = tx.send(result);
                     });
             if let Err(e) = spawn_result {
-                PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
                 respond(
                     &mut stream,
                     "500 Internal Server Error",
@@ -427,7 +528,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     format!("spawn profiler thread: {e}\n").as_bytes(),
                 )
                 .await;
-                continue;
+                break 'request;
             }
 
             // Wait for the dedicated thread without blocking the runtime's
@@ -438,18 +539,15 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     Ok(r) => break r,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         if std::time::Instant::now() >= deadline {
-                            PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
                             break Err("profiler timed out".to_string());
                         }
                         knet::sleep_ms(50).await;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
                         break Err("profiler thread vanished".to_string());
                     }
                 }
             };
-            PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
 
             let profile_bytes = match profile_result {
                 Ok(bytes) => bytes,
@@ -463,7 +561,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                         msg.as_bytes(),
                     )
                     .await;
-                    continue;
+                    break 'request;
                 }
             };
 
@@ -486,7 +584,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 profile_bytes.len(),
                 peer
             );
-            continue;
+            break 'request;
         }
 
         #[cfg(not(unix))]
@@ -500,7 +598,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 msg.as_bytes(),
             )
             .await;
-            continue;
+            break 'request;
         }
 
         // ── Command line ────────────────────────────────────────────────
@@ -514,7 +612,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"method not allowed\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
             let args: Vec<Vec<u8>> = std::env::args()
                 .map(|s| {
@@ -532,7 +630,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 &body,
             )
             .await;
-            continue;
+            break 'request;
         }
 
         // ── Symbol lookup (Go-compatible: GET + POST, num_symbols format) ─
@@ -546,7 +644,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"method not allowed\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
 
             // Go's symbol handler:
@@ -616,7 +714,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 symbols.as_bytes(),
             )
             .await;
-            continue;
+            break 'request;
         }
 
         // ── Heap profile ────────────────────────────────────────────────
@@ -630,7 +728,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"method not allowed\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
             // Go supports ?gc=1 to run GC before sampling.
             // In Rust we can't force mimalloc GC, but we can hint.
@@ -686,7 +784,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 )
                 .await;
             }
-            continue;
+            break 'request;
         }
 
         // ── Allocs profile ──────────────────────────────────────────────
@@ -700,7 +798,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"method not allowed\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
             let debug_mode: u64 = query
                 .split('&')
@@ -742,7 +840,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 )
                 .await;
             }
-            continue;
+            break 'request;
         }
 
         // ── Goroutine (thread dump / empty protobuf) ────────────────────
@@ -756,7 +854,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                     b"method not allowed\n",
                 )
                 .await;
-                continue;
+                break 'request;
             }
             let debug_mode: u64 = query
                 .split('&')
@@ -788,7 +886,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 )
                 .await;
             }
-            continue;
+            break 'request;
         }
 
         // ── Empty profiles for Go runtime-only types ───────────────────
@@ -804,7 +902,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 &body,
             )
             .await;
-            continue;
+            break 'request;
         }
         if path == "/debug/pprof/mutex" {
             let body = gzip_bytes(&empty_profile("contentions", "events"));
@@ -816,7 +914,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 &body,
             )
             .await;
-            continue;
+            break 'request;
         }
         if path == "/debug/pprof/threadcreate" {
             let body = gzip_bytes(&empty_profile("threads", "count"));
@@ -828,7 +926,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 &body,
             )
             .await;
-            continue;
+            break 'request;
         }
 
         // ── Trace (not supported in Rust) ──────────────────────────────
@@ -843,7 +941,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 msg.as_bytes(),
             )
             .await;
-            continue;
+            break 'request;
         }
 
         // ── Deadlock check (requires feature) ───────────────────────────
@@ -858,7 +956,7 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 body.as_bytes(),
             )
             .await;
-            continue;
+            break 'request;
         }
 
         // ── 404 ─────────────────────────────────────────────────────────
@@ -870,10 +968,8 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             b"not found\ntry GET /debug/pprof/\n",
         )
         .await;
+        break;
     }
-
-    log::info!("pprof server stopped");
-    Ok(())
 }
 
 // ─── HTTP response helper ────────────────────────────────────────────────────

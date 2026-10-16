@@ -7,8 +7,8 @@
 | Status | implemented |
 | Created | 2026-08-05 |
 | Scope | kcp-rs listener/transport/conn 的资源有界 + 零分配批量收包 + 每 burst 一次锁 + 批量接收栈；Go wire 兼容性交叉验证 |
-| Out of scope | P0.3 执行器归属、P1.4 可取消收包、P2.2 发送批量化（见 `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md` §13） |
-| Related | `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md`（v3 审核版，详细设计）、`kcp-rs/src/listener.rs`、`transport.rs`、`conn.rs`、`kio-rs/src/net/*`、`kcptun-common/src/kcp_transport.rs` |
+| Out of scope | P0.3 执行器归属、P1.4 可取消收包、P2.2 发送批量化（见 `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md`（已删除）§13） |
+| Related | `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md`（v3 审核版，详细设计；已删除）、`kcp-rs/src/listener.rs`、`transport.rs`、`conn.rs`、`kio-rs/src/net/*`、`kcptun-common/src/kcp_transport.rs` |
 
 ## Problem
 

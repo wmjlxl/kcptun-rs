@@ -5,7 +5,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
-    <img src="https://img.shields.io/badge/tests-443%20passed-brightgreen" alt="Tests">
+    <img src="https://img.shields.io/badge/tests-551%20passed-brightgreen" alt="Tests">
     <img src="https://img.shields.io/badge/e2e-68%20passed-brightgreen" alt="E2E">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
     <img src="https://img.shields.io/badge/rust-1.92+-orange" alt="Rust">
@@ -18,7 +18,7 @@
     <tr>
       <td align="center" width="25%"><b>5.38×</b><br><sub>max speedup vs Go</sub></td>
       <td align="center" width="25%"><b>68 / 68</b><br><sub>Go↔Rust e2e tests</sub></td>
-      <td align="center" width="25%"><b>443</b><br><sub>unit tests</sub></td>
+      <td align="center" width="25%"><b>551</b><br><sub>tests passing</sub></td>
       <td align="center" width="25%"><b>~2 MB</b><br><sub>stripped binary</sub></td>
     </tr>
   </table>
@@ -80,7 +80,7 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 
 - ✅ **Wire-compatible** with Go kcptun (kcp-go v5) — Rust ↔ Go, Go → Rust, Rust → Rust all work
 - ⚡ **Faster than Go** on most cipher/mode combinations (up to **5.38×** on macOS, **1.11–1.59×** on Linux VPS)
-- 🧩 **13 encryption backends** + AES-128-GCM: AES, SM4, Salsa20, Blowfish, Twofish, CAST5, 3DES, TEA, XTEA, XOR, and more
+- 🧩 **15 encryption methods** (incl. AES-128-GCM): AES, SM4, Salsa20, Blowfish, Twofish, CAST5, 3DES, TEA, XTEA, XOR, and more
 - ⚡ **Single async runtime**: tokio (multi-threaded, high-concurrency)
 - 🎯 **Production-ready features**: FEC, SMUX v1/v2, QPP obfuscation, SNMP stats, rate limiting, pprof profiling
 - 🔄 **Cross-platform**: macOS, Linux, ARMv7 (Raspberry Pi), ARM64 (Graviton)
@@ -90,7 +90,7 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 | Category | Details |
 |----------|---------|
 | **Compatibility** | Full wire-compatible with Go kcptun (kcp-go v5) — all ciphers, modes, SMUX versions, FEC, Snappy |
-| **Encryption** | 14 backends: `null`, `none`, `xor`, `aes-128`, `aes-192`, `aes`(256), `aes-128-gcm`, `sm4`, `tea`, `xtea`, `salsa20`, `blowfish`, `twofish`, `cast5`, `3des` — see [Cipher authentication](#-cipher-authentication) |
+| **Encryption** | 15 methods: `null`, `none`, `xor`, `aes-128`, `aes-192`, `aes`(256), `aes-128-gcm`, `sm4`, `tea`, `xtea`, `salsa20`, `blowfish`, `twofish`, `cast5`, `3des` (aliases: `aes-256`, `salsa`, `tripledes`) — see [Cipher authentication](#-cipher-authentication) |
 | **KCP Modes** | `normal`, `fast`, `fast2`, `fast3` |
 | **SMUX** | v1 & v2 multiplexing — multiple TCP streams over a single KCP connection |
 | **FEC** | Reed-Solomon forward error correction (Go-compatible 10/3 default) |
@@ -141,9 +141,11 @@ Now point your application at `127.0.0.1:12948` — all TCP data is encrypted, c
 ### With config file
 
 ```bash
-kcptun-server -c config.json
-kcptun-client -c config.json
+kcptun-client -c client.json
+kcptun-server -c server.json
 ```
+
+The two config schemas are **disjoint**: client-only fields (`localaddr`, `remoteaddr`, `conn`, `autoexpire`, `scavengettl`) are rejected by the server, and server-only fields (`listen`, `target`, `shards`, `peripsessionrate`, `maxsessionsperip`) are rejected by the client.
 
 ```json
 {
@@ -153,13 +155,33 @@ kcptun-client -c config.json
     "crypt": "aes-128",
     "mode": "fast2",
     "conn": 2,
+    "sndwnd": 128,
+    "rcvwnd": 512,
+    "datashard": 10,
+    "parityshard": 3,
+    "nocomp": false,
+    "smuxver": 2,
+    "keepalive": 10,
+    "autoexpire": 0,
+    "scavengettl": 600
+}
+```
+
+```json
+{
+    "listen": ":29900",
+    "target": "127.0.0.1:12948",
+    "key": "my-secret",
+    "crypt": "aes-128",
+    "mode": "fast2",
     "sndwnd": 1024,
     "rcvwnd": 1024,
     "datashard": 10,
     "parityshard": 3,
     "nocomp": false,
     "smuxver": 2,
-    "keepalive": 10
+    "keepalive": 10,
+    "shards": 0
 }
 ```
 
@@ -168,7 +190,7 @@ kcptun-client -c config.json
 **JSON config rules (audit hardening):**
 - JSON values take priority over CLI flags.
 - **Unknown fields are rejected** (`deny_unknown_fields`) — a typo like `"shard"` instead of `"shards"` fails at startup instead of being silently ignored.
-- Server-only `"shards"` is a real field (same semantics as `--shards`).
+- Server-only `"shards"` is a real field (same semantics as `--shards`); `--threads` is CLI-only (no JSON field).
 - Invalid values fail fast at startup: `--crypt` must be a known method, `--mtu` must be ≥ 50, `--dscp` must be 0–63, `--conn` ≤ 256, `--shards` ≤ 64.
 
 ## 📊 Performance Deep Dive
@@ -291,68 +313,42 @@ With compression (Snappy):
 <details>
 <summary><strong>Stress Tests (Data Integrity)</strong></summary>
 
-All 8 stress tests pass — verifying **byte-for-byte accuracy** under concurrent load:
+All 10 stress tests pass — verifying **byte-for-byte accuracy** under concurrent load:
 
 | Test | Connections | Payload | Result |
 |------|:-----------:|:-------:|:------:|
 | Single conn, mixed sizes | 1 | 1B…64KB | ✅ |
+| Single conn, 1 MB | 1 | 1 MB | ✅ |
 | Multi-thread 10 conn | 10 | 256B each | ✅ |
 | Multi-thread 50 conn | 50 | 255B each | ✅ |
 | Multi-thread 100 conn | 100 | 1B + 4KB | ✅ |
 | Large data (100 conn) | 100 | 64KB + 128KB | ✅ |
 | Page refresh simulation | 80 (3 waves) | 512B…128KB | ✅ |
 | Compressible data | 1 | patterns | ✅ |
+| Multi-port listener | 2 | 2-port range | ✅ |
+| closeWait smoke | 1 | echo | ✅ |
 
 </details>
 
 <details>
 <summary><strong>Client I/O Modes</strong></summary>
 
-The `latency_p99` example supports three client I/O modes to measure the effect of different KCP scheduling architectures on round-trip latency:
+The `latency_p99` example measures round-trip latency of a raw `kcp_rs::KcpStream`. Per-connection tokio tasks are the production (and only) client architecture — the experimental WorkerPool client modes (`--wp-client` / `--wp-workers`) were removed after they measured worse than the default: the extra cross-thread wakeups hurt P50 and throughput.
 
 ```bash
 # 1. Start an echo server in a separate process (avoids CPU contention)
 cargo run -p kcp-rs --features async --example latency_p99 -- --mode server --port 39001
 
-# 2a. Normal mode (per-connection tokio tasks) — the production default
+# 2a. Open-model: fixed request rate
 cargo run -p kcp-rs --features async --example latency_p99 -- \
     --mode peer --addr 127.0.0.1:39001 --rps 200 --warmup 3 --duration 10
 
-# 2b. WorkerPool direct_rx (1 worker, no reader thread)
+# 2b. Closed-loop: keep N requests in flight
 cargo run -p kcp-rs --features async --example latency_p99 -- \
-    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 1 --rps 200 --warmup 3 --duration 10
-
-# 2c. WorkerPool channel (2 workers, dedicated reader + channel)
-cargo run -p kcp-rs --features async --example latency_p99 -- \
-    --mode peer --addr 127.0.0.1:39001 --wp-client --wp-workers 2 --rps 200 --warmup 3 --duration 10
+    --mode peer --addr 127.0.0.1:39001 --concurrency 128 --warmup 3 --duration 10
 ```
 
-**Architecture comparison:**
-
-| | Normal (per-conn) | WP direct\_rx (1w) | WP channel (2w) |
-|---|---|---|---|
-| **RX path** | `input_loop` tokio task → `kcp.input()` | worker thread `try_recv_from` → `kcp.input()` | reader thread `recv_from().await` → channel → worker `kcp.input()` |
-| **TX path** | `write_all` → inline `try_send_batch_to` | same inline send; flush/retransmit in worker | same inline send; flush/retransmit in worker |
-| **Cross-thread hops** | 0 (same runtime) | 1 (worker → client `read_notify`) | 2 (reader → channel → worker, worker → client) |
-| **Best for** | **All client use cases** | Experimental: low-RPS P999 tuning | Experimental: multi-conn server demux |
-
-**Measured (200 RPS, 1KB, external server, macOS M1):**
-
-| Mode | P50 | P99 | P999 | Max |
-|------|----:|----:|-----:|----:|
-| **Normal** | **604 μs** | **1.1 ms** | 16.6 ms | 26.3 ms |
-| WP direct\_rx (1w) | 1.5 ms | 3.8 ms | 33.4 ms | 42.1 ms |
-| WP channel (2w) | 1.4 ms | 3.7 ms | 15.1 ms | 23.8 ms |
-
-**Measured (128 concurrent, 1KB, external server):**
-
-| Mode | RPS | P50 | P99 | P999 |
-|------|----:|----:|----:|-----:|
-| **Normal** | **49,766** | 2.4 ms | 4.4 ms | 22.6 ms |
-| WP direct\_rx (1w) | 37,764 | 3.3 ms | 4.7 ms | 9.1 ms |
-| WP channel (2w) | 2,465 | 3.7 ms | 5.3 ms | 5.6 ms |
-
-> **Conclusion:** Normal mode (per-connection tokio tasks) is the correct choice for clients. WorkerPool modes add cross-thread wake overhead that hurts P50 and throughput. WorkerPool's value is on the **server side** — shared UDP socket demux for many concurrent connections (not benchmarked here via `latency_p99`).
+`--rt single|multi` and `--workers N` only select the benchmark process's own runtime (single-threaded to avoid cross-thread wakes, vs the multi-threaded production shape). For measured numbers see [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md).
 
 </details>
 
@@ -381,7 +377,7 @@ kcptun-rs is **fully wire-compatible** with Go kcptun (kcp-go v5). All 68 end-to
 Encryption:  15/15 ciphers passed (Go→Rust + Rust→Go)
 KCP Modes:   4/4 passed
 SMUX:        2/2 versions passed
-Compression: 8/8 cipher×compression combos passed
+Compression: 7/7 cipher×compression combos passed (14 checks)
 FEC:         2/2 configurations passed
 Total:       68 passed, 0 failed, 0 skipped 🎉
 ```
@@ -411,7 +407,7 @@ Total:       68 passed, 0 failed, 0 skipped 🎉
 ```text
 kcptun-rs/
 ├── kcp-rs/          — KCP ARQ protocol state machine
-├── kcrypt-rs/       — 13 block ciphers + AES-128-GCM
+├── kcrypt-rs/       — cipher engines (15 methods incl. AES-128-GCM)
 ├── smux-rs/         — SMUX stream multiplexer (v1/v2)
 ├── qpp-rs/          — Quantum Permutation Pad obfuscation
 ├── knet-rs/          — Async I/O abstraction (tokio)
@@ -426,18 +422,18 @@ kcptun-rs/
 - **tokio** (sole runtime) — multi-threaded, high-concurrency, production-scaled
 - Business code uses `knet::*` abstractions only — never raw tokio APIs
 
-### Flush Loop Optimization
+### Session Write Pipeline
 
-The flush loop is split into **4 phases** to minimize KCP mutex hold time:
+The session writer (`kcptun-common::kcptun_session::write_loop`) keeps the KCP mutex out of every expensive stage:
 
-| Phase | Work | KCP Lock |
-|:-----:|------|:---------:|
-| 1 | Drain SMUX send buffers, collect FIN-pending streams | ❌ Not held |
-| 2 | Encode SMUX frames | ❌ Not held |
-| 3 | Snappy compress (if enabled) | ❌ Not held |
-| 4 | `kcp.send()` + `kcp.update()` + `kcp.flush()` | ✅ Held briefly |
+| Step | Work | KCP Lock |
+|:----:|------|:---------:|
+| 1 | Drain SMUX send buffers, encode frames + FINs (`prepare_outbound_into_controlled`) | ❌ Not held |
+| 2 | Reap stale/linger-expired streams and backfill their FINs | ❌ Not held |
+| 3 | Snappy compress (session-level); large batches offload to `cpu_block` with a bounded wait and inline fallback | ❌ Not held |
+| 4 | `kcp.write_all(batch)` — the only KCP-touching call (`update`/`flush`/retransmit are driven by `KcpStream`'s own event-driven flush loop) | ✅ Held briefly |
 
-This allows the UDP recv loop to feed data into KCP while the flush loop prepares the next batch of frames — eliminating lock contention under high concurrency.
+On the receive side the same principle applies: FEC decode runs outside the lock and a whole UDP burst is fed with one lock (`process_inbound_batch`). This lets the recv loop feed data into KCP while the writer prepares the next batch of frames — eliminating lock contention under high concurrency.
 
 ## 🔧 Build & Run
 
@@ -465,7 +461,7 @@ make linux-aarch64     # ARM64 Linux musl (from macOS)
 make windows           # Windows x86_64 .exe (from macOS/Linux)
 ```
 
-ARM cross builds use the **tokio** runtime with `pprof` disabled for minimal binary size.
+All cross builds use the **tokio** runtime with the binaries' default feature set: `qpp` + `pprof` are default features, so pprof is **not** disabled. Because of that, the `*-full` targets currently build the same feature set as the base targets.
 
 ### Windows Binaries from macOS/Linux
 
@@ -481,16 +477,16 @@ make build-windows     # debug build
 
 Rust's `x86_64-pc-windows-gnu` std uses self-contained linking, so the `.exe` files carry no `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` dependency — copy them to Windows and run. The only imports are OS components (`kernel32`, `ws2_32`, `advapi32`, `bcrypt`, `ntdll` + UCRT), so Windows 10 or newer is required. The MSVC triple (`x86_64-pc-windows-msvc`) is not built here; it requires a Windows host or xwin plus the MSVC SDK.
 
-> Windows runtime behavior is not covered by CI: raw-TCP (`--tcpraw`/`--tcpmux`) needs Administrator privileges, and `--pprof` serves heap/allocs but returns 501 for CPU profiles (kpprof-rs CPU sampling is Unix-only).
+> Windows runtime behavior is not covered by CI: raw-TCP (`--tcp`) needs Administrator privileges, and `--pprof` serves heap/allocs but returns 501 for CPU profiles (kpprof-rs CPU sampling is Unix-only).
 
 ### Linux Binaries from macOS
 
 Build fully static musl binaries directly from macOS — ideal for CI or deployment testing:
 
 ```bash
-make linux              # x86_64 musl (tokio)
-make linux-aarch64      # ARM64 musl (tokio)
-make linux-full         # x86_64 musl + QPP
+make linux              # x86_64 musl (tokio + qpp + pprof)
+make linux-aarch64      # ARM64 musl (tokio + qpp + pprof)
+make linux-full         # x86_64 musl (same features: qpp is already a default)
 ```
 
 ### OS-Level UDP Buffer Tuning (macOS)
@@ -525,7 +521,6 @@ Runtime tuning knobs are read from the environment when the relevant component s
 | Variable | Default | Scope | Description |
 |---|---|---|---|
 | `KCP_BUSY_YIELDS` | `0` (disabled) | kcp-rs `KcpStream::read` | Spin-bounded busy-poll: how many `yield_now` spins `read()` performs before parking on the wakeup `Notify`. Compensates tokio's notify→wake→schedule→poll hop (~0.2–2 ms per wakeup) — Go gets equivalent wakeup speed for free from its runtime's µs-level goroutine scheduling. |
-| `KCPTUN_WORKER_THREADS` | available parallelism (clamped to 1–16) | `KcpListener` shards | Default listener shard count. A positive value overrides auto-detection; an explicit Builder `worker_count(n)` overrides the environment. This variable does not size the shared Tokio runtime. |
 
 **`KCP_BUSY_YIELDS` rules of thumb** (measured on arm64 macOS, 500 RPS × 26 KB echo; see [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md)):
 
@@ -533,7 +528,7 @@ Runtime tuning knobs are read from the environment when the relevant component s
 - **Listener / high-concurrency server**: keep `0`. Spinning readers compete with connection and flush tasks and can sharply inflate P99.
 - **Throughput-bound / closed-loop workloads**: keep `0`. Spinning measurably regressed closed-loop req/s. Accordingly, `bench/run_p99.sh` enables `512` only for the standalone Rust→Go request initiator (combination 3); Rust↔Rust self mode, the Rust server, and closed-loop runs explicitly use the event-driven setting.
 
-The library default stays `0`, so production deployments remain event-driven. `KcpListener` creates one dedicated current-thread runtime per shard. The shared multi-thread Tokio runtime uses Tokio's system-derived default worker count.
+The library default stays `0`, so production deployments remain event-driven. `KcpListener` runs entirely on the caller's runtime (no private runtimes); `kcptun-server` gives each multi-shard socket its own OS thread + current-thread runtime, and the shared multi-thread Tokio worker count is set with `--threads N` (0 = auto).
 
 ## 🎛️ Latency Tuning Guide (Linux)
 
@@ -541,28 +536,22 @@ Practical tuning findings from the P99 optimization work (2026-09). All numbers
 come from controlled same-machine A/B runs on a 1-vCPU Linux VM
 ([docs/kcp-rs-optimization-2026-09-01.md](docs/kcp-rs-optimization-2026-09-01.md) §6–§9).
 
-### 1. Let the listener pick its topology (no action needed)
+### 1. Listener architecture (no action needed)
 
-`KcpListener` (used by `kcptun-server`) selects its receive pipeline at bind time:
-
-| Topology | When | What you get |
-|:---------|:-----|:-------------|
-| **Direct single worker** | `worker_count == 1` (any platform) | The worker drains the UDP socket itself — no reader thread, no queue hop. Best default on 1–2 vCPU hosts. |
-| **Direct SO_REUSEPORT group** | Linux, fresh bind, N workers | One socket per worker; the kernel's 4-tuple hash keeps each session pinned to one worker (session affinity without user-space routing). Best for multi-core hosts. |
-| **Reader pipeline** | Shared/external socket + N workers | Dedicated RX thread fans out to worker queues (also the fallback on macOS/Windows, where SO_REUSEPORT does not distribute UDP flows). |
-
-Set the shard count with `KCPTUN_WORKER_THREADS` (library) — on Linux a value > 1
-on a fresh bind automatically uses the reuseport group.
+`KcpListener` (used by `kcptun-server`) runs **on the caller's runtime**: one asynchronous receive task drains the shared socket, groups each burst by source address, and feeds every live session inline — one decrypt pass, one KCP lock, one flush and one send syscall per peer per burst. There is no worker-count or topology knob (the old `KCPTUN_WORKER_THREADS` variable is gone); parallelism comes from `kcptun-server` shards (below), and the shared Tokio worker count is set with `--threads`.
 
 ### 2. `--shards N` on kcptun-server (Linux)
 
-Each shard is an independent SO_REUSEPORT socket processed by its own thread,
-so there is no shared-fd send contention.
+Each shard binds its own SO_REUSEPORT socket on the listen port, so there is no
+shared-fd send contention.
 
 - Default (`--shards 0`): one shard per logical CPU on **Linux**; a single
   shard elsewhere (macOS does not distribute UDP via SO_REUSEPORT).
-- **Hard max 64**: each shard is one OS thread + one bound UDP socket; larger
-  values fail at startup (they used to `expect`-panic and abort the process).
+- **Hard max 64**: each shard binds its own UDP socket; multi-shard runs give
+  every socket a dedicated OS thread + current-thread runtime (strict fd
+  affinity), while the single-shard case runs as one task on the shared
+  runtime. Larger values fail at startup (they used to `expect`-panic and abort
+  the process).
 - Rule of thumb: **shards ≈ vCPUs**. On a 1–2 vCPU box keep 1 shard — every
   extra worker only adds cross-core wakeups on the same core (the N=2 reuseport
   path is verified correct, but on a single vCPU it is strictly slower).
@@ -608,7 +597,7 @@ raise the kernel ceiling so the requests are honored.
 
 | Scenario | Setting |
 |:---------|:--------|
-| 1–2 vCPU host (VPS, container) | 1 shard (`--shards 1` or default worker count 1) + `wakeup_granularity=1ms` |
+| 1–2 vCPU host (VPS, container) | 1 shard (`--shards 1`; non-Linux platforms already default to 1) + `wakeup_granularity=1ms` |
 | Multi-core host, many concurrent sessions | default `--shards` (= CPUs, reuseport group on Linux) + `wakeup_granularity=1ms` |
 | Lossy network | keep default; FEC (`--datashard/--parityshard`) trades bandwidth for tail latency |
 | Throughput benchmarking | restore `wakeup_granularity` to default (1 ms slightly raises fair-share switching) |
@@ -703,9 +692,9 @@ re-attempted):
 
 | Test Type | Count | What It Verifies |
 |:----------|:-----:|:-----------------|
-| Unit tests | 443 | Individual crate correctness |
+| Tests | 551 | `cargo test --workspace` — 422 unit + 118 integration + 11 doc-tests |
 | E2E interop | 68 | Go↔Rust bidirectional compatibility |
-| Stress tests | 8 | Byte-for-byte data integrity at scale |
+| Stress tests | 10 | Byte-for-byte data integrity at scale |
 | Stability run | PASS | Formal 1 h × 20-client remote run, six criteria (stall threshold 150 s since 2026-10-12) |
 | Integrity hunt | 27.08M / 0 | Instrumented exchanges byte-verified (~358 GB), zero failures as of 2026-10-15 |
 | Clippy | `-D warnings` | Zero warnings enforced |
@@ -718,43 +707,83 @@ tears a session down on `dead_link` state alone, matching Go.
 
 ## 📋 CLI Options
 
+Defaults below are the **effective** values (some are resolved in code, so `--help` shows no default for them).
+
 ### kcptun-client
 
 | Flag | Default | Description |
 |:-----|:--------|:------------|
-| `-l` / `--localaddr` | `:12948` | Local listening address |
-| `-r` / `--remoteaddr` | (required) | KCP server address |
-| `--key` | `it's a secrect` | Pre-shared secret |
-| `--crypt` | `aes` | Encryption algorithm. Unknown names fail at startup. Prefer `aes-128-gcm` (only authenticated cipher) |
-| `--mode` | `fast` | KCP mode |
+| `-l` / `--localaddr` | `:12948` | Local TCP listening address |
+| `-r` / `--remoteaddr` | `vps:29900` | Remote server address (IP, DNS name, or multi-port range `host:29900-29910`) |
+| `-k` / `--key` | `it's a secrect` | Pre-shared secret (also `KCPTUN_KEY` env var) |
+| `--crypt` | `aes` | Encryption method; unknown names fail at startup. Prefer `aes-128-gcm` (the only authenticated cipher) |
+| `-m` / `--mode` | `fast` | KCP mode: `normal`/`fast`/`fast2`/`fast3`; any other value selects manual mode using the four knobs below |
 | `--conn` | `1` | Number of UDP connections (**1–256**; larger values are rejected) |
-| `--mtu` | `1350` | Maximum transmission unit (**≥ 50**; invalid values fail at startup, no silent fallback) |
-| `--sndwnd` | `1024` | Send window |
-| `--rcvwnd` | `1024` | Receive window |
-| `--datashard` | `0` | FEC data shards |
-| `--parityshard` | `0` | FEC parity shards |
+| `--autoexpire` | `0` (off) | Replace a pool slot N seconds after the session was created (retired sessions keep serving, then are scavenged) |
+| `--scavengettl` | `600` | Scavenge TTL (sec) for retired sessions |
+| `--mtu` | `1350` | Maximum transmission unit (**≥ 50**, must also fit the 2048-byte receive capacity) |
+| `--ratelimit` | `0` | Per-connection rate limit, bytes/sec (0 = off) |
+| `--sndwnd` | `128` | KCP send window |
+| `--rcvwnd` | `512` | KCP receive window |
+| `--datashard` | `10` | FEC data shards |
+| `--parityshard` | `3` | FEC parity shards |
 | `--dscp` | `0` | DSCP for IP packets (**0–63**) |
-| `--ratelimit` | `0` | Rate limit (bytes/sec) |
-| `--nocomp` | `false` | Disable Snappy compression |
+| `--nocomp` | `false` | Disable session-level Snappy compression |
+| `--acknodelay` | `false` | ACK nodelay |
+| `--nodelay` / `--interval` / `--resend` / `--nc` | `0` / `50` / `0` / `0` | Manual KCP knobs (used when `--mode` is not a known name) |
+| `--sockbuf` | `4 MiB` | Socket buffer size (bytes) |
 | `--smuxver` | `2` | SMUX version (1 or 2) |
-| `--keepalive` | `10` | Keepalive interval (sec) |
-| `--QPP` | `false` | Enable QPP obfuscation |
+| `--smuxbuf` | `4 MiB` | SMUX receive buffer |
+| `--streambuf` | `2 MiB` | SMUX stream buffer |
+| `--framesize` | `8192` | SMUX max frame size |
+| `--keepalive` | `10` | SMUX keepalive interval (sec; 0 = off) |
+| `--keepalivetimeout` | `30` | Inbound-silence timeout, sec (0 = off) |
+| `--ackstalltimeout` | `10` | Unacked-outbound timeout, sec (0 = off) |
+| `--closewait` | `0` | closeWait grace period (sec) |
+| `--snmplog` / `--snmpperiod` | unset / `60` | SNMP CSV log path + logging period (sec) |
+| `--log` | stderr | Log file path (rotated at 10 MiB) |
+| `--quiet` | `false` | Suppress log output |
+| `--tcp` | `false` | raw-TCP transport instead of UDP |
+| `--pprof` / `--pprofaddr` | `false` / `127.0.0.1:6060` | pprof HTTP endpoint (one CPU profile at a time; extra requests get 429) |
+| `--threads` | `0` (auto) | Tokio worker threads for the global async runtime |
+| `--QPP` / `--QPPCount` | `false` / `61` | QPP obfuscation + pad count |
+| `-c` | — | Path to JSON config file |
+| `-v` / `--version` | — | Print version and exit |
 
 ### kcptun-server
 
 | Flag | Default | Description |
 |:-----|:--------|:------------|
-| `-l` / `--listen` | `:29900` | KCP listen address |
-| `-t` / `--target` | (required) | TCP target address |
-| `--shards` | `0` (auto: per-CPU on Linux, 1 elsewhere) | SO_REUSEPORT shard sockets — each shard is its own socket + worker thread. **Hard max 64** (larger values used to abort the process) |
-| `--key` | `it's a secrect` | Pre-shared secret |
-| `--crypt` | `aes` | Encryption (same as client). Unknown names fail at startup |
-| `--dscp` | `0` | DSCP for IP packets (**0–63**) |
-| `--mode` | `fast` | KCP mode |
-| `--pprof` | `false` | HTTP pprof (loopback by default; one CPU profile at a time, extra requests get 429) |
-| `--pprofaddr` | `127.0.0.1:6060` | pprof bind address. Use `0.0.0.0:6060` to restore Go kcptun's all-interfaces bind |
+| `-l` / `--listen` | `:29900` | KCP listen address (UDP; accepts a port range) |
+| `-t` / `--target` | `127.0.0.1:12948` | TCP target to forward connections to |
+| `-k` / `--key` | `it's a secrect` | Pre-shared secret (also `KCPTUN_KEY` env var) |
+| `--crypt` | `aes` | Encryption (same as client); unknown names fail at startup |
+| `-m` / `--mode` | `fast` | KCP mode |
+| `--shards` | `0` (auto: per-CPU on Linux, 1 elsewhere) | SO_REUSEPORT shard sockets. **Hard max 64** (larger values used to abort the process) |
 | `--peripsessionrate` | `20` | Max new sessions/sec per source IP (0 = unlimited) |
 | `--maxsessionsperip` | `0` | Max concurrent sessions per source IP (0 = unlimited; leave 0 behind NAT) |
+| `--mtu` | `1350` | MTU (**≥ 50**) |
+| `--ratelimit` | `0` | Per-connection rate limit, bytes/sec (0 = off) |
+| `--sndwnd` / `--rcvwnd` | `1024` / `1024` | KCP send / receive window |
+| `--datashard` / `--parityshard` | `10` / `3` | FEC data / parity shards |
+| `--dscp` | `0` | DSCP for IP packets (**0–63**) |
+| `--nocomp` | `false` | Disable session-level Snappy compression |
+| `--acknodelay` | `false` | ACK nodelay |
+| `--nodelay` / `--interval` / `--resend` / `--nc` | `0` / `50` / `0` / `0` | Manual KCP knobs (used when `--mode` is not a known name) |
+| `--sockbuf` | `4 MiB` | Socket buffer size (bytes) |
+| `--smuxver` | `2` | SMUX version (1 or 2) |
+| `--smuxbuf` / `--streambuf` / `--framesize` | `4 MiB` / `2 MiB` / `8192` | SMUX receive buffer / stream buffer / max frame |
+| `--keepalive` / `--keepalivetimeout` / `--ackstalltimeout` | `10` / `30` / `10` | SMUX keepalive, inbound-silence and ack-stall timeouts (sec; 0 = off) |
+| `--closewait` | `30` | closeWait grace period (sec) |
+| `--snmplog` / `--snmpperiod` | unset / `60` | SNMP CSV log path + logging period (sec) |
+| `--log` | stderr | Log file path (rotated at 10 MiB) |
+| `--quiet` | `false` | Suppress log output |
+| `--tcp` | `false` | raw-TCP transport instead of UDP |
+| `--pprof` / `--pprofaddr` | `false` / `127.0.0.1:6060` | HTTP pprof (loopback by default; one CPU profile at a time, extra requests get 429) |
+| `--threads` | `0` (auto) | Tokio worker threads for the global async runtime |
+| `--QPP` / `--QPPCount` | `false` / `61` | QPP obfuscation + pad count |
+| `-c` | — | Path to JSON config file |
+| `-v` / `--version` | — | Print version and exit |
 
 ## 💡 Why Rust?
 

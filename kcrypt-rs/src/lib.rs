@@ -53,7 +53,7 @@ pub mod wire;
 #[allow(deprecated)]
 pub use crypt::{
     select_aead_crypt, select_block_crypt, validate_crypt_method, AeadCrypt, BlockCrypt,
-    CryptEngine,
+    CryptEngine, AEAD_OVERHEAD,
 };
 pub use wire::{
     decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, encrypt_batch_ref_into, inbound_null,

@@ -81,6 +81,17 @@ impl fmt::Debug for Frame {
 }
 
 impl Frame {
+    /// Checked constructor — rejects payloads larger than the 2-byte wire
+    /// length field can hold (65535).  The existing [`new`](Self::new) retains
+    /// its truncating `as u32` / `as u16` behaviour for compatibility with
+    /// internal call sites that already respect `MAX_FRAME_SIZE`.
+    pub fn try_new(cmd: Cmd, stream_id: u32, data: Bytes) -> Result<Self, &'static str> {
+        if data.len() > u16::MAX as usize {
+            return Err("frame payload exceeds 65535 bytes (u16 length field)");
+        }
+        Ok(Self::new(cmd, stream_id, data))
+    }
+
     /// Create a new frame.
     #[inline]
     pub fn new(cmd: Cmd, stream_id: u32, data: Bytes) -> Self {
@@ -127,12 +138,32 @@ impl Frame {
 
     /// Encode this frame — Go smux wire format:
     /// ver(1) | cmd(1) | length(2) LE | stream_id(4) LE | data
+    ///
+    /// **Truncating**: `length` is written as `u16`. [`Frame::new`] always keeps
+    /// `length == data.len()`, but `Frame`'s fields are public, so a frame built
+    /// by hand can encode a length that disagrees with (or overflows) its
+    /// payload. Use [`Frame::try_encode`] on any frame not built by `new`.
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> usize {
         Self::encode_header_into(buf, self.ver, self.cmd, self.stream_id, self.length as u16);
         if !self.data.is_empty() {
             buf.put_slice(&self.data);
         }
         FRAME_HEADER_SIZE + self.data.len()
+    }
+
+    /// Checked encode: rejects a frame whose `length` field cannot describe its
+    /// payload on the wire, instead of silently writing a truncated `u16`.
+    ///
+    /// Fails when `length > 65535` (does not fit the 2-byte field) or
+    /// `length != data.len()` (the peer would read the wrong number of bytes).
+    pub fn try_encode<B: BufMut>(&self, buf: &mut B) -> Result<usize, &'static str> {
+        if self.length > u16::MAX as u32 {
+            return Err("frame length exceeds the u16 wire field");
+        }
+        if self.length as usize != self.data.len() {
+            return Err("frame length does not match its payload");
+        }
+        Ok(self.encode(buf))
     }
 
     /// Try to decode a frame — Go smux wire format:
@@ -466,6 +497,41 @@ mod tests {
         let (decoded, _) = Frame::decode(&buf).unwrap();
         assert_eq!(decoded.length, 65535);
         assert_eq!(decoded.data.len(), 65535);
+    }
+
+    /// `try_new` accepts the largest payload the 2-byte wire length can carry
+    /// and rejects one byte more. `new` keeps its old truncating behaviour so
+    /// existing internal call sites (which bound payloads themselves) are
+    /// unaffected.
+    #[test]
+    fn try_new_bounds_payload_at_u16() {
+        assert!(Frame::try_new(Cmd::Psh, 1, Bytes::from(vec![0u8; 65535])).is_ok());
+        let err = Frame::try_new(Cmd::Psh, 1, Bytes::from(vec![0u8; 65536])).unwrap_err();
+        assert!(err.contains("65535"), "{err}");
+    }
+
+    /// A hand-built frame (fields are public) must not be able to encode a
+    /// length that disagrees with its payload or overflows the wire field.
+    #[test]
+    fn try_encode_rejects_tampered_length() {
+        let mut frame = Frame::new(Cmd::Psh, 1, Bytes::from_static(b"abcd"));
+        // `encode` truncates silently — that is the documented legacy path.
+        frame.length = 65536;
+        let mut buf = Vec::new();
+        assert!(frame.try_encode(&mut buf).is_err());
+        assert_eq!(
+            buf.len(),
+            0,
+            "checked encode must not write a partial frame"
+        );
+
+        frame.length = 5; // claims one byte more than it carries
+        assert!(frame.try_encode(&mut buf).is_err());
+        assert_eq!(buf.len(), 0);
+
+        frame.length = 4;
+        assert_eq!(frame.try_encode(&mut buf).unwrap(), 12);
+        assert_eq!(Frame::decode(&buf).unwrap().0.length, 4);
     }
 
     /// Verify Go-compatible wire format:

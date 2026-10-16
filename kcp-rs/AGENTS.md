@@ -17,7 +17,7 @@ Async surface (optional): `KcpStream` is a tokio-TCP-shaped `AsyncRead`/`AsyncWr
 | `src/lib.rs` | Crate root; large intentional `#![allow(clippy::…)]` list — do not "fix" |
 | `src/kcp.rs` | Core `KCP` state machine: windows, RTO, flush, input, NoDelay |
 | `src/segment.rs` | 24-byte LE wire header, `Command` enum, `SegmentPool` (SegQueue) |
-| `src/fec.rs` | `FecEncoder` / `FecDecoder` / `fec_expand_packets` / `fec_kcp_from_recovered`; header types `0x00f1` / `0x00f2` / `0x00f3` |
+| `src/fec.rs` | `FecEncoder` / `FecDecoder` / `fec_expand_packets` / `fec_kcp_from_recovered`; header types `0x00f1` (data) / `0x00f2` (parity). Go also has `0x00f3` (OOB) but this implementation does not claim OOB support |
 | ~~`src/crypto_buf.rs`~~ | **Removed** (B2) — moved to `kcrypt-rs::wire`; see `../kcrypt-rs/AGENTS.md` |
 | `src/conn.rs` | (feature `async`) `KcpStream` + `SharedIoState` (crate-private) + builder + background loops + poll impls + split halves; exposes monotonic `last_activity_ms` for upper-layer session expiry; **TcpStream-aligned surface** (`set_nodelay(bool)`, `set_nonblocking(bool)` honored by `read`/`write_all`, `shutdown(Shutdown)`, read/write timeouts, `split`/`into_split`, `readable`/`writable`, `peek`, `take_error`, builder `.connect_timeout`) + post-construction `set_kcp_window_size`; builder raw knobs are `.set_kcp_nodelay(n,i,r,nc)` (not `.nodelay`). Shared builder setters use one internal macro (re-exported for both listener builders). TX path uses `flush_tx_batch` (non-blocking `sendmmsg` fast path → async `send_batch` fallback on `WouldBlock`); `feed_raw_batch`/`feed_batch`/`tick` are `pub(crate)` — the listener worker path only |
 | `src/transport.rs` | (feature `async`) `PacketTransport` trait + impls (`knet::DatagramSocket`, per-peer `PeerTransport`) + `PeerQueue` (listener demux) + `TransportWrapper`; `MAX_DATAGRAM` bounds receive storage; exchanged buffers return to the shared listener pool |
@@ -101,6 +101,14 @@ let conn = KcpStream::with_transport(transport, cfg).await?;
   `recv_vec` / `try_recv_vec` let queue-backed transports transfer reusable
   owned packet storage without an extra copy.
 - FEC: `.fec(datashard, parityshard)` on builder; encode on flush, decode on input.
+- The auto-tune probe (`AutoTune::probe`) runs on every packet while `should_tune` is set, so it must stay
+  allocation-free: one sorted snapshot into a reusable buffer (skipping the sort when the samples already
+  arrive in order), no rotated copy, no modulo per element. It must **not** be throttled by sample count — a
+  fixed stride aliases with the group period (stride 16 never realigns with a 128+128 stream), which silently
+  breaks retuning. `fec::tune_tests` pins the cost against the pre-change algorithm on random and structured
+  histories.
+- FEC parity latency uses `FEC_ENCODE_LATENCY_MS` (500, mirrors Go kcp-go v5.6.64 `maxFECEncodeLatency`). It is a fixed pseudo-RTO, not a live `rx_rto` sample — do not "improve" it into one.
+- `transport::MAX_DATAGRAM` (2048) is a cross-crate contract, not a local knob: every receive slot is sized from it and `kcptun-common::validate_encrypted_mtu` derives the maximum legal `--mtu` from it (`mtu + crypto overhead <= 2048`). Its value is pinned by `transport::tests::max_datagram_is_the_shared_receive_slot`.
 - `KcpListener`: `bind` → `accept() -> (KcpStream, SocketAddr)`. One bound UDP socket; demux by source addr
   via per-peer queue-backed `PeerTransport`. Reconnect = fresh client session (KCP SN continuity blocks
   same-stream reuse after a server-side close).
@@ -127,9 +135,8 @@ let conn = KcpStream::with_transport(transport, cfg).await?;
 - **Listener admission + lifecycle** (`sharded.rs`): a server session is created from a *single* inbound datagram, so `process_session` runs a pre-admission integrity gate — it builds the `PacketTransport` (crypto wrapper included) and calls `decrypt_packet_in_place` on the first burst **before** `KcpStream::build()`. A peer that cannot produce a valid CRC32 / AEAD tag gets no `KcpStream`, no flush loop and no accept-backlog entry (`WorkerPoolStats::unauthenticated_drops`). With no crypto configured the default `decrypt_packet_in_place` is the identity, so the gate is a no-op — the `max_sessions_per_worker` cap is the only bound in that configuration.
 - `WorkerPoolLimits` defaults are **bounded, not unlimited**: `max_sessions_per_worker = 4096`, `idle_timeout = 600s`, `building_timeout = 10s`. KCP has no keepalive of its own, so a peer that sends one datagram and vanishes never trips `is_dead()`; `idle_timeout` is what frees its slot. `last_activity_ms` is stamped by `SharedIoState::mark_activity()` from **both** the input loop and the `feed_batch`/`feed_single` paths — server sessions run `background_input(false)` and have no input loop, so dropping the feed-path stamp makes the reaper kill live sessions.
 - **Reaping closes.** `reaper_sweep` and `KcpListener::remove_peer` call `KcpStream::close()` on what they remove. The session map holds a non-owning clone (`detach_owner`), so a bare `remove` leaks the flush-loop task and leaves anything blocked on the stream parked forever.
-- The lifecycle sweep runs as a `SWEEP_PARK_MS` timer task on each worker's own current-thread runtime, not off RX wakeups: a shard that goes completely silent has no wakeups, and the old wakeup-counted sweep stopped running exactly when reaping mattered most.
-- `KCPTUN_WORKER_THREADS` controls the default sharded-listener worker count;
-  an explicit Builder `worker_count(n)` takes precedence.
+- The lifecycle sweep runs in the listener's receive task on the `SWEEP_INTERVAL` (1s) cadence — never per batch, so its O(sessions) scan cannot scale with packet rate. A listener that goes completely silent has no wakeups, so the sweep also runs on an idle timeout.
+- `KcpListener` has **no** worker-count knob: it runs entirely on the caller's runtime and feeds every session inline. Parallelism comes from the caller (kcptun-server `--shards`); the old `KCPTUN_WORKER_THREADS` env var and `worker_count(n)` builder are gone.
 
 ### Testing Requirements
 

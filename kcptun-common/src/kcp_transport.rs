@@ -55,6 +55,45 @@ const DEFAULT_CONV: u32 = 0xDEAD_BEEF;
 /// Distinct seed for ACK-path CryptoBuf so nonces never collide with data path.
 const ACK_SESSION_XOR: u64 = 0xA11C_B0FF_u64;
 
+/// Check that a full encrypted KCP datagram fits the built-in receive slots.
+///
+/// KCP already subtracts the FEC header from its MTU, so only the crypto
+/// wrapper is added here — the FEC 8-byte header must **not** be counted twice.
+/// Overhead comes from the crypto crate's own constants so a wire-format change
+/// there cannot silently invalidate this budget.
+pub fn validate_encrypted_mtu(mtu: u32, method: &str) -> io::Result<()> {
+    /// Receive slots are sized with `kcp_rs::transport::MAX_DATAGRAM` (2048):
+    /// the sharded listener's per-peer slot and the `conn` endpoint's burst
+    /// buffers. `kcp-rs`'s `max_datagram_is_the_shared_receive_slot` test pins
+    /// that value.
+    const RECEIVE_CAPACITY: u32 = 2048;
+    let overhead = if method == "null" {
+        // `null` has no crypto header at all (unlike `none`, which is CFB with
+        // a zero key and still carries the 20-byte header).
+        0
+    } else if method == "aes-128-gcm" {
+        kcrypt_rs::AEAD_OVERHEAD as u32
+    } else {
+        kcrypt_rs::CRYPTO_HEADER_SIZE as u32
+    };
+    if mtu
+        .checked_add(overhead)
+        .is_none_or(|wire| wire > RECEIVE_CAPACITY)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "mtu {mtu} with crypt {method} exceeds {RECEIVE_CAPACITY}-byte receive capacity (maximum {})",
+                RECEIVE_CAPACITY - overhead
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mtu_tests;
+
 // ─── CryptoTransport ──────────────────────────────────────────────────────────
 
 /// Datagram transport that encrypts/decrypts packets around an inner socket.
@@ -561,6 +600,7 @@ async fn kcp_stream_with_socket_options(
     offload_profile: OffloadProfile,
     rate_limit: u32,
 ) -> io::Result<KcpStream> {
+    validate_encrypted_mtu(config.mtu, crypt)?;
     // Go kcptun sessions each carry a random conv (kcp-go Dial), so a session
     // re-dial — autoexpire/scavenger replacement, reconnect after death — can
     // never alias into a lingering server-side session that still holds the

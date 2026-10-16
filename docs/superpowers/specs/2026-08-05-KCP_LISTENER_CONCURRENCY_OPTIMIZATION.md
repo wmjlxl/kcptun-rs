@@ -19,7 +19,7 @@
 | `kio-rs/src/net/{tokio,smol}.rs` | `UdpSocket::try_recv_batch_from_into`（Linux recvmmsg；非 Linux 原地填槽不再 to_vec） |
 | `kio-rs/src/net/mod.rs` | `DatagramSocket::try_recv_batch_from_into` 分发 |
 | `kcptun-common/src/kcp_transport.rs` | `CryptoTransport::try_recv_batch`（逐槽原位解密 + 坏包稳定压缩）+ `supports_recv_batch` 透传、mock 坏包压缩测试 |
-| `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md` | 实施状态 §13（已完成/未实施+理由） |
+| `docs/KCP_LISTENER_CONCURRENCY_OPTIMIZATION.md`（已删除） | 实施状态 §13（已完成/未实施+理由） |
 
 ## 修复的故障路径（Fixed failure paths）
 

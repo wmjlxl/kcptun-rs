@@ -563,6 +563,23 @@ pub fn encrypt_batch_into(
     );
 }
 
+/// Reset a reuse buffer and make room for a whole batch up front.
+///
+/// `clear()` leaves `len == 0`, so the reserve argument counts from the current
+/// *length*, not from the spare capacity. Sizing it as
+/// `packets.len() - capacity()` on a reused buffer asks for fewer bytes than
+/// the batch needs (cap 8, 9 packets → `reserve(1)`), and the pushes then
+/// reallocate one at a time. Kept as its own function so the arithmetic is
+/// directly testable — a post-push capacity check cannot observe it, since the
+/// pushes grow the `Vec` anyway.
+#[inline]
+fn reserve_batch_capacity(out: &mut Vec<Bytes>, packets_len: usize) {
+    out.clear();
+    if out.capacity() < packets_len {
+        out.reserve(packets_len);
+    }
+}
+
 /// Same as [`encrypt_batch_into`] but takes `&[Bytes]` instead of `Vec<Bytes>`,
 /// avoiding the `to_vec()` allocation on the sync TX path (`encrypt_sync`).
 ///
@@ -576,10 +593,7 @@ pub fn encrypt_batch_ref_into(
     allow_parallel: bool,
     out: &mut Vec<Bytes>,
 ) {
-    out.clear();
-    if out.capacity() < packets.len() {
-        out.reserve(packets.len() - out.capacity());
-    }
+    reserve_batch_capacity(out, packets.len());
     if let Some(aead) = crypt.as_aead() {
         // Reuse CryptoBuf.aead_buf across flush cycles (not just within a batch).
         let mut cb = crypto_buf.lock();

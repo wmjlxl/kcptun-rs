@@ -61,6 +61,8 @@ qpp   = ["dep:qpp-rs", "kcptun-common/qpp"]
 - Prefer extending this crate over copying helpers into binaries.
 - `pipe` starts a grace period when either copy direction completes, matching Go `closeWait`.
 - Do not change Snappy framing or PBKDF2 parameters (wire / key interop).
+- `validate_encrypted_mtu(mtu, crypt)` is the shared guard for the receive-slot budget: KCP already subtracts the FEC 8-byte header, so it adds only the crypto wrapper (`kcrypt_rs::AEAD_OVERHEAD` for AES-128-GCM, `CRYPTO_HEADER_SIZE` otherwise, `0` for `null`) and rejects a configuration whose full datagram would exceed the 2048-byte receive slot. Client, server and `kcp_stream_with_socket_options` all call it.
+- `SnappyStreamDecoder::feed` budgets input per call (`MAX_FEED_INPUT`), retains at most one incomplete chunk between calls (`MAX_RETAINED_INPUT`) and caps decompressed output per call (`MAX_FEED_OUTPUT`); per-chunk lengths are validated against the framing spec's type limits, and a skippable chunk is streamed away instead of buffered. A rejected feed is fatal for the session (`read_loop` closes it) — the budgets must therefore never reject a well-formed stream, which is what `snappy_frame::tests` covers with split max-size chunks.
 - QPP AsyncRead/Write uses tokio `ReadBuf`.
 - When wiring binaries to `KcpStream`, map CLI via `KcpCliParams` / `kcp_config_from`;
   do **not** put Snappy or SMUX inside KcpStream.

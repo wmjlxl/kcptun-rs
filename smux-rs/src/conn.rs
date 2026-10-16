@@ -541,6 +541,9 @@ impl SmuxConn {
                     if stream.is_local_closed() && !stream.is_fin_sent() {
                         fin_pending = true;
                     }
+                    if more_data && fin_pending {
+                        break;
+                    }
                 }
                 drop(guard);
                 fin_retry = fin_pending || (more_data && !wrote);

@@ -38,7 +38,7 @@ mod xtea;
 
 // Re-export all cipher types at the module root.
 pub use aes_cfb::AesCfbCrypt;
-pub use aes_gcm::Aes128GcmCrypt;
+pub use aes_gcm::{Aes128GcmCrypt, AEAD_OVERHEAD};
 pub use blowfish::BlowfishCrypt;
 pub use cast5_crypt::Cast5Crypt;
 pub use none::NoneCrypt;
