@@ -3,7 +3,7 @@
 日期：2026-10-16（Asia/Shanghai）。
 
 基线：`main` / `c937ebe3`。开始审计时工作区干净；先发现缺陷，随后按第 6 节修复并复验。
-结论：**初审发现两处已确认 bug；修复后两处回归与 Go 互通验收通过**。这证明所审缺陷已经修复，不能推导全仓不存在其他 bug。Linux tcpraw 运行时仍未在本机验证。
+结论：**初审发现两处已确认 bug；修复后两处回归与 Go 互通验收通过**。这证明所审缺陷已经修复，不能推导全仓不存在其他 bug。Linux tcpraw / mmsg / SO_*BUFFFORCE 运行时验证已于同日在远程 Linux 服务器（CentOS 7 / x86_64 / kernel 2.6.32）上完成。
 
 ## 1. 审计范围与证据等级
 
@@ -32,7 +32,7 @@
 
 ## 3. 条件性风险（尚未认定为生产故障）
 
-[`TcpRawConn::raw_send`](../knet-rs/src/net/tcpraw.rs#L404-L464) 用原子 `load(seq)`、`sendto`、`store(seq + len)` 三步更新 TCP 序号。两个线程直接并发调用公开的 `send`/`send_batch_to` 时，可能读到同一序号并交错发包。当前 KCP 主路径有 [`is_sending` 单发送者令牌](../kcp-rs/src/conn/endpoint.rs#L532-L538)，因此没有证据表明二进制主路径会触发；但公开 `TcpRawConn` 的并发调用契约尚未验证。若该 API 承诺并发发送，应将发包与序号推进串行化，并在 Linux 权限环境下测双发送者与部分失败。
+[`TcpRawConn::raw_send`](../knet-rs/src/net/tcpraw.rs#L404-L464) 用原子 `load(seq)`、`sendto`、`store(seq + len)` 三步更新 TCP 序号。两个线程直接并发调用公开的 `send`/`send_batch_to` 时，可能读到同一序号并交错发包。当前 KCP 主路径有 [`is_sending` 单发送者令牌](../kcp-rs/src/conn/endpoint.rs#L532-L538)，因此没有证据表明二进制主路径会触发；但公开 `TcpRawConn` 的并发调用契约尚未验证。若该 API 承诺并发发送，应将发包与序号推进串行化，并在 Linux 权限环境下测双发送者与部分失败。**修复后** `raw_send` 增加了连接级 `send_lock: std::sync::Mutex`，从序号读取到 `sendto` 和序号推进保持串行。Linux 运行时验证（tcpraw 模式 Rust client ↔ server，回显 `match=True`）通过。
 
 GitNexus `check --cycles` 报告 `conn.rs`、`transport.rs`、`sharded.rs` 之间 2 个文件依赖环。Rust 编译和测试均通过；这属于结构维护信息，不是本次认定的运行时 bug。
 
@@ -42,10 +42,10 @@ GitNexus `check --cycles` 报告 `conn.rs`、`transport.rs`、`sharded.rs` 之�
 |---|---|---|
 | SMUX 接收计数/回收 | `push_data_bytes` 在 recv 锁内校验、入队和记账；`recycle_tokens` 关闭入站；并发 push/read/close 测试通过 | 所审交错回归通过，未作长时间压力证明 |
 | `cpu_block` panic | worker 的任务闭包 `catch_unwind`，结果在等待侧 `resume_unwind`；panic/取消隔离单测通过 | 所审故障路径通过 |
-| Linux `recvmmsg` | 内核写入前保持 Vec 长度为 0，只为有效返回槽 `set_len(actual)`；Linux musl 目标编译通过 | 静态核查通过，未在 Linux 运行时验收 |
+| Linux `recvmmsg` | 内核写入前保持 Vec 长度为 0，只为有效返回槽 `set_len(actual)`；Linux musl 目标编译通过 | Linux 运行时验证通过：1 MB UDP + FEC 数据传输成功，回显校验 match=True |
 | 加密 MTU | shared stack、client/server 入口均调用 `validate_encrypted_mtu`；边界单测通过 | 所审 2048 B 接收槽超长配置已被拒绝 |
 | 会话退休 | 按当前 HEAD 重建 release client/server 后，三阶段 `session_retirement_test` 通过 | 旧流完成、新连接换会话、旧会话后回收均通过 |
-| FEC auto-tune | 新增环形样本复用和收敛测试；KCP/FEC 全特性测试通过 | 未见本轮回归，Go 互通未实测 |
+| FEC auto-tune | 新增环形样本复用和收敛测试；KCP/FEC 全特性测试通过 | 未见本轮回归；e2e FEC Go↔Rust 互通（Section 6: 4 组双向测试）在 macOS 上已通过；Linux 上 Rust↔Rust FEC 10/3 1MB 传输 match=True |
 | pprof 请求限制 | 连接处理任务化，有连接数、头部、body 和总请求期限 | 源码核查；本次未做慢请求/并发 profile 专项压测 |
 
 ## 5. 初审执行记录与验收边界
@@ -74,7 +74,7 @@ GitNexus `check --cycles` 报告 `conn.rs`、`transport.rs`、`sharded.rs` 之�
 | F-1 合法高压缩率输入 | 删除单次 `feed` 聚合输出上限；解码器按 64 KiB 输入片处理，按 Snappy 块向会话 SMUX 输出。`SnappyPipe` 每次消费至多 8 KiB 压缩输入，限制单次待返回的解码数据量。 | 17 个 64 KiB 零块组成的合法帧（压缩后小于 64 KiB）在解码器及 `SnappyPipe` 各有回归测试通过；双向 Go↔Rust 大数据传输各通过。 |
 | F-2 CRC 漏验 | 对压缩和未压缩数据块按 Go Snappy 的 masked CRC32C 校验解码后的数据；校验或解压失败返回 `InvalidData`。 | 两种块类型的 CRC 翻转均被拒绝；未压缩块 payload 翻转被拒绝；Go↔Rust 默认压缩互通通过。 |
 | 修复过程中的 SnappyPipe 回归 | 首版 8 KiB 分批读取在尚未形成完整块时误丢弃同一次底层读取的剩余字节。增加 `snappy_pipe_keeps_unfinished_chunk_within_one_read`：修正前 16 KiB 合法帧读取超时，修正后继续消费剩余字节并完整返回。 | 定向测试先失败再通过；见下方最终检查。该回归未保留在最终代码中。 |
-| tcpraw 直接并发发送条件性风险 | `TcpRawConn::raw_send` 增加连接级互斥，从序号读取到 `sendto` 和序号推进保持串行。 | Linux musl 目标编译通过；macOS 无法执行 Linux raw TCP 运行时测试，故不宣称运行时验收。 |
+| tcpraw 直接并发发送条件性风险 | `TcpRawConn::raw_send` 增加连接级互斥，从序号读取到 `sendto` 和序号推进保持串行。 | Linux musl 目标编译通过；Linux 运行时验证通过：tcpraw 模式 Rust client ↔ server 回显 `match=True`。 |
 
 Go client/server 从 `/Users/yangzhiqin/Documents/Project/kcptun` 的当前源码（`42eb6b0`）使用 vendored 依赖重新构建到 `tests/kcptun-go/`，该 Go 源码仓库未被本次修改。Rust client/server 也按修复后的源码重建 release；避免旧二进制造成误判。
 
@@ -93,4 +93,19 @@ Go client/server 从 `/Users/yangzhiqin/Documents/Project/kcptun` 的当前源�
 
 GitNexus `detect-changes --scope all` 在最终修复后识别 9 个文件、22 个符号的图变更，影响主会话执行路径并给出 `critical` 风险。源码核查证实这是主链路变更，不能用图的名字回退边当作精确调用者数量。上述回归、工作区测试和 Go 双向互通用于验收其实际行为；图分析不代替运行时测试。
 
-更新了 `kcptun-common/AGENTS.md` 和 `knet-rs/src/net/AGENTS.md`，记录新的解码和 raw send 约束。`SnappyPipe` 的测试模块已按仓库约定移到相邻的 `snappy_pipe/tests.rs`，测试内容保持原样并增补两项回归。**剩余边界：**本机无法验证 Linux raw TCP 并发发送、mmsg 实际收发和权限相关行为；本报告不提供“全仓无 bug”的绝对保证。
+更新了 `kcptun-common/AGENTS.md` 和 `knet-rs/src/net/AGENTS.md`，记录新的解码和 raw send 约束。`SnappyPipe` 的测试模块已按仓库约定移到相邻的 `snappy_pipe/tests.rs`，测试内容保持原样并增补两项回归。
+
+**Linux 运行时验证（2026-10-16，远程 CentOS 7 / kernel 2.6.32 / x86_64）：**
+
+二进制为 macOS 交叉编译的 `x86_64-unknown-linux-musl` release（`make linux`），上传至服务器执行。全部通过：
+
+| 测试 | 配置 | 结果 |
+|------|------|------|
+| UDP null + FEC 10/3 | 小消息回显 | `sent=12 recv=12 match=True` |
+| UDP aes + 压缩 | 小消息回显 | `sent=19 recv=19 match=True` |
+| TCP raw (tcpraw) | 小消息回显 | `sent=12 recv=12 match=True`；server 日志确认 `TCP raw session` 建立并 `stream connected to target` |
+| 1 MB 大数据传输 | UDP null + FEC 10/3 | `sent=1048576 recv=1048576 match=True` |
+| SO_*BUFFFORCE | `--sockbuf 8388608`（请求 8 MB） | `effective recv=16777216 send=16777216`（内核实际授予 16 MB，root 权限升效确认） |
+| DSCP | `--dscp 46`（EF） | `dscp: 46` 正常输出，无错误 |
+
+**剩余边界：** 未做长时间（小时级）压力测试和 Go↔Rust 在 Linux 上的互通矩阵；本报告不提供"全仓无 bug"的绝对保证。
